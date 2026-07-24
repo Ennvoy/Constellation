@@ -5,20 +5,23 @@
 //   - Write（帶完整新內容 content）→ 直接檢查新內容本身。
 //   - Edit（只帶變更片段 new_string）→ 讀磁碟現檔（編輯前）的「## 驗證證據」section。
 //   - MultiEdit（tool_input.edits 陣列）→ 任一 edit 的 new_string 把 status 設 done，就讀磁碟現檔驗證。
-//   - apply_patch（Codex 原生編輯工具，tool_input.patch 或 input.patch 帶 unified patch 文字）→
-//     解析 `*** Update File: <路徑>` 找出受影響票檔，patch 內容含新增的 `+status: done` 才驗證，
-//     讀磁碟現檔（patch 套用前）確認證據。
-// 沒有「24 小時內＋簽章核對通過」的證據 → stderr 印理由、exit 2 擋下；有→放行。
-// 任何解析異常一律 fail-open（放行），不誤擋日常編輯——擋人是例外，不是預設。
+//   - apply_patch（Codex 原生編輯工具）→ 解析 `*** Update File: <路徑>` 找出受影響票檔，patch 內容
+//     含新增的 `+status: done` 才驗證，讀磁碟現檔（patch 套用前）確認證據。patch 文字本身用 fallback
+//     鏈依序嘗試 tool_input.patch → tool_input.command → input.patch → input.command——Codex 官方
+//     payload 實際把 apply_patch 內容放在 command 欄位（不是 patch 欄位），只認 tool_input.patch
+//     會讀錯欄位、形同虛設，這是本檔這輪修復裡最重要的一項。
+// 沒有「24 小時內＋簽章核對通過」的證據、或「## 驗收條件」尚有未勾項 → stderr 印理由、exit 2 擋下；
+// 都過 → 放行。任何解析異常一律 fail-open（放行），不誤擋日常編輯——擋人是例外，不是預設。
 //
 // R1 證據防偽：只認「24 小時內的 ISO 時間戳」不夠防偽——時間戳是純文字，手改票檔一樣能塞一個
 // 24 小時內的字串進去。真正把關的是簽章：對最新一筆證據的「ISO 時間戳＋票檔相對路徑＋全部指令
-// 串接＋輸出尾行」重算 HMAC-SHA256，核對證據筆尾的 `sig: <hex>` 行——簽章缺失／不符／unsigned／
-// secret 檔不存在，一律擋下（secret 不存在時 fail-closed：沒有 secret 就無法驗證任何東西，
-// 一律當作未過關，不能因為讀不到 secret 就放水）。
-// **鏡像提醒**：本檔的簽章建構邏輯（SECRET_PATH／ticketRelPath／FIELD_SEP／computeSignature，
-// 以及簽章涵蓋的欄位定義）與 gates/verify-runner.mjs 的簽章邏輯必須逐字元一致，兩檔各自內聯一份
-// （不共用 import）——這是安全閘門，不依賴另一支腳本的存在／版本；改一份要同步改另一份。
+// 串接＋輸出尾行＋repo 根絕對路徑」重算 HMAC-SHA256，核對證據筆尾的 `sig: <hex>` 行——簽章缺失／
+// 不符／unsigned／secret 檔不存在，一律擋下（secret 不存在時 fail-closed：沒有 secret 就無法驗證
+// 任何東西，一律當作未過關，不能因為讀不到 secret 就放水）。repo 根這段防跨專案重放。
+// **鏡像提醒**：本檔的簽章建構邏輯（SECRET_PATH／ticketRelPath／FIELD_SEP／computeSignature／
+// repoRootToken，以及簽章涵蓋的欄位定義）與 gates/verify-runner.mjs 的簽章邏輯、gates/commit-gate.mjs
+// 的 done 票稽核驗簽邏輯必須逐字元一致，三檔各自內聯一份（不共用 import）——這是安全閘門，不依賴
+// 另一支腳本的存在／版本；改一份要同步改另兩份。
 import { readFileSync } from 'node:fs';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { homedir } from 'node:os';
@@ -39,6 +42,9 @@ const STATUS_DONE_ADDED_RE = /^\+\s*status\s*:\s*done\s*(?:#.*)?\s*$/m;
 // 只認「驗證證據」開頭即可，不要求整行只有這四個字——實際模板標題帶括號說明文字
 // （如「## 驗證證據（關票時由 runner 寫入...）」），要求整行精確符合會漏配該 section。
 const EVIDENCE_HEADING_RE = /^##\s*驗證證據.*$/m;
+// 「## 驗收條件」section 內、行首未勾選的列項（- [ ]，允許前導縮排——巢狀清單也算數）。
+const ACCEPTANCE_HEADING_RE = /^##\s*驗收條件.*$/m;
+const UNCHECKED_ACCEPTANCE_RE = /^\s*-\s*\[\s\]/m;
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 const CLOCK_SKEW_MS = 5 * 60 * 1000; // 容許 5 分鐘時鐘飄移，別把剛寫入的證據當成「未來時間」而判失敗
 
@@ -48,7 +54,7 @@ const GATES_DIR = dirname(fileURLToPath(import.meta.url));
 const VERIFY_RUNNER_ABS_PATH = join(GATES_DIR, 'verify-runner.mjs');
 
 // ---------------------------------------------------------------------------
-// R1 簽章（與 verify-runner.mjs 鏡像，見檔頭說明）
+// R1 簽章（與 verify-runner.mjs／commit-gate.mjs 鏡像，見檔頭說明）
 // ---------------------------------------------------------------------------
 const SECRET_PATH = join(homedir(), '.constellation', 'secret');
 
@@ -67,9 +73,14 @@ function ticketRelPath(p) {
   return m ? m[0] : norm;
 }
 
-const FIELD_SEP = '';
-function computeSignature(secret, ts, relPath, commandsJoined, lastLine) {
-  const payload = [ts, relPath, commandsJoined, lastLine].join(FIELD_SEP);
+// repo 根識別 token：path.resolve 正規化後轉小寫、反斜線轉正斜線。
+function repoRootToken(cwd) {
+  return resolve(cwd).toLowerCase().replace(/\\/g, '/');
+}
+
+const FIELD_SEP = '\u0001';
+function computeSignature(secret, ts, relPath, commandsJoined, lastLine, repoRoot) {
+  const payload = [ts, relPath, commandsJoined, lastLine, repoRoot].join(FIELD_SEP);
   return createHmac('sha256', secret).update(payload, 'utf8').digest('hex');
 }
 
@@ -82,6 +93,30 @@ function safeHexEqual(a, b) {
   } catch {
     return false;
   }
+}
+
+// 從 hook payload 解析 cwd（多鍵名 fallback）——與 verify-runner 的 --cwd 概念上是同一個「專案根」，
+// 必須用同一套推導方式（resolve→小寫→正斜線）才能讓兩邊算出的 repoRootToken 一致。
+function resolveCwd(input) {
+  return input.cwd ?? input.workspace_root ?? input.workingDirectory ?? process.cwd();
+}
+
+// ---------------------------------------------------------------------------
+// 驗收條件解析：取「## 驗收條件」section，判斷是否還有未勾選列項。
+// ---------------------------------------------------------------------------
+function acceptanceSection(content) {
+  const m = content.match(ACCEPTANCE_HEADING_RE);
+  if (!m) return '';
+  const after = m.index + m[0].length;
+  const rest = content.slice(after);
+  const next = rest.match(/\n##\s/);
+  return next ? rest.slice(0, next.index) : rest;
+}
+
+function hasUncheckedAcceptance(content) {
+  const section = acceptanceSection(content);
+  if (!section) return false; // 沒有這個 section 就不擋——不強迫每張票都用這個模板
+  return UNCHECKED_ACCEPTANCE_RE.test(section);
 }
 
 // ---------------------------------------------------------------------------
@@ -227,8 +262,18 @@ function mismatchMessage(filePath) {
   ].join('\n');
 }
 
-// 核心驗證：給定完整票檔內容與檔案路徑，判斷最新一筆證據是否新鮮且簽章核對通過。
-function verifyEvidence(content, filePath) {
+function uncheckedAcceptanceMessage(filePath) {
+  return [
+    `Constellation 關票刷卡機：擋下——${filePath} 要把 status 設為 done，但「## 驗收條件」尚有未勾項。`,
+    '  → 驗收條件尚有未勾項——逐條實跑驗過、勾滿再關票',
+  ].join('\n');
+}
+
+// 核心驗證：給定完整票檔內容、檔案路徑、cwd（用於 repo 根 token），判斷驗收條件是否全勾、
+// 最新一筆證據是否新鮮且簽章核對通過。
+function verifyEvidence(content, filePath, cwd) {
+  if (hasUncheckedAcceptance(content)) return BLOCK(uncheckedAcceptanceMessage(filePath));
+
   const secret = readSecret();
   if (!secret) return BLOCK(missingSecretMessage(filePath));
 
@@ -245,7 +290,8 @@ function verifyEvidence(content, filePath) {
   if (entry.sig === 'unsigned') return BLOCK(unsignedMessage(filePath));
 
   const relPath = ticketRelPath(filePath);
-  const expected = computeSignature(secret, entry.ts, relPath, entry.commandsJoined, entry.lastLine);
+  const repoRoot = repoRootToken(cwd);
+  const expected = computeSignature(secret, entry.ts, relPath, entry.commandsJoined, entry.lastLine, repoRoot);
   if (!safeHexEqual(expected, entry.sig)) return BLOCK(mismatchMessage(filePath));
 
   return PASS;
@@ -253,10 +299,10 @@ function verifyEvidence(content, filePath) {
 
 // Edit／MultiEdit／apply_patch 共用：從磁碟讀「編輯前」的現檔內容來驗證（變更片段裡通常沒有
 // 證據 section，證據活在檔案其他地方）。讀不到檔案就放行，不誤擋（fail-open）。
-function verifyFromDisk(filePath) {
+function verifyFromDisk(filePath, cwd) {
   let disk;
   try { disk = readFileSync(filePath, 'utf8'); } catch { return PASS; }
-  return verifyEvidence(stripBom(disk), filePath);
+  return verifyEvidence(stripBom(disk), filePath, cwd);
 }
 
 // ---------------------------------------------------------------------------
@@ -274,7 +320,7 @@ function checkApplyPatch(patchText, input) {
   }
   if (!markers.length) return PASS;
 
-  const cwd = input.cwd ?? input.workspace_root ?? input.workingDirectory ?? process.cwd();
+  const cwd = resolveCwd(input);
 
   for (let i = 0; i < markers.length; i++) {
     const marker = markers[i];
@@ -286,10 +332,16 @@ function checkApplyPatch(patchText, input) {
     if (!STATUS_DONE_ADDED_RE.test(segment)) continue;
 
     const absPath = resolve(cwd, marker.path);
-    const r = verifyFromDisk(absPath);
+    const r = verifyFromDisk(absPath, cwd);
     if (r.block) return r;
   }
   return PASS;
+}
+
+// 從一組候選值裡取第一個非空字串——apply_patch 的 patch 文字來源 fallback 鏈用。
+function firstNonEmptyString(...vals) {
+  for (const v of vals) if (typeof v === 'string' && v.length) return v;
+  return '';
 }
 
 // ---------------------------------------------------------------------------
@@ -304,7 +356,7 @@ export function closeGateCheck(input) {
     if (!filePath || !TICKET_PATH_RE.test(filePath)) return PASS;
     const content = ti.content;
     if (typeof content !== 'string' || !STATUS_DONE_RE.test(content)) return PASS;
-    return verifyEvidence(content, filePath);
+    return verifyEvidence(content, filePath, resolveCwd(input));
   }
 
   if (tool === 'Edit') {
@@ -312,7 +364,7 @@ export function closeGateCheck(input) {
     if (!filePath || !TICKET_PATH_RE.test(filePath)) return PASS;
     const newString = ti.new_string ?? ti.newString;
     if (typeof newString !== 'string' || !STATUS_DONE_RE.test(newString)) return PASS;
-    return verifyFromDisk(filePath);
+    return verifyFromDisk(filePath, resolveCwd(input));
   }
 
   if (tool === 'MultiEdit') {
@@ -324,13 +376,16 @@ export function closeGateCheck(input) {
       return typeof ns === 'string' && STATUS_DONE_RE.test(ns);
     });
     if (!setsDone) return PASS;
-    return verifyFromDisk(filePath);
+    return verifyFromDisk(filePath, resolveCwd(input));
   }
 
   // Codex apply_patch：不嚴格卡 tool_name（Codex 端的實際 tool_name 可能是 apply_patch 或其他
   // 殼名），只要輸入形狀帶 patch 文字就進這條分支——matcher 層（hooks.codex.json）已經只放行
   // Edit|Write|apply_patch 三種工具進來，這裡再檢查形狀是雙重保險。
-  const patchText = typeof ti.patch === 'string' ? ti.patch : (typeof input.patch === 'string' ? input.patch : '');
+  // patch 文字來源 fallback 鏈：tool_input.patch → tool_input.command → input.patch → input.command
+  // ——Codex 官方 payload 實際把 apply_patch 內容放在 command 欄位，只認 tool_input.patch 讀錯欄位、
+  // 形同虛設，這是本檔這輪最重要的修復。
+  const patchText = firstNonEmptyString(ti.patch, ti.command, input.patch, input.command);
   if (patchText) return checkApplyPatch(patchText, input);
 
   return PASS;

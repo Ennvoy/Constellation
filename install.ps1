@@ -2,13 +2,15 @@
     install.ps1 —— Asteria Constellation 一鍵部署（DESIGN.md §9／§10）。
 
     功能：
-      1. 把 skills/constellation、skills/grill 各自 junction 到 Claude Code 與 Codex 的
-         個人 skills 目錄（~/.claude/skills/<name>、~/.codex/skills/<name>），兩邊 runtime
-         讀同一份實體檔案，不重複部署。
+      1. 把 skills/constellation、skills/grill 各自 junction 到三邊 runtime 的個人 skills
+         目錄（~/.claude/skills/<name>、~/.codex/skills/<name>、~/.agents/skills/<name>，
+         最後一個是 Codex 官方現行使用者層 skills 路徑），三邊 runtime 讀同一份實體檔案，
+         不重複部署；目標目錄不存在會自動先建。
       2. 把 gates/hooks.claude.json、gates/hooks.codex.json（先把 {{ROOT}} 換成本機絕對路徑）
          合併進 ~/.claude/settings.json 與 ~/.codex/hooks.json 的 hooks 設定，保留使用者原有的
          其他項目，只汰換 Constellation 自家掛的那幾條（冪等，重跑安全）。
-      3. 印出對賬報告：每個 junction 的結果、兩邊 hooks 自家項數量、gates/*.mjs 逐支語法檢查。
+      3. 印出對賬報告：三組 junction 的結果、兩邊 hooks 自家項數量、gates/*.mjs 逐支語法檢查、
+         Codex hooks feature 開啟狀態。
 
     用法：
       ./install.ps1              安裝／重新對賬
@@ -318,16 +320,32 @@ function Invoke-HooksMerge {
 # ---------------------------------------------------------------------------
 $skillsToLink = @('constellation', 'grill')
 
-$runtimeTargets = @(
+# Skill junction 三組目標（Claude Code／Codex／Codex 官方現行使用者層 ~/.agents/skills，
+# 三邊都讀同一份母本實體檔案）。.agents 這組只掛 skill junction，不涉 hooks 合併。
+$skillsTargets = @(
     [PSCustomObject]@{
         Runtime = 'claude'
         SkillsBase = Join-Path $env:USERPROFILE '.claude\skills'
+    },
+    [PSCustomObject]@{
+        Runtime = 'codex'
+        SkillsBase = Join-Path $env:USERPROFILE '.codex\skills'
+    },
+    [PSCustomObject]@{
+        Runtime = 'agents'
+        SkillsBase = Join-Path $env:USERPROFILE '.agents\skills'
+    }
+)
+
+# Hooks 合併只有 Claude Code／Codex 兩邊有對應設定檔（~/.agents 本身不掛 hooks）。
+$hooksTargets = @(
+    [PSCustomObject]@{
+        Runtime = 'claude'
         HooksFragment = Join-Path $Root 'gates\hooks.claude.json'
         HooksTarget = Join-Path $env:USERPROFILE '.claude\settings.json'
     },
     [PSCustomObject]@{
         Runtime = 'codex'
-        SkillsBase = Join-Path $env:USERPROFILE '.codex\skills'
         HooksFragment = Join-Path $Root 'gates\hooks.codex.json'
         HooksTarget = Join-Path $env:USERPROFILE '.codex\hooks.json'
     }
@@ -343,7 +361,7 @@ $mjsResults = New-Object System.Collections.Generic.List[object]
 if ($Uninstall) {
     $rootSkillsNorm = Normalize-Path (Join-Path $Root 'skills')
     foreach ($skill in $skillsToLink) {
-        foreach ($rt in $runtimeTargets) {
+        foreach ($rt in $skillsTargets) {
             $linkPath = Join-Path $rt.SkillsBase $skill
             $r = [PSCustomObject]@{ Skill = $skill; Runtime = $rt.Runtime; LinkPath = $linkPath; Action = ''; Detail = '' }
             try {
@@ -372,12 +390,12 @@ if ($Uninstall) {
     foreach ($skill in $skillsToLink) {
         $source = Join-Path $Root ("skills\{0}" -f $skill)
         if (-not (Test-Path -LiteralPath $source -PathType Container)) {
-            foreach ($rt in $runtimeTargets) {
+            foreach ($rt in $skillsTargets) {
                 $junctionResults.Add([PSCustomObject]@{ Skill = $skill; Runtime = $rt.Runtime; LinkPath = '(N/A)'; Action = '錯誤(來源不存在)'; Detail = $source })
             }
             continue
         }
-        foreach ($rt in $runtimeTargets) {
+        foreach ($rt in $skillsTargets) {
             $linkPath = Join-Path $rt.SkillsBase $skill
             $r = [PSCustomObject]@{ Skill = $skill; Runtime = $rt.Runtime; LinkPath = $linkPath; Action = ''; Detail = '' }
             try {
@@ -415,7 +433,7 @@ if ($Uninstall) {
 # ---------------------------------------------------------------------------
 # hooks 合併 / 拆除
 # ---------------------------------------------------------------------------
-foreach ($rt in $runtimeTargets) {
+foreach ($rt in $hooksTargets) {
     if ($Uninstall) {
         $hooksResults.Add((Invoke-HooksMerge -Label $rt.Runtime -FragmentPath $rt.HooksFragment -TargetPath $rt.HooksTarget -RootPath $Root -UninstallMode))
     } else {
@@ -469,11 +487,13 @@ if ($Uninstall) {
 
 # ---------------------------------------------------------------------------
 # Codex hooks feature 狀態確認（BY7a；非致命——抓不到 codex 指令或執行失敗都只降級
-# 為提示，不影響本次安裝／對賬結果）。
+# 為提示，不影響本次安裝／對賬結果）。除了抓到那一行原文，另外解析行內 enabled 值
+# （true/false）：false 印警告要求去 config.toml 開啟；解析不到就印「無法確認」。
 # ---------------------------------------------------------------------------
 $codexFeatureFound = $false
 $codexFeatureLine = ''
 $codexFeatureNote = ''
+$codexFeatureEnabled = $null   # $null=無法解析, $true=已開啟, $false=未開啟
 try {
     $codexCmd = Get-Command codex -ErrorAction SilentlyContinue
     if (-not $codexCmd) {
@@ -489,6 +509,13 @@ try {
             if ($hooksLine) {
                 $codexFeatureFound = $true
                 $codexFeatureLine = $hooksLine.Trim()
+                if ($codexFeatureLine -match '(?i)\btrue\b') {
+                    $codexFeatureEnabled = $true
+                } elseif ($codexFeatureLine -match '(?i)\bfalse\b') {
+                    $codexFeatureEnabled = $false
+                } else {
+                    $codexFeatureNote = '無法從輸出解析 enabled 值(true/false)'
+                }
             } else {
                 $codexFeatureNote = '輸出中找不到 hooks 相關字樣'
             }
@@ -555,6 +582,9 @@ foreach ($r in $hooksResults) {
         Write-Host ("  [{0}] {1} -> 狀態：{2}，自家項數量：{3}" -f $r.Label, $r.TargetPath, $r.Status, $r.OwnCount)
     }
     if ($r.Detail) { Write-Host ("      {0}" -f $r.Detail) }
+    if (-not $Uninstall -and $r.Label -eq 'codex') {
+        Write-Host '      提醒：hooks 設定已寫入，但 Codex 要求在其 CLI 內執行 /hooks 審閱並信任後才會真正生效——請務必完成此步驟，否則 Codex 端閘門不會觸發。'
+    }
 }
 
 Write-Host ''
@@ -579,6 +609,11 @@ Write-Host ''
 Write-Host '-- Codex Hooks Feature 狀態 (codex features list) --'
 if ($codexFeatureFound) {
     Write-Host ("  {0}" -f $codexFeatureLine)
+    if ($codexFeatureEnabled -eq $false) {
+        Write-Host '  警告：Codex hooks 功能未開啟，請在 config.toml [features] 開啟。'
+    } elseif ($null -eq $codexFeatureEnabled) {
+        Write-Host '  無法確認。'
+    }
 } else {
     Write-Host ("  無法確認 Codex hooks feature 狀態，請自行確認。({0})" -f $codexFeatureNote)
 }

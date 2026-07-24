@@ -12,6 +12,7 @@
 - 跑法：驗證 runner 絕對路徑由 session 開場注入提供（閘門 3 開場會印出這個路徑）；session 沒印出注入路徑時，用 install 部署的母本路徑 `<母本>\gates\verify-runner.mjs`。執行 `node <runner 絕對路徑> --scope ship`——一次跑齊 `.constellation/config.json` 裡登記的**全部** `commands.journey`，加上 `commands.test` 的完整回歸——不是只挑被改到的部份。
 - 跟逐票驗證的差異：逐票只驗那張票驗收條件涉及的部份，範圍窄；這裡是全量。
 - 一樣走真鏈路：真點擊（Playwright）、真 API、真 DB 讀回，不能用 mock。
+- **證據落點**：`--scope ship` 這次跑出的全量證據，由 runner 簽章寫入 `.constellation/ship-evidence.md`（跟逐票證據寫進各票檔不同，全量證據集中這一份）——下面「出貨報告」的「證據在哪」就是指向這份檔案，不是要求審查者自己東拼西湊。
 - 有任何一條紅：先回本檔同目錄的 `phase-build.md` 修，修完再回來重跑全量，不要帶著已知的紅燈去做下一步的審查——審查是相對貴的動作，值得先確認能全部跑過再花時間審。
 
 ## 步驟 2：獨立兩軸審查
@@ -38,4 +39,12 @@
 
 - **做了什麼**：這輪出貨包含哪些票，每張票一句話說做了什麼。
 - **驗了什麼**：全量驗證跑了哪些 test／journey、結果如何；兩軸審查各自看了什麼範圍。
-- **證據在哪**：驗證輸出、截圖、log 存在哪個檔案或哪張票的哪個欄位——讓人可以自己回去核對，不能只靠這份報告的文字斷言。
+- **證據在哪**：全量驗證的證據指向 `.constellation/ship-evidence.md`（步驟 1 由 runner 簽章寫入）；逐票驗證與審查發現另外存在各票檔的對應欄位——讓人可以自己回去核對，不能只靠這份報告的文字斷言。
+
+## 步驟 3：出貨後歸檔
+
+離場條件（全量驗證綠燈＋兩軸審查無阻擋級發現＋出貨報告已產出）滿足後，才做這一步——讓下一輪任務從乾淨狀態開始，新舊輪不混淆：
+
+- 把本輪 `tickets/`、`decisions/grill-close.md`、`.constellation/ship-evidence.md` 整批移入 `.constellation/archive/<日期>-<摘要>/`（`<日期>` 用 `yyyy-mm-dd`，`<摘要>` 取 `decisions/grill-close.md` 記錄的一句話任務摘要轉成 kebab-case slug）。
+- `CONTEXT.md` 與其餘 `decisions/NNN-slug.md`（`grill-close.md` 除外）**留在原位、不歸檔**——這些是跨輪累積的專案領域知識，不是單輪產物。
+- 歸檔完成後，`.constellation/` 底下不再有任何 `tickets/*.md`，也沒有 `decisions/grill-close.md`——這是刻意的：下次總控（`skills/constellation/SKILL.md` Step 0）讀到這個狀態，會依「`tickets/` 空＋`grill-close.md` 不存在」判定「訪談尚未完成」，Lazy Read `references/phase-grill.md` 走增量重訪。這正是要的效果——`CONTEXT.md` 與其餘 `decisions/*.md` 還留著跨輪知識，新一輪需求接上既有背景繼續問新的 frontier，不會被上一輪的舊票或舊決議誤判成「還在做上一輪」。

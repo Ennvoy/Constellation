@@ -1,19 +1,24 @@
 #!/usr/bin/env node
 // gates/commit-gate.mjs — Constellation commit 守門（PreToolUse on Bash|PowerShell）。
-// 從 Flow flow-commit-gate.mjs（+ commit-gate-core.mjs）搬入並去 Flow 化，攔 `git commit`，保留兩道
+// 從 Flow flow-commit-gate.mjs（+ commit-gate-core.mjs）搬入並去 Flow 化，攔 `git commit`，保留三道
 // 核心確定性防護：
 //   閘門〇「secrets 不進歷史」：staged 含 .env/私鑰類檔案 → 擋下，先移出 staging＋補 .gitignore。
 //   閘門一「先清、再 commit」：staged 含驗證垃圾（測試/驗證過程產物，含 .playwright-mcp 的 MCP 殘留）→ 擋下。
+//   閘門二「done 票稽核」：staged 的票檔若把 status 設為 done，驗其最新證據筆簽章（新鮮度放寬 7 天，
+//     其餘與關票刷卡機同一套驗簽邏輯）——堵「用 shell 指令繞過關票刷卡機直接改檔＋git add」這條旁門，
+//     關票刷卡機只在 Edit/Write/MultiEdit/apply_patch 當下擋，commit 這關再兜底一次。
 // 另補「模型端繞過 pre-commit」防線：命令帶 --no-verify/-n 或改向 -c core.hooksPath → 擋下（human 在終端機
 // 自己打的不過本 hook，--no-verify 對人仍是 documented 逃生門、reflog 可稽核）。
-// `--amend` 不豁免：兩道閘門照常判斷當下 staged 內容。
+// `--amend` 不豁免：三道閘門照常判斷當下 staged 內容。
+// repo root 一律用 `git rev-parse --show-toplevel`（在 cwd 下跑）解析，失敗才 fallback 用 cwd 本身——
+// `.constellation` 存在性偵測、staged 檔案清單、done 票稽核全部基於這個 root，子目錄開 commit 也準。
 // 設計鐵則：fail-open（解析不出 / 非 git commit / 非 Constellation 專案 / git 或例外 → 一律放行，絕不誤擋）。
 //
 // ── 去 Flow 化紀錄（供整合者核對，勿在後續同步流程中復原以下行為）──
 //   1) 原檔第三道閘門「先標、再 commit」（比對 commit message 點名的 flow task 是否已在 .flow ledger 標
 //      delivered，依賴 flow-toolkit/statelib.mjs 與 flow-state.mjs）已整支剝除，不搬。Constellation 的
-//      等效防護落在獨立的「關票刷卡機」（gates/close-gate.mjs，票標 done 時檢查驗證證據存在且新鮮），
-//      責任點在「關票」而非「commit 當下」，兩者本就該分開、也避免本檔對 flow-toolkit 產生跨專案依賴。
+//      對應防護落在本檔「done 票稽核」＋獨立的「關票刷卡機」（gates/close-gate.mjs，票標 done 時檢查
+//      驗證證據存在且新鮮），兩層責任分開：close-gate 管「改檔當下」、commit-gate 管「進歷史前兜底」。
 //   2) 原本 secrets／驗證垃圾判定抽在共用檔 commit-gate-core.mjs（供 git 原生 pre-commit 對應檔
 //      flow-precommit.mjs 共用），Constellation 這次未搬原生 pre-commit 對應檔，故本檔內聯全部判定
 //      邏輯，改為單檔自足，不再依賴外部 core 檔。
@@ -23,9 +28,17 @@
 //      `git restore --staged` 手動移出，不再呼叫外部清理腳本。
 //   4) 生效範圍門檻由「.flow 存在」改為「.constellation 存在」——僅在已採用 Constellation 工作流的專案
 //      生效，非本工作流專案不受影響（與原檔「非 flow 專案放行」同一設計精神，只是換了目錄名）。
-import { existsSync } from 'node:fs';
+//
+// R1 證據防偽（done 票稽核用）：與 gates/verify-runner.mjs／gates/close-gate.mjs 的簽章邏輯**逐字元一致
+// 鏡像**（SECRET_PATH／ticketRelPath／FIELD_SEP／computeSignature／repoRootToken，以及簽章涵蓋欄位），
+// 三檔各自內聯一份、不共用 import——安全閘門不依賴另一支腳本的存在／版本；改一份要同步改另兩份。
+// 與另外兩檔的差異僅止於「新鮮度窗口」：關票當下 24 小時、commit 稽核放寬到 7 天（票可能關了幾天
+// 才真的 commit），驗簽核心邏輯完全相同。
+import { existsSync, readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { join } from 'node:path';
+import { createHmac, timingSafeEqual } from 'node:crypto';
+import { homedir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const exit0 = () => process.exit(0);
@@ -49,6 +62,166 @@ if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
     if (r && r.block) { process.stderr.write(String(r.message || '') + '\n'); process.exit(2); }
     exit0();
   });
+}
+
+// ── repo root 解析（新增）：git rev-parse --show-toplevel，失敗 fallback cwd ──
+function resolveRepoRoot(cwd) {
+  try {
+    const out = execFileSync('git', ['-C', cwd, 'rev-parse', '--show-toplevel'], { maxBuffer: 1 << 20 })
+      .toString('utf8').trim();
+    if (out) return out;
+  } catch {} // 非 git repo／git 不存在等 → fallback cwd，維持 fail-open 精神
+  return cwd;
+}
+
+// ── 內聯：R1 簽章（與 verify-runner.mjs／close-gate.mjs 鏡像，見檔頭說明）──
+const SECRET_PATH = join(homedir(), '.constellation', 'secret');
+
+function readSecret() {
+  try {
+    const s = readFileSync(SECRET_PATH, 'utf8').trim();
+    return s || null;
+  } catch {
+    return null;
+  }
+}
+
+function ticketRelPath(p) {
+  const norm = String(p).replace(/\\/g, '/');
+  const m = norm.match(/\.constellation\/tickets\/[^/]+\.md$/i);
+  return m ? m[0] : norm;
+}
+
+function repoRootToken(cwd) {
+  return resolve(cwd).toLowerCase().replace(/\\/g, '/');
+}
+
+const FIELD_SEP = '\u0001';
+function computeSignature(secret, ts, relPath, commandsJoined, lastLine, repoRoot) {
+  const payload = [ts, relPath, commandsJoined, lastLine, repoRoot].join(FIELD_SEP);
+  return createHmac('sha256', secret).update(payload, 'utf8').digest('hex');
+}
+
+function safeHexEqual(a, b) {
+  try {
+    const ba = Buffer.from(String(a), 'hex');
+    const bb = Buffer.from(String(b), 'hex');
+    if (ba.length === 0 || ba.length !== bb.length) return false;
+    return timingSafeEqual(ba, bb);
+  } catch {
+    return false;
+  }
+}
+
+const EVIDENCE_HEADING_RE = /^##\s*驗證證據.*$/m;
+function evidenceSection(content) {
+  const m = content.match(EVIDENCE_HEADING_RE);
+  if (!m) return '';
+  const after = m.index + m[0].length;
+  const rest = content.slice(after);
+  const next = rest.match(/\n##\s/);
+  return next ? rest.slice(0, next.index) : rest;
+}
+
+function splitEntries(section) {
+  const lines = section.split(/\r?\n/);
+  const starts = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (/^-\s*\*\*[^*]+\*\*\s*$/.test(lines[i])) starts.push(i);
+  }
+  const out = [];
+  for (let i = 0; i < starts.length; i++) {
+    const begin = starts[i];
+    const end = i + 1 < starts.length ? starts[i + 1] : lines.length;
+    out.push(lines.slice(begin, end));
+  }
+  return out;
+}
+
+function findLastOutputLine(contentLines, lastCmdIdx) {
+  if (lastCmdIdx < 0) return '';
+  let idx = lastCmdIdx + 1;
+  if (idx < contentLines.length && /^ {4}\(.*\)\s*$/.test(contentLines[idx])) idx++;
+  if (idx < contentLines.length && /^ {4}```\s*$/.test(contentLines[idx])) {
+    let j = idx + 1;
+    const block = [];
+    while (j < contentLines.length && !/^ {4}```\s*$/.test(contentLines[j])) {
+      block.push(contentLines[j]);
+      j++;
+    }
+    for (let k = block.length - 1; k >= 0; k--) {
+      const rawLine = block[k].startsWith('    ') ? block[k].slice(4) : block[k];
+      if (rawLine.trim() !== '') return rawLine;
+    }
+  }
+  return '';
+}
+
+const COMMAND_LINE_RE = /^\s*-\s*`(.+)`（exit\s*-?\d+）\s*$/;
+const SIG_LINE_RE = /^\s*-\s*sig:\s*(\S+)\s*$/;
+
+function parseEntry(linesArr) {
+  const tsMatch = linesArr[0] && linesArr[0].match(/^-\s*\*\*([^*]+)\*\*\s*$/);
+  const ts = tsMatch ? tsMatch[1].trim() : '';
+
+  let sigIdx = -1, sig = null;
+  for (let i = 0; i < linesArr.length; i++) {
+    const m = linesArr[i].match(SIG_LINE_RE);
+    if (m) { sigIdx = i; sig = m[1]; }
+  }
+  const contentLines = sigIdx >= 0 ? linesArr.slice(0, sigIdx) : linesArr.slice();
+
+  const cmds = [];
+  let lastCmdIdx = -1;
+  for (let i = 0; i < contentLines.length; i++) {
+    const m = contentLines[i].match(COMMAND_LINE_RE);
+    if (m) { cmds.push(m[1]); lastCmdIdx = i; }
+  }
+
+  return {
+    ts,
+    sig,
+    commandsJoined: cmds.join('\n'),
+    lastLine: findLastOutputLine(contentLines, lastCmdIdx),
+  };
+}
+
+function latestEntry(section) {
+  let best = null, bestTs = -Infinity;
+  for (const g of splitEntries(section)) {
+    const e = parseEntry(g);
+    const t = Date.parse(e.ts);
+    if (Number.isNaN(t)) continue;
+    if (t > bestTs) { bestTs = t; best = e; }
+  }
+  return best;
+}
+
+// done 票稽核用新鮮度窗口：7 天（比關票當下的 24 小時寬——票可能關了幾天才真的 commit）。
+const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+const CLOCK_SKEW_MS = 5 * 60 * 1000;
+
+// 驗某張 done 票的最新證據筆是否簽章核對通過且在 7 天新鮮期內。root＝repo 根（resolveRepoRoot 結果），
+// relFsPath＝該票相對 root 的路徑（git 給的 staged 路徑，天生就是這個格式）。
+function verifyTicketEvidence(content, relFsPath, root) {
+  const secret = readSecret();
+  if (!secret) return false; // fail-closed：沒有 secret 一律視為未過關
+
+  const section = evidenceSection(content);
+  const entry = section ? latestEntry(section) : null;
+  if (!entry) return false;
+
+  const now = Date.now();
+  const t = Date.parse(entry.ts);
+  const fresh = !Number.isNaN(t) && (now - t <= SEVEN_DAYS_MS) && (now - t >= -CLOCK_SKEW_MS);
+  if (!fresh) return false;
+
+  if (!entry.sig || entry.sig === 'unsigned') return false;
+
+  const relPath = ticketRelPath(relFsPath);
+  const repoRoot = repoRootToken(root);
+  const expected = computeSignature(secret, entry.ts, relPath, entry.commandsJoined, entry.lastLine, repoRoot);
+  return safeHexEqual(expected, entry.sig);
 }
 
 // ── 內聯：驗證垃圾白名單判定（原 flow-toolkit/clean-verify-artifacts.mjs 的最小子集，見去 Flow 化紀錄③）──
@@ -92,17 +265,18 @@ function isCommitBlockableArtifact(relpath) {
   return underArtifactDir(relpath) || isHardArtifact(base);
 }
 
-// ── 內聯：staged 清單 + 閘門〇（secrets）+ 閘門一（驗證垃圾）判定（原 commit-gate-core.mjs，見去 Flow 化紀錄②）──
-function stagedFiles(cwd) {
+// ── 內聯：staged 清單 + 閘門〇（secrets）+ 閘門一（驗證垃圾）+ 閘門二（done 票稽核）判定 ──
+// 全部基於 root（resolveRepoRoot 的結果），不是原始 cwd——子目錄開 commit 一樣準。
+function stagedFiles(root) {
   try {
-    return execFileSync('git', ['-C', cwd, 'diff', '--cached', '--name-only', '-z'], { maxBuffer: 1 << 26 })
+    return execFileSync('git', ['-C', root, 'diff', '--cached', '--name-only', '-z'], { maxBuffer: 1 << 26 })
       .toString('utf8').split('\0').filter(Boolean);
-  } catch { return null; } // 取不到＝fail-open，兩道檔案閘門都放行
+  } catch { return null; } // 取不到＝fail-open，三道檔案閘門都放行
 }
 
 // 檔名白名單式偵測（確定性、近零額外 IO）；樣板（*.example 等）與公鑰放行。
 // .npmrc/.pypirc 常見且多半只有 registry 設定 → 只在 staged 內容真含 token/password 才擋（讀 staged 版本）。
-function secretsReason(cwd, staged) {
+function secretsReason(root, staged) {
   if (!staged) return null;
   const SECRET_RE = [
     /(^|\/)\.env(\.[^/]+)?$/i,                       // .env / .env.local / .env.production…
@@ -116,7 +290,7 @@ function secretsReason(cwd, staged) {
   const TOKENY_RE = /(^|\/)\.(npmrc|pypirc)$/i;
   for (const p of staged.filter((q) => TOKENY_RE.test(q))) {
     try {
-      const body = execFileSync('git', ['-C', cwd, 'show', ':' + p], { maxBuffer: 1 << 20 }).toString('utf8');
+      const body = execFileSync('git', ['-C', root, 'show', ':' + p], { maxBuffer: 1 << 20 }).toString('utf8');
       // 只在帶「真正字面值」時擋——排除 env 變數引用（${VAR}/$VAR，npm 官方推薦的安全寫法），否則誤擋乾淨 .npmrc。
       if (/_authToken\s*=\s*(?!\$\{|\$[A-Za-z_])['"]?\S/i.test(body) || /password\s*[=:]\s*(?!\$\{|\$[A-Za-z_])['"]?\S/i.test(body)) secrets.push(p);
     } catch {} // 讀不到 staged 內容 → fail-open（純 registry 設定不誤擋）
@@ -147,6 +321,36 @@ function artifactsReason(staged) {
   ].join('\n');
 }
 
+const TICKET_PATH_RE = /(^|[\\/])\.constellation[\\/]tickets[\\/][^\\/]+\.md$/i;
+const STATUS_DONE_RE = /^\s*status\s*:\s*done\s*(?:#.*)?$/im;
+
+// staged 裡標 done 的票，逐張驗證據簽章——讀 staged 版本內容（git show :path），失敗才 fallback 磁碟
+// （例如檔案已從 index 移除但還在工作區這種邊緣狀況，寧可再試一次也不要 fail-open 漏掉稽核）。
+function doneTicketAuditReason(root, staged) {
+  if (!staged) return null;
+  const ticketPaths = staged.filter((p) => TICKET_PATH_RE.test(p));
+  if (!ticketPaths.length) return null;
+
+  const failing = [];
+  for (const p of ticketPaths) {
+    let content = null;
+    try {
+      content = execFileSync('git', ['-C', root, 'show', ':' + p], { maxBuffer: 1 << 24 }).toString('utf8');
+    } catch {
+      try { content = readFileSync(join(root, p), 'utf8'); } catch { content = null; }
+    }
+    if (content == null) continue; // 兩邊都讀不到 → 跳過（fail-open，不誤擋不存在/已刪的檔案）
+    content = stripBom(content);
+    if (!STATUS_DONE_RE.test(content)) continue; // 這次 staged 內容沒把它設 done，不必稽核
+    if (!verifyTicketEvidence(content, p, root)) failing.push(p);
+  }
+  if (!failing.length) return null;
+  return [
+    'Constellation commit 守門：擋下 commit —— staged 的 done 票證據驗簽失敗——可能是繞過刷卡機直接改檔；請跑 verify-runner 重新取證再 commit：',
+    ...failing.map((p) => '    ' + p),
+  ].join('\n');
+}
+
 // 純判定（不碰 exit/stderr）。呼叫端負責 fail-open（try-catch）與輸出。
 export function commitGateCheck(input) {
   const tool = input.tool_name ?? input.toolName ?? '';
@@ -159,7 +363,8 @@ export function commitGateCheck(input) {
   if (!/\bgit\b[^\n]*(?<![=-])\bcommit\b(?!-)/.test(cmd)) return PASS;
 
   const cwd = input.cwd ?? process.cwd();
-  if (!existsSync(join(cwd, '.constellation'))) return PASS; // 非 Constellation 專案
+  const root = resolveRepoRoot(cwd); // R9：一律用 git rev-parse --show-toplevel 解析、失敗 fallback cwd
+  if (!existsSync(join(root, '.constellation'))) return PASS; // 非 Constellation 專案
 
   // ── 補堵「繞過 pre-commit 兜底」的旗標 ──
   // 只挖「-m/-F 的值」（含 here-string 與雙引號轉義），再去掉殘餘引號「字元」（非內容）：
@@ -182,12 +387,14 @@ export function commitGateCheck(input) {
     ].join('\n'));
   }
 
-  // ── 兩道閘門 ──
-  const staged = stagedFiles(cwd); // 取一次，兩道共用；取不到＝null＝兩道 fail-open
-  const secret = secretsReason(cwd, staged);
+  // ── 三道閘門 ──
+  const staged = stagedFiles(root); // 取一次，三道共用；取不到＝null＝三道 fail-open
+  const secret = secretsReason(root, staged);
   if (secret) return BLOCK(secret);
   const artifact = artifactsReason(staged);
   if (artifact) return BLOCK(artifact);
+  const doneAudit = doneTicketAuditReason(root, staged);
+  if (doneAudit) return BLOCK(doneAudit);
 
   return PASS;
 }

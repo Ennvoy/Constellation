@@ -1,6 +1,6 @@
 ---
 name: constellation
-description: 當使用者要開發新功能、啟動或推進一個專案、想跑開發工作流、要做需求訪談、有開發任務要處理，或提到 constellation／星座工作流時啟用。偵測專案 .constellation/ 目錄現況，自動接續五步流程（訪談→UI 定稿→合成拆票→逐票實作→出貨）中對的一步，不必使用者自己判斷該從哪接。
+description: 當使用者要啟動新功能開發、想走完整開發工作流、要開新專案／處理新需求、要做需求訪談，或明確提到 constellation／星座工作流時啟用。偵測專案 .constellation/ 目錄現況，自動接續五步流程（訪談→UI 定稿→合成拆票→逐票實作→出貨）中對的一步，不必使用者自己判斷該從哪接。單純修 bug、單純問問題、單純看 code 不觸發本技能。
 ---
 
 # Constellation 總控
@@ -28,19 +28,23 @@ description: 當使用者要開發新功能、啟動或推進一個專案、想�
 2. **`.constellation/` 存在，但 `tickets/` 不存在或裡面沒有任何 `*.md`**：
    - `decisions/grill-close.md` 不存在 → 訪談尚未完成——**即使 `CONTEXT.md` 或 `decisions/` 底下已經有其他內容也一樣**，這份固定決議檔是唯一的機讀完成標記，沒有它一律判定訪談中途中斷、尚未拍板，不能拿其他檔案有內容來腦補「應該問得差不多了」。
      Lazy Read `references/phase-grill.md`，走增量重訪（機制會自動判斷從哪接，不會重問已拍板的節點）。
-   - `decisions/grill-close.md` 存在（內容為大小流程選擇＋是否需要 UI＋一句話任務摘要）→ 訪談已完成、尚未拆票。
+   - `decisions/grill-close.md` 存在（內容為大小流程、是否需要 UI、高風險標記、必備模組排除、一句話任務摘要五欄）→ 訪談已完成、尚未拆票。
      Lazy Read `references/phase-weave.md`；若該任務需要 UI 定稿而尚未定稿，weave 會據此轉交
      `references/phase-design.md`，照它接手即可，不必在此另行判斷。
 
-3. **`tickets/` 底下有 `*.md`**，逐檔讀 `status:` 欄位：
-   - 任一票 `status: open` 或 `in-progress` → 向使用者報告現況：列出每張票的名稱與狀態，
-     in-progress 的票額外摘要做到哪（讀該票「決議記錄」段落）。
-     Lazy Read `references/phase-build.md`，接續實作。
-   - 沒有 `open`／`in-progress`，但有票 `status: blocked` → 向使用者報告被什麼卡住
-     （讀該票「決議記錄」找卡住原因；`blocked-by` 欄位空著代表卡在大事待決或真依賴未就緒——原因見決議記錄，不是在等別張票；`blocked-by` 有填票號才是卡在依賴鏈，等那張票 `done` 才會解除）。
-     Lazy Read `references/phase-build.md`，照其 blocked 彙整規則處理（大事分歧統一彙報、彈窗請使用者拍板）。
-   - 全部票 `status: done` → 向使用者報告全數完成。
-     Lazy Read `references/phase-ship.md`，準備出貨。
+3. **`tickets/` 底下有 `*.md`**：
+   - 先讀 `.constellation/config.json` 有沒有 `"approved": true`：**沒有**（欄位不存在或為 `false`）→ 代表這批票是 weave 合成出來的，但使用者核准確認那一步被中斷、還沒走完（機讀核准標記見 DESIGN.md §4）。向使用者說明目前看到的票清單摘要，Lazy Read `references/phase-weave.md`，回到「完成後：呈交票清單摘要」那一步重新請使用者核准確認，不能跳過核准直接當作已進 build。
+   - **有** `"approved": true` → 照票的 `status:` 欄位判斷：
+     - 任一票 `status: open` 或 `in-progress` → 向使用者報告現況：列出每張票的名稱與狀態，
+       in-progress 的票額外摘要做到哪（讀該票「決議記錄」段落）。
+       Lazy Read `references/phase-build.md`，接續實作。
+     - 沒有 `open`／`in-progress`，但有票 `status: blocked` → 向使用者報告被什麼卡住
+       （讀該票「決議記錄」找卡住原因；`blocked-by` 欄位空著代表卡在大事待決或真依賴未就緒——原因見決議記錄，不是在等別張票；`blocked-by` 有填票號才是卡在依賴鏈，等那張票 `done` 才會解除）。
+       Lazy Read `references/phase-build.md`，照其 blocked 彙整規則處理（大事分歧統一彙報、彈窗請使用者拍板）。
+     - 全部票 `status: done`：
+       - 先檢查 `.constellation/ship-evidence.md` 存不存在，或 `.constellation/archive/` 底下有沒有已經歸檔的資料夾——任一成立，代表本輪已經出貨過（可能出貨後歸檔步驟還沒跑完、票檔還沒被清走，也可能已經跑完歸檔但這批票是舊資料殘留）。向使用者報告「本輪已出貨」，新需求視為全新任務，Lazy Read `references/phase-grill.md` 從頭訪談，不要誤判成「還要準備出貨」而卡在原地重跑一次 ship；順手補跑一次 `references/phase-ship.md` 步驟 3 把這批舊票歸檔清乾淨即可，不必因為要先歸檔而卡住不開始新訪談。
+       - 兩者都不存在 → 向使用者報告全數完成。
+         Lazy Read `references/phase-ship.md`，準備出貨。
 
 ## 紀律
 
@@ -48,3 +52,7 @@ description: 當使用者要開發新功能、啟動或推進一個專案、想�
 - 判斷完全依賴 `.constellation/` 目錄下的檔案內容，不依賴這次對話之前聊過什麼——換一個全新 session 進來，讀檔結果必須一樣。
 - 大小分岔（大流程完整走②③④⑤；小流程只在③不拆多票、weave 直接產單一任務卡，之後走輕量⑤）由 `references/phase-grill.md` 在訪談收尾時與使用者一次拍板，本檔不重複判斷。是否需要②（UI 定稿）與大小流程正交、分開決定——不是「小流程＝連②也跳過」。
 - 若讀到的現況互相矛盾（例如 `tickets/` 有檔但 `CONTEXT.md` 不存在），照實告知使用者看到的落差，不自行腦補跳過。
+- **runtime 降級對照**（此對照放總控，是因為 lazy loading 下 Codex 在後期階段讀不到 `phase-grill.md` 裡的降級說明；各 `references/phase-*.md` 提到下列三個工具時，Codex 端一律按此對照執行，紀律不變、形式退化）：
+  - **AskUserQuestion 彈窗** → Codex 端改用跟開放問題同款的文字點列格式呈現封閉確認，選項精簡、一句講清楚哪個是預設；使用者一樣可回數字、回「ok」、或打自由文字。
+  - **Workflow 工具（票平行 fan-out）** → Codex 端沒有這個工具，這批票改序列逐張做，不平行。
+  - **DesignSync／Claude Design canvas** → Codex 端退化為純本地變體瀏覽器走查（開 `?variant=` 切換），流程其餘不變。

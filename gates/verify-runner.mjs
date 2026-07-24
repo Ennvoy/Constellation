@@ -1,20 +1,29 @@
 #!/usr/bin/env node
 // Constellation 閘門 4 —— 驗證 runner（CLI，非 hook）。DESIGN.md §4／§5。
-// 用法：node verify-runner.mjs --ticket <tickets/T-xxx.md 路徑> [--cwd <專案根>]
-// 讀 {cwd}/.constellation/config.json 的 commands.test（必要）＋ commands.journey（選填，
-// DESIGN §5 閘門 4 明定「測試套件＋真鏈路 journey」皆屬本 runner 職責，phase-weave.md／
-// phase-build.md 也是這樣描述 config 用法）——兩者合併、依序以 spawnSync 逐一實跑。
-// 全部 exit 0 才在票的「## 驗證證據」section append 一筆（時間戳＋各指令＋exit code＋stdout 尾 15 行）；
-// 任一失敗：印該指令完整輸出、不寫證據、exit 1——證據不能靠人手填，必須是這支 runner 親自跑出來的。
+// 用法：
+//   逐票：node verify-runner.mjs --ticket <票路徑或純票號> [--cwd <專案根>] [--scope ticket]
+//   出貨：node verify-runner.mjs --scope ship [--cwd <專案根>]
+// --scope ticket（預設）：要求 --ticket，只跑 config 的 commands.test，證據寫回該票檔。
+// --scope ship：不要求 --ticket，跑 commands.test＋commands.journey 全量，證據寫入
+//   {cwd}/.constellation/ship-evidence.md（沒有這個檔就自動建立）。
+// --ticket 可以給純票號（如 T-003）：先試直接路徑，找不到就在 .constellation/tickets/ 下
+// glob `<票號>*.md`，唯一命中才用；零命中或多重命中一律報錯並列出候選，不猜。
+// 全部指令 exit 0 才落一筆證據（時間戳＋各指令＋exit code＋stdout 尾 15 行）；任一失敗：印該指令
+// 完整輸出、不寫證據、exit 1（或斷路器觸發時 exit 2）——證據不能靠人手填，必須是這支 runner 親自跑出來的。
 //
 // R1 證據防偽：光「不能手填時間戳」不夠——時間戳本身也是純文字，手改票檔一樣能塞一個 24 小時內的
-// ISO 字串。真正的防偽來自簽章：對「ISO 時間戳＋票檔相對路徑＋全部指令串接＋輸出尾行」算
-// HMAC-SHA256（secret 只存在使用者家目錄、不進 git、不落 repo），證據筆尾附一行 `sig: <hex>`。
-// 沒有這把 secret 就無法算出合法簽章，手填時間戳因此真的擋不過關票刷卡機（gates/close-gate.mjs）。
-// **鏡像提醒**：本檔的簽章建構邏輯（SECRET_PATH／ticketRelPath／FIELD_SEP／computeSignature，
-// 以及簽章涵蓋的欄位定義）與 gates/close-gate.mjs 的驗簽邏輯必須逐字元一致，兩檔各自內聯一份
-// （不共用 import）——關票刷卡機是安全閘門，不依賴另一支腳本的存在／版本；改一份要同步改另一份。
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+// ISO 字串。真正的防偽來自簽章：對「ISO 時間戳＋票檔相對路徑（或 "ship"）＋全部指令串接＋輸出尾行
+// ＋repo 根絕對路徑」算 HMAC-SHA256（secret 只存在使用者家目錄、不進 git、不落 repo），證據筆尾附一行
+// `sig: <hex>`。沒有這把 secret 就無法算出合法簽章，手填時間戳因此真的擋不過關票刷卡機（gates/close-gate.mjs）。
+// repo 根這段是防「跨專案重放」——把另一個專案跑出來的合法證據筆整段複製貼到這個專案的票裡，簽章對不上。
+// **鏡像提醒**：本檔的簽章建構邏輯（SECRET_PATH／ticketRelPath／FIELD_SEP／computeSignature／
+// repoRootToken，以及簽章涵蓋的欄位定義）與 gates/close-gate.mjs 的驗簽邏輯、gates/commit-gate.mjs
+// 的 done 票稽核驗簽邏輯必須逐字元一致，三檔各自內聯一份（不共用 import）——關票刷卡機與 commit 守門
+// 是安全閘門，不依賴另一支腳本的存在／版本；改一份要同步改另兩份。
+//
+// 斷路器（R2）：{cwd}/.constellation/.verify-state.json 記 per-target（票相對路徑或 "ship"）連續失敗
+// 計數；成功歸零、失敗 +1；達 5 次時 exit 2，請使用者拍板，不再盲目重試（見 recordFailure）。
+import { readFileSync, writeFileSync, existsSync, readdirSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { resolve, join, basename } from 'node:path';
 import { createHmac } from 'node:crypto';
@@ -23,7 +32,7 @@ import { homedir } from 'node:os';
 const stripBom = s => (s && s.charCodeAt(0) === 0xfeff ? s.slice(1) : s);
 
 // ---------------------------------------------------------------------------
-// R1 簽章（與 close-gate.mjs 鏡像，見檔頭說明）
+// R1 簽章（與 close-gate.mjs／commit-gate.mjs 鏡像，見檔頭說明）
 // ---------------------------------------------------------------------------
 const SECRET_PATH = join(homedir(), '.constellation', 'secret');
 
@@ -45,24 +54,53 @@ function ticketRelPath(p) {
   return m ? m[0] : norm;
 }
 
-// 欄位分隔字元：一般文字與指令輸出裡幾乎不可能出現的控制字元（U+0001, SOH），
-// 用來串接簽章的各欄位、避免欄位邊界混淆。兩邊腳本的值與位置必須逐字元一致。
-const FIELD_SEP = '';
+// repo 根識別 token：path.resolve 正規化後轉小寫、反斜線轉正斜線——同一台機器上不同大小寫/斜線
+// 風格寫法的同一個路徑，token 仍相同；不同專案的 cwd 一定不同，簽章因此天然綁定 repo（防跨專案重放）。
+function repoRootToken(cwd) {
+  return resolve(cwd).toLowerCase().replace(/\\/g, '/');
+}
 
-// 簽章涵蓋欄位：ISO 時間戳、票檔相對路徑、全部指令以 '\n' 串接、輸出尾行（最後一個指令的 tail
-// 輸出裡最後一個非空白行；沒有輸出則為空字串）。
-function computeSignature(secret, ts, relPath, commandsJoined, lastLine) {
-  const payload = [ts, relPath, commandsJoined, lastLine].join(FIELD_SEP);
+// 欄位分隔字元：一般文字與指令輸出裡幾乎不可能出現的控制字元（U+0001, SOH），
+// 用來串接簽章的各欄位、避免欄位邊界混淆。三邊腳本的值與位置必須逐字元一致。
+const FIELD_SEP = '\u0001';
+
+// 簽章涵蓋欄位：ISO 時間戳、票檔相對路徑（或 "ship"）、全部指令以 '\n' 串接、輸出尾行（最後一個指令
+// 的 tail 輸出裡最後一個非空白行；沒有輸出則為空字串）、repo 根絕對路徑 token。
+function computeSignature(secret, ts, relPath, commandsJoined, lastLine, repoRoot) {
+  const payload = [ts, relPath, commandsJoined, lastLine, repoRoot].join(FIELD_SEP);
   return createHmac('sha256', secret).update(payload, 'utf8').digest('hex');
 }
 
 function parseArgs(argv) {
-  const out = { ticket: '', cwd: '' };
+  const out = { ticket: '', cwd: '', scope: 'ticket' };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--ticket') out.ticket = argv[++i] || '';
     else if (argv[i] === '--cwd') out.cwd = argv[++i] || '';
+    else if (argv[i] === '--scope') out.scope = argv[++i] || '';
   }
   return out;
+}
+
+// --ticket 支援純票號（如 "T-003"）：先試把它當相對路徑直接解析，找得到檔案就用；找不到就當票號，
+// 在 .constellation/tickets/ 下找 `<票號>*.md`，唯一命中才用——零命中或多重命中一律報錯列候選，不猜。
+function resolveTicketPath(cwd, ticketArg) {
+  const direct = resolve(cwd, ticketArg);
+  if (existsSync(direct)) return direct;
+
+  const ticketsDir = join(cwd, '.constellation', 'tickets');
+  let files = [];
+  try { files = readdirSync(ticketsDir).filter(f => f.toLowerCase().endsWith('.md')); } catch { files = []; }
+
+  const prefix = basename(String(ticketArg).trim());
+  const candidates = files.filter(f => f.startsWith(prefix));
+  if (candidates.length === 1) return join(ticketsDir, candidates[0]);
+  if (candidates.length === 0) {
+    console.error(`找不到票檔：直接路徑 "${direct}" 不存在，當票號解析也在 ${ticketsDir} 下找不到符合 "${prefix}*.md" 的檔案。`);
+    process.exit(1);
+  }
+  console.error(`票號 "${prefix}" 對應多張票，無法判斷唯一，請改用完整路徑指定：`);
+  for (const c of candidates) console.error(`  - ${join('tickets', c)}`);
+  process.exit(1);
 }
 
 // commands.test / commands.journey 可以是單一字串或字串陣列，統一收成陣列。
@@ -85,6 +123,47 @@ function lastNonBlankLine(text) {
     if (lines[i].trim() !== '') return lines[i];
   }
   return '';
+}
+
+// ---------------------------------------------------------------------------
+// R2 斷路器：{cwd}/.constellation/.verify-state.json，per-target 連續失敗計數。
+// 讀寫皆 fail-safe（讀不到/壞掉就當空狀態；寫不進去不擋主流程，斷路器降級但不 crash）。
+// ---------------------------------------------------------------------------
+const BREAKER_LIMIT = 5;
+const stateFilePath = cwd => join(cwd, '.constellation', '.verify-state.json');
+
+function readState(cwd) {
+  try {
+    const parsed = JSON.parse(stripBom(readFileSync(stateFilePath(cwd), 'utf8')));
+    if (parsed && typeof parsed === 'object' && parsed.targets && typeof parsed.targets === 'object') return parsed;
+  } catch {}
+  return { targets: {} };
+}
+
+function writeState(cwd, state) {
+  try { writeFileSync(stateFilePath(cwd), JSON.stringify(state, null, 2), 'utf8'); } catch {}
+}
+
+// 失敗：計數 +1、落盤、回傳新計數。
+function recordFailure(cwd, target) {
+  const state = readState(cwd);
+  const cur = (Number(state.targets[target]) || 0) + 1;
+  state.targets[target] = cur;
+  writeState(cwd, state);
+  return cur;
+}
+
+// 成功：計數歸零（只有原本非零才需要寫入，省一次 IO）。
+function recordSuccess(cwd, target) {
+  const state = readState(cwd);
+  if (state.targets[target]) {
+    state.targets[target] = 0;
+    writeState(cwd, state);
+  }
+}
+
+function breakerTrippedMessage() {
+  return '同一目標連續驗證失敗已達 5 次——停下來，把狀況整理給使用者拍板，不要再盲目重試（要重置計數請刪 .constellation/.verify-state.json 或修好後重跑）';
 }
 
 // ---------------------------------------------------------------------------
@@ -121,6 +200,7 @@ function ticketTitle(raw) {
 }
 
 // 把一筆驗證證據 append 進「## 驗證證據」section 的尾端（沒有該 section 就自動補在檔尾）。
+// ticket 票檔與 ship-evidence.md 共用這支函式——DESIGN 明定 ship 級證據筆格式與票內完全相同。
 function appendEvidence(content, entryText) {
   // 只認「驗證證據」開頭即可，不要求整行只有這四個字——實際模板標題帶括號說明文字
   // （如「## 驗證證據（關票時由 runner 寫入...）」），要求整行精確符合會漏配，重複補一個新 heading。
@@ -140,16 +220,25 @@ function appendEvidence(content, entryText) {
 }
 
 function main() {
-  const { ticket, cwd: cwdArg } = parseArgs(process.argv.slice(2));
-  if (!ticket) {
-    console.error('用法：node verify-runner.mjs --ticket <tickets/T-xxx.md 路徑> [--cwd <專案根>]');
+  const { ticket, cwd: cwdArg, scope: scopeArg } = parseArgs(process.argv.slice(2));
+  const scope = scopeArg || 'ticket';
+  if (scope !== 'ticket' && scope !== 'ship') {
+    console.error(`--scope 只能是 ticket 或 ship（收到："${scopeArg}"）`);
     process.exit(1);
   }
   const cwd = resolve(cwdArg || process.cwd());
-  const ticketPath = resolve(cwd, ticket);
-  if (!existsSync(ticketPath)) {
-    console.error(`找不到票檔：${ticketPath}`);
-    process.exit(1);
+
+  let ticketPath = '';
+  let target = '';
+  if (scope === 'ticket') {
+    if (!ticket) {
+      console.error('用法：node verify-runner.mjs --ticket <票路徑或純票號> [--cwd <專案根>] [--scope ticket]');
+      process.exit(1);
+    }
+    ticketPath = resolveTicketPath(cwd, ticket);
+    target = ticketRelPath(ticketPath);
+  } else {
+    target = 'ship';
   }
 
   const configPath = join(cwd, '.constellation', 'config.json');
@@ -159,11 +248,17 @@ function main() {
     process.exit(1);
   }
   const commandsCfg = config.commands || {};
-  const commands = [...toCommandList(commandsCfg.test), ...toCommandList(commandsCfg.journey)];
+  const commands = scope === 'ticket'
+    ? toCommandList(commandsCfg.test)
+    : [...toCommandList(commandsCfg.test), ...toCommandList(commandsCfg.journey)];
   if (!commands.length) {
-    console.error(`${configPath} 的 commands.test／commands.journey 都是空的——沒有指令可驗證。補上指令，或這張票該標 blocked（見 phase-weave.md）。`);
+    const which = scope === 'ticket' ? 'commands.test' : 'commands.test／commands.journey';
+    console.error(`${configPath} 的 ${which} 都是空的——沒有指令可驗證。補上指令，或這張票該標 blocked（見 phase-weave.md）。`);
     process.exit(1);
   }
+
+  const timeoutSec = Number(config.timeoutSec);
+  const timeoutMs = (Number.isFinite(timeoutSec) && timeoutSec > 0 ? timeoutSec : 600) * 1000;
 
   const results = [];
   for (const cmd of commands) {
@@ -173,12 +268,15 @@ function main() {
       encoding: 'buffer',
       env: { ...process.env, PYTHONIOENCODING: 'utf-8', LANG: 'C.UTF-8' },
       maxBuffer: 20 * 1024 * 1024,
+      timeout: timeoutMs,
     });
     const outDecoded = decodeOutput(r.stdout);
     const errDecoded = decodeOutput(r.stderr);
+    const timedOut = r.error && r.error.code === 'ETIMEDOUT';
     const exitCode = r.error ? 1 : (r.status ?? 1);
     if (exitCode !== 0) {
       console.error(`驗證失敗：\`${cmd}\`（exit ${exitCode}）`);
+      if (timedOut) console.error(`逾時：超過 ${timeoutMs / 1000} 秒未結束，已強制終止該指令。`);
       if (r.error) console.error(`spawn 錯誤：${r.error.message}`);
       console.error('--- stdout ---');
       console.error(outDecoded.text);
@@ -186,6 +284,12 @@ function main() {
       console.error('--- stderr ---');
       console.error(errDecoded.text);
       if (errDecoded.note) console.error(errDecoded.note);
+
+      const failCount = recordFailure(cwd, target);
+      if (failCount >= BREAKER_LIMIT) {
+        console.error(`\nConstellation 驗證斷路器：${breakerTrippedMessage()}`);
+        process.exit(2);
+      }
       console.error('未寫入驗證證據，這張票不能標 done。');
       process.exit(1);
     }
@@ -195,8 +299,9 @@ function main() {
     results.push({ cmd, realTailText, note: outDecoded.note, realLastLine: lastNonBlankLine(realTailText) });
   }
 
-  // 全部通過 → 落證據（含簽章）
-  const raw = stripBom(readFileSync(ticketPath, 'utf8'));
+  // 全部通過 → 斷路器歸零 → 落證據（含簽章）
+  recordSuccess(cwd, target);
+
   const ts = new Date().toISOString();
   const entryLines = [`- **${ts}**`];
   for (const r of results) {
@@ -211,13 +316,13 @@ function main() {
 
   const secret = readSecret();
   if (secret) {
-    const relPath = ticketRelPath(ticketPath);
     const commandsJoined = results.map(r => r.cmd).join('\n');
     const lastCmdResult = results[results.length - 1];
     // 簽章用的「輸出尾行」取真正解碼後內容的最後非空白行（不含保底解碼註記那一行），
     // 這樣才是對「實際輸出內容」的指紋，不是對註記文字的指紋。
     const lastLine = lastCmdResult ? lastCmdResult.realLastLine : '';
-    const sig = computeSignature(secret, ts, relPath, commandsJoined, lastLine);
+    const repoRoot = repoRootToken(cwd);
+    const sig = computeSignature(secret, ts, target, commandsJoined, lastLine, repoRoot);
     entryLines.push(`  - sig: ${sig}`);
   } else {
     console.warn(`警告：讀不到簽章 secret 檔（${SECRET_PATH}）——這筆證據將標記為 unsigned，關票刷卡機會擋下。`);
@@ -225,10 +330,21 @@ function main() {
     entryLines.push('  - sig: unsigned');
   }
 
-  writeFileSync(ticketPath, appendEvidence(raw, entryLines.join('\n')), 'utf8');
+  const entryText = entryLines.join('\n');
 
-  const title = ticketTitle(raw) || basename(ticketPath);
-  console.log(`驗證通過（${title}）：${results.length} 項指令全數 exit 0，證據已寫入 ${ticketPath}`);
+  if (scope === 'ticket') {
+    const raw = stripBom(readFileSync(ticketPath, 'utf8'));
+    writeFileSync(ticketPath, appendEvidence(raw, entryText), 'utf8');
+    const title = ticketTitle(raw) || basename(ticketPath);
+    console.log(`驗證通過（${title}）：${results.length} 項指令全數 exit 0，證據已寫入 ${ticketPath}`);
+  } else {
+    const shipEvidencePath = join(cwd, '.constellation', 'ship-evidence.md');
+    const existing = existsSync(shipEvidencePath)
+      ? stripBom(readFileSync(shipEvidencePath, 'utf8'))
+      : '# Constellation 出貨驗證證據\n\n> 由 `verify-runner.mjs --scope ship` 寫入，證據筆格式與票內完全相同（見 DESIGN.md §5）。\n';
+    writeFileSync(shipEvidencePath, appendEvidence(existing, entryText), 'utf8');
+    console.log(`出貨驗證通過：${results.length} 項指令（test＋journey 全量）全數 exit 0，證據已寫入 ${shipEvidencePath}`);
+  }
   for (const r of results) console.log(`  - ${r.cmd}（exit 0）`);
   process.exit(0);
 }

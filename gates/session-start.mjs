@@ -1,10 +1,13 @@
 #!/usr/bin/env node
 // Constellation 閘門 3 —— session 開場注入（SessionStart hook）。
-// 純讀檔：掃 {cwd}/.constellation/tickets/*.md，解析 status／blocked-by／票名（首行 # 標題）與
+// 純讀檔：掃 {root}/.constellation/tickets/*.md，解析 status／blocked-by／票名（首行 # 標題）與
 // 「## 驗收條件」勾選進度，組成繁中摘要，供 runtime 注入開場。DESIGN.md §4／§5 閘門 3。
+// root 解析：git rev-parse --show-toplevel（在 cwd 下跑），失敗 fallback cwd（與 gates/commit-gate.mjs
+// 的 resolveRepoRoot 同一套規則）——在子目錄下開 session 也掃得到專案根的 .constellation。
 // 沒有 .constellation/ 的專案（非 Constellation 專案）一律靜默 exit 0，不干擾。
 // 任何解析異常 fail-open：寧可少報一張票，也不 crash session 開場。
 import { readFileSync, existsSync, readdirSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -55,8 +58,19 @@ function parseTicket(raw) {
 
 const STATUSES = ['open', 'in-progress', 'blocked', 'done'];
 
+// repo root 解析：git rev-parse --show-toplevel，失敗 fallback cwd（與 commit-gate.mjs 鏡像）。
+function resolveRepoRoot(cwd) {
+  try {
+    const out = execFileSync('git', ['-C', cwd, 'rev-parse', '--show-toplevel'], { maxBuffer: 1 << 20 })
+      .toString('utf8').trim();
+    if (out) return out;
+  } catch {} // 非 git repo／git 不存在等 → fallback cwd
+  return cwd;
+}
+
 function buildSummary(cwd) {
-  const base = join(cwd, '.constellation');
+  const root = resolveRepoRoot(cwd);
+  const base = join(root, '.constellation');
   if (!existsSync(base)) return null; // 非 Constellation 專案，靜默
 
   const ticketsDir = join(base, 'tickets');

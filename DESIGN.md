@@ -24,7 +24,7 @@
 ⑤ 出貨 (ship)       全量真鏈路驗證＋獨立兩軸審查（Standards / Spec 分開報告，不合併排名）
 ```
 
-**大小分岔**：訪談收尾時 agent 依改動範圍估算（預計動幾個檔、有無新資料結構、跨不跨模組）提議走大流程或小流程，使用者一鍵拍板；拍板結果寫入固定決議檔 `decisions/grill-close.md`（記大小分岔＋是否需要 UI＋高風險標記——是否涉權限／金流／個資），此檔同時是機讀的「訪談已完成」標記——總控據此路由，**無此檔一律回到訪談增量重訪**，防止訪談中斷被誤判為已完成。
+**大小分岔**：訪談收尾時 agent 依改動範圍估算（預計動幾個檔、有無新資料結構、跨不跨模組）提議走大流程或小流程，使用者一鍵拍板；拍板結果寫入固定決議檔 `decisions/grill-close.md`（五欄：大小分岔／是否需要 UI／高風險標記（權限・金流・個資）／必備模組排除／一句話任務摘要），此檔同時是機讀的「訪談已完成」標記——總控據此路由，**無此檔一律回到訪談增量重訪**，防止訪談中斷被誤判為已完成。
 - **小流程**：③不拆多票——weave 直接產**單一任務卡**（本質是一張票，含驗收條件與 config.json 驗證設定），單線程做完＋實跑驗證，再走輕量⑤（驗證範圍即該卡全部驗收條件，兩軸審查照做）。
 - **大流程**：完整五步。
 - 是否需要②（UI 定稿）與大小流程**正交**：純後端／無 UI 任務跳過②，大小流程皆然。
@@ -87,7 +87,7 @@ zone: src/auth/**, tests/auth/**   # 檔案界線（平行時互斥用）
 - `CONTEXT.md`：專案領域詞彙表。只收本專案特有詞（通用程式概念不收）；每詞 1–2 句；同義詞選一個定案、其餘列為 avoid。
 - `decisions/NNN-slug.md`：極簡決策記錄（1–3 句：背景＋決定＋原因）。只在三條件同時成立才寫：難以逆轉＋沒背景會讓人驚訝＋真的經過權衡。過時用 `superseded by NNN` 標記，不刪除。
 
-另有 **`config.json`**：該專案的驗證指令設定（`commands.test`＝逐票快速套件、`commands.journey`＝全量 journey），weave 階段生成、驗證 runner 讀取。
+另有 **`config.json`**：該專案的驗證指令設定（`commands.test`＝逐票快速套件、`commands.journey`＝全量 journey、`timeoutSec`＝單指令逾時），weave 階段生成、驗證 runner 讀取；weave 票清單經使用者核准後在此寫入 `"approved": true`（機讀核准標記，總控據此才准進 build）。**出貨後歸檔**：ship 完成即把本輪 tickets/、grill-close.md、ship-evidence.md 移入 `.constellation/archive/<日期>-<摘要>/`——下一輪任務從乾淨狀態開始，新舊輪不混淆。
 
 **接續**：新 session 開場由 session-start 閘門自動注入「有哪些票、各自狀態、進行中的做到哪」（含驗證 runner 的絕對路徑）。中斷即中斷，讀檔即接手。
 
@@ -98,10 +98,10 @@ zone: src/auth/**, tests/auth/**   # 檔案界線（平行時互斥用）
 | 1 | git 守門 | hook | 擋破壞性 git 操作與未經確認的開/切分支（自 Flow 原封搬入） |
 | 2 | commit 守門 | hook | commit 前掃 secrets／垃圾產物（自 Flow 原封搬入） |
 | 3 | session 開場注入 | hook | 從 `.constellation/` 重建現況並注入開場 |
-| 4 | 驗證 runner | script | 實跑驗證（`--scope` 分逐票／出貨兩級），pass 證據附簽章寫入票 |
-| 5 | 關票刷卡機 | hook | 票標 done 時機器驗證據簽章與新鮮度（24h），不過直接擋下 |
+| 4 | 驗證 runner | script | 實跑驗證（`--scope` 分逐票／出貨兩級），pass 證據附簽章寫入票（ship 級寫入 `.constellation/ship-evidence.md`）；內建**斷路器**——同一目標連續 5 次失敗即強制停下請使用者拍板，不無限重試 |
+| 5 | 關票刷卡機 | hook | 票標 done 時機器驗證據簽章與新鮮度（24h）＋驗收條件全勾，不過直接擋下 |
 
-驗證證據由 runner 以本機 secret（install 時生成於使用者家目錄，不進 git）簽章、刷卡機驗簽——手填時間戳無法通過，「機器擋假完成」才真正成立。
+驗證證據由 runner 以本機 secret（install 時生成於使用者家目錄，不進 git）簽章（簽章綁定 repo，防跨專案重放）、刷卡機驗簽——手填時間戳無法通過，「機器擋假完成」才真正成立。commit 守門另做一道 **done 票稽核**：commit 時 staged 的 done 票必須含通過驗簽的證據，堵「用 shell 指令繞過刷卡機改檔」的旁門。
 
 原則：**每個閘門只在關鍵事件觸發，平時零開銷**。不設巨石 CLI；除此五件外，一切靠 skill 紀律，不加新硬閘（加閘門需回本文件修訂）。
 
@@ -134,7 +134,7 @@ zone: src/auth/**, tests/auth/**   # 檔案界線（平行時互斥用）
 
 **共用架構：單源母本＋junction 雙掛載＋觸發層各自適配**
 
-- 母本 `Desktop\Constellation\skills\` 以 junction 同時掛到 `~/.claude/skills/` 與 `~/.codex/skills/`——兩邊 runtime 讀**同一份實體檔案**，改母本即時雙邊生效，零重複部署（字面意義的真共用；社群 vercel-labs/skills 已驗證此模式可行）。
+- 母本 `Desktop\Constellation\skills\` 以 junction 同時掛到 `~/.claude/skills/`、`~/.codex/skills/` 與 `~/.agents/skills/`（Codex 官方現行使用者層路徑）——各邊 runtime 讀**同一份實體檔案**，改母本即時生效，零重複部署（字面意義的真共用；社群 vercel-labs/skills 已驗證此模式可行）。Codex hooks 寫入設定後須使用者在 Codex 內跑 `/hooks` 審閱信任才會生效（install 對賬會提示）。
 - 每個 skill：一份 `SKILL.md` 主體（兩邊通用）＋ `agents/openai.yaml`（Codex 專屬外觀層，僅 display_name／short_description 兩欄，不含邏輯——照抄 mattpocock 慣例）。
 - 閘門 script 本體（node `.mjs`）一份共用；觸發設定**分兩檔維護**：Claude Code 掛 `settings.json` hooks、Codex 掛 `~/.codex/hooks.json`——schema 同構故內容幾乎相同，仍分檔以備未來分岔；Codex 端 matcher 另需涵蓋其原生編輯工具 `apply_patch` 的輸入形狀（關票刷卡機已支援）。`install.ps1` 一次建好 junction＋雙邊觸發設定＋對賬檢查。
 - 工作狀態天然共通：票與 CONTEXT.md 活在各專案 `.constellation/`，哪邊 runtime 接手都讀同一份。
@@ -177,6 +177,16 @@ Desktop\Constellation\
 - **全新取代**。新流建好後新任務一律走 Constellation；Flow hooks 暫不拆，退役時機由使用者在新流跑順首個真實任務後拍板。
 - 搬遷零件（血淚資產）：flow-git-guardrail、flow-commit-gate（→ 閘門 1、2）；session-start 重建思路（→ 閘門 3）；150 套 design-systems 資產庫（原封搬入）；另自 mattpocock 改寫除錯迴圈與衝突解法兩篇。EARS 語法不再沿用——票的驗收條件以「實跑可驗證」紀律取代結構化語法。
 - 不搬：五階段儀式、SDD 三件套、31-subcommand 巨石 CLI、多層對抗審查、spec-review 收斂迴圈。
+
+## 11.5 已知限制（審查後拍板「揭露不修」，拒絕機制膨脹）
+
+以下缺口經雙路對抗審查（本家＋Codex 跨家族）確認存在，但依「審查跟著風險走／harness 不得成為工作量」原則**刻意不補機制**，白紙黑字揭露：
+
+- **未達升格門檻的訪談答案不落檔**，中斷重訪可能重問——by-design（§2 已註明），避免訪談狀態檔膨脹。
+- **同一次編輯「改 done＋刪證據」的複合操作**理論上可騙過刷卡機的磁碟現檔檢查——由 commit 守門的 done 票稽核在 commit 時兜底。
+- **驗證通過後 24h 內再改壞 code 仍可關票**——改壞的 code 會在 ship 全量驗證爆出（自我暴露型），不為它加即時防護。
+- **install.ps1 非交易式**（中途失敗可能半完成）、多 clone 場景卸載可能誤拔——單人單機低頻情境，有備份與重跑冪等即可。
+- **不建逐驗收條件的機讀追蹤體系**（acceptanceId／per-check command）——那是 Flow 老路；驗收品質由「關票須全勾＋ship Spec 軸逐票對照」把關。
 
 ## 12. 建置計畫（藍圖核准後執行）
 

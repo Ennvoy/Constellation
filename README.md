@@ -41,7 +41,9 @@ Constellation/
 
 每個專案要用 Constellation 時，會在自己的 repo 裡建一個 `.constellation/` 工作目錄承載訪談決議與票的狀態：
 `tickets/*.md`（票，模板與狀態機見 `DESIGN.md` §4）、`CONTEXT.md`＋`decisions/`（詞彙表與決策記錄，見 §4）、
-`config.json`（驗證指令，形如 `{"commands": {"test": [...], "journey": [...]}}`，供閘門 4 驗證 runner 讀取）。
+`config.json`（驗證指令，形如 `{"commands": {"test": [...], "journey": [...]}}`，供閘門 4 驗證 runner 讀取；票清單經使用者核准後在此寫入 `"approved": true`）、
+`ship-evidence.md`（出貨階段 `--scope ship` 全量驗證的簽章證據，閘門 4 寫入，見 §4／§6）、
+`archive/`（出貨後把該輪 `tickets/`、`decisions/grill-close.md`、`ship-evidence.md` 歸檔到 `archive/<日期>-<摘要>/`，讓下一輪從乾淨狀態開始，見 §4）。
 
 ## 安裝
 
@@ -53,15 +55,19 @@ Constellation/
 
 它做五件事：
 
-1. **對 `skills/` 下每個 skill 各建一條 junction**：目前是 `constellation`、`grill` 兩個 skill，
-   逐一各自建一條 junction 連到 `~/.claude/skills/<skill>` 與 `~/.codex/skills/<skill>`——不是把整個
-   `skills/` 資料夾包成單一 junction。兩邊 runtime 讀的是同一份實體檔案，不是各自複製一份。改母本
-   任何一個 `SKILL.md` 或 `references/`，Claude Code 與 Codex 立刻同步生效，不會有兩邊版本漂移的問題
-   （Windows junction 免管理員權限，已本機實測成功）。
+1. **對 `skills/` 下每個 skill 各建三條 junction**：目前是 `constellation`、`grill` 兩個 skill，
+   逐一各自建三條 junction，分別連到 `~/.claude/skills/<skill>`、`~/.codex/skills/<skill>` 與
+   `~/.agents/skills/<skill>`（Codex 官方現行使用者層路徑，見 `DESIGN.md` §9）——不是把整個
+   `skills/` 資料夾包成單一 junction。也就是共三組掛載點、每組各兩條（對應兩個 skill），一共六條
+   junction。三邊 runtime 讀的是同一份實體檔案，不是各自複製一份。改母本任何一個 `SKILL.md` 或
+   `references/`，Claude Code 與 Codex 立刻同步生效，不會有版本漂移的問題（Windows junction 免管理員
+   權限，已本機實測成功）。
 2. **掛雙邊 hooks**：閘門五件組的 node script 本體只有一份、兩邊共用；觸發設定分兩檔維護——
    Claude Code 用 `gates/hooks.claude.json` 接 `settings.json`，Codex 用 `gates/hooks.codex.json`
    接 `~/.codex/hooks.json`（經實測兩邊 hooks schema 同構，內容幾乎相同；分檔是為了 matcher 差異
-   ——Codex 端要涵蓋 `apply_patch`——與未來可能的分岔）。
+   ——Codex 端要涵蓋 `apply_patch`——與未來可能的分岔）。**寫入設定不等於生效**：Codex 端還要使用者
+   自己在 Codex 內跑一次 `/hooks` 審閱並信任這些 hook，設定才會真的啟用；install 的對賬步驟只會提醒
+   這件事，實際執行 `/hooks` 需要使用者手動做。
 3. **生成簽章 secret**：在使用者家目錄產生 `~/.constellation/secret`（不進 git，跨專案共用同一把）——
    驗證證據由 runner 用這把本機 secret 簽章、關票刷卡機驗簽（細節見 DESIGN.md §5）；已存在就不覆蓋，
    冪等，重跑安裝不會讓舊簽章失效。

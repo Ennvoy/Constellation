@@ -36,10 +36,53 @@ const BLOCK = msg => ({ block: true, message: msg });
 const HINT = '依使用者全域規則，開/切分支與破壞性 git 操作 SHALL 先用 AskUserQuestion 取得使用者明示同意；' +
   "取得同意後在命令中帶 CONSTELLATION_GIT_OK=1 重跑放行（bash：CONSTELLATION_GIT_OK=1 git …；PowerShell：$env:CONSTELLATION_GIT_OK='1'; git …）。";
 
-// 把 chain 命令（&&/;/||/|/換行）拆段，逐段找 git 呼叫——串接中段出現的 git 子命令也要抓
-// （例：`git add . && git checkout -b x` 第二段沒有 && 之前的內容干擾）。
+// 把 chain 命令（&&/;/||/|/換行，以及引號外、兩側有空白的單一 &）拆段，逐段找 git 呼叫——串接中段
+// 出現的 git 子命令也要抓（例：`git add . && git checkout -b x` 第二段沒有 && 之前的內容干擾）。
+//
+// 單一 & 的判斷限定「引號外」且「左右緊鄰空白」，逐字元掃描、追蹤是否在引號內：這樣一方面能切開
+// cmd.exe 風格的 `cmd1 & cmd2` 串接／POSIX shell 的背景執行 `cmd1 & cmd2`，另一方面不誤傷
+// PowerShell call operator（`& "C:\Program Files\App\app.exe" arg`）——call operator 的 & 通常在
+// 片段開頭、前面沒有空白字元（是整段第一個字元），不滿足「兩側都有空白」而不會被切開。
+function splitOnBareAmpersand(segment) {
+  const out = [];
+  let cur = '';
+  let quote = '';
+  for (let i = 0; i < segment.length; i++) {
+    const ch = segment[i];
+    if (quote) {
+      cur += ch;
+      if (ch === quote) quote = '';
+      continue;
+    }
+    if (ch === '"' || ch === "'") { quote = ch; cur += ch; continue; }
+    if (ch === '&' && segment[i + 1] !== '&' && segment[i - 1] !== '&') {
+      const prevIsSpace = i > 0 && /\s/.test(segment[i - 1]);
+      const nextIsSpace = i + 1 < segment.length && /\s/.test(segment[i + 1]);
+      if (prevIsSpace && nextIsSpace) { out.push(cur); cur = ''; continue; }
+    }
+    cur += ch;
+  }
+  out.push(cur);
+  return out;
+}
+
+// GUARD-07：`cmd /c "<指令>"` / `cmd.exe /c "<指令>"` 包裹——偵測到就取引號內容遞迴當指令重新
+// 拆段判定（引號內可能又是複合指令，含 &&/;/| 等，故直接遞迴呼叫 splitSegments）。不支援跳脫符號的
+// 完美還原，只求「引號內的內容會被當成指令重新掃過一次」，不因為套一層 cmd /c 殼就整段被漏判。
+const CMD_C_WRAPPER_RE = /^\s*"?cmd(?:\.exe)?"?\s+\/c\s+(["'])([\s\S]*)\1\s*$/i;
+function expandCmdWrapper(segment) {
+  const m = segment.match(CMD_C_WRAPPER_RE);
+  if (!m) return [segment];
+  return splitSegments(m[2]);
+}
+
 function splitSegments(cmd) {
-  return cmd.split(/&&|\|\||;|\||\r?\n/);
+  const rough = cmd.split(/&&|\|\||;|\||\r?\n/);
+  const out = [];
+  for (const seg of rough) {
+    for (const piece of splitOnBareAmpersand(seg)) out.push(...expandCmdWrapper(piece));
+  }
+  return out;
 }
 
 // token 化：引號段整段當一個 token——處理 `-C "/my repo"` 這種帶空白的引號值不被拆散。
@@ -56,7 +99,11 @@ const VALUE_FLAGS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespac
 // 第一個非旗標 token 才是子命令。GUARD-01：堵 `git -c k=v checkout -b`／`git --no-pager push --force`
 // 這類「前綴旗標讓第一 token 以 - 開頭而落 default 放行」的繞法。找不到 git 呼叫/子命令回 null。
 function extractGitCall(segment) {
-  const toks = tokenize(segment);
+  // 切出的段若以 & 開頭（前面可能有空白），視為 PowerShell call operator 殘留——去掉開頭的 &
+  // 後照常判該段，不讓它干擾 git token 的定位。
+  const leadTrimmed = segment.replace(/^\s+/, '');
+  const seg = leadTrimmed.startsWith('&') ? leadTrimmed.slice(1) : segment;
+  const toks = tokenize(seg);
   const gi = toks.findIndex(t => /^git(\.exe)?$/i.test(stripQuotes(t)) || /[\\/]git(\.exe)?$/i.test(stripQuotes(t)));
   if (gi < 0) return null;
   for (let i = gi + 1; i < toks.length; i++) {
@@ -158,14 +205,21 @@ function judgeSubcommand(sub, rest) {
       return null;
     }
 
-    case 'restore':
-      // 僅帶 --staged（取消暫存，不動工作區）放行；其餘（含裸 restore、--worktree）視為覆寫工作區的破壞性操作。
-      if (/(^|\s)--staged\b/.test(rest)) return null;
+    case 'restore': {
+      // 只有「純 --staged（不含 --worktree）」才是安全的取消暫存操作、放行；一旦帶 --worktree
+      // （長式 --worktree 或短式 -W，含旗標 bundle 如 -SW）就會覆寫工作區內容——即使同時帶了
+      // --staged 也要攔，不能讓 --staged 的存在掩護 --worktree 的破壞性。
+      const hasWorktree = /(^|\s)--worktree\b/.test(rest) ||
+        rest.split(/\s+/).some(t => /^-[A-Za-z]*W[A-Za-z]*$/.test(t));
+      const hasStaged = /(^|\s)--staged\b/.test(rest) ||
+        rest.split(/\s+/).some(t => /^-[A-Za-z]*S[A-Za-z]*$/.test(t));
+      if (hasStaged && !hasWorktree) return null;
       return BLOCK([
-        'Constellation git 守門：擋下 `git restore` —— 會覆寫工作區檔案內容（未加 --staged 的用法不可逆）。',
-        '  只是想取消暫存？帶上 `--staged` 即放行。',
+        'Constellation git 守門：擋下 `git restore` —— 會覆寫工作區檔案內容（未加 --staged，或帶 --worktree/-W 的用法不可逆）。',
+        '  只是想取消暫存？只帶 `--staged`（不加 --worktree）即放行。',
         `  ${HINT}`,
       ].join('\n'));
+    }
 
     case 'rebase':
       // --continue/--abort/--skip 是在收尾既有 rebase（使用者已經在流程中），裸 rebase（開新的
@@ -233,9 +287,12 @@ export function gitGuardrailCheck(input) {
   const ti = input.tool_input ?? input.toolInput ?? {};
   const cmd = String(ti.command ?? '');
   if (!cmd) return PASS;
-  // GUARD-05：只認「賦值形式」逃生口（bash 前綴 CONSTELLATION_GIT_OK=1 …／PowerShell $env:CONSTELLATION_GIT_OK='1'）——
-  // 純子字串比對會被 commit message／路徑裡的偶發字樣整條停用護欄。
-  if (/(^|[\s;&(|])CONSTELLATION_GIT_OK=/.test(cmd) || /\$env:CONSTELLATION_GIT_OK\s*=/.test(cmd)) return PASS;
+  // GUARD-05：只認「賦值形式**且值明確為 1**」的逃生口（bash 前綴 CONSTELLATION_GIT_OK=1 …／
+  // PowerShell $env:CONSTELLATION_GIT_OK='1'）——純子字串比對（不管值是什麼）會被 =0／空值／=true
+  // 這類「看起來像設過但其實沒同意」的寫法誤放行；(?!\d) 排除 =10/=123 這種數字延伸不算 =1。
+  const GIT_OK_BASH_RE = /(^|[\s;&(|])CONSTELLATION_GIT_OK=(['"]?)1\2(?!\d)/;
+  const GIT_OK_PS_RE = /\$env:CONSTELLATION_GIT_OK\s*=\s*(['"]?)1\1(?!\d)/i;
+  if (GIT_OK_BASH_RE.test(cmd) || GIT_OK_PS_RE.test(cmd)) return PASS;
 
   for (const segment of splitSegments(cmd)) {
     const call = extractGitCall(segment);
