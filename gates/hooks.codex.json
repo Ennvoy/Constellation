@@ -1,0 +1,46 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"{{ROOT}}\\gates\\session-start.mjs\"",
+            "timeout": 15,
+            "_constellation": true
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|apply_patch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"{{ROOT}}\\gates\\close-gate.mjs\"",
+            "timeout": 10,
+            "_constellation": true
+          }
+        ]
+      },
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"{{ROOT}}\\gates\\git-guardrail.mjs\"",
+            "timeout": 10,
+            "_constellation": true
+          },
+          {
+            "type": "command",
+            "command": "node \"{{ROOT}}\\gates\\commit-gate.mjs\"",
+            "timeout": 15,
+            "_constellation": true
+          }
+        ]
+      }
+    ]
+  }
+}

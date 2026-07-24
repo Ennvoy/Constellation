@@ -1,0 +1,3 @@
+interface:
+  display_name: "Constellation"
+  short_description: "Detect project state and route to the right workflow phase"
