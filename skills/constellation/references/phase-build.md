@@ -23,6 +23,7 @@
 ## 平行編排（無依賴 + zone 不重疊才平行）
 
 - **條件**：這批票兩兩之間 `zone` 沒有交集、也沒有 `blocked-by` 關係 → 可同批 fan-out。有依賴鏈的票本來就不會排進同一批——它要等前置票 `done` 之後，才會在下一批被領走。
+- **委派下限**：幾個 tool calls 就能自己做完的工作不委派 subagent；不用 subagent 覆核自己剛完成的工作（獨立 context 的對抗審查是另一回事，照母本 DESIGN.md §6 規則走）；一個 subagent 能完成就不用多個。
 - **開工前**：正文一句話講清楚這批要平行幾張票（平行是 token 倍增，讓使用者知道成本）。
 - 用 **Workflow 工具** fan-out——這裡指 Claude Code 端內建的臨場編排工具，用來把這批票同時派給多個 worker，不是 repo 裡預先寫好的腳本檔案；worker 用便宜模型，各自跑上面「單票內部循環」的步驟 1～4（領票→測試先行→實作轉綠→實跑驗證落證據），關票與 commit 留到下面「序列整合」統一做。**Codex 端沒有 Workflow 工具**，依總控（`skills/constellation/SKILL.md`）的 runtime 降級對照，這批票改序列逐張做，不平行。
 - **序列整合**：一張張來，不要等所有 worker 都跑完才一次合併：
