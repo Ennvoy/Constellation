@@ -22,6 +22,12 @@
 // repoRootToken，以及簽章涵蓋的欄位定義）與 gates/verify-runner.mjs 的簽章邏輯、gates/commit-gate.mjs
 // 的 done 票稽核驗簽邏輯必須逐字元一致，三檔各自內聯一份（不共用 import）——這是安全閘門，不依賴
 // 另一支腳本的存在／版本；改一份要同步改另兩份。
+//
+// 定稿 UI 凍結守衛（本輪新增，DESIGN.md §3 第 4 點／§5）：另外讀取 `.constellation/design-frozen.json`
+// 的 frozen 陣列，命中名單的目標檔案一律擋下編輯（Write／Edit／MultiEdit／apply_patch 皆涵蓋，不限
+// 票檔）——要改必須先經使用者彈窗同意、把該檔從 frozen 移除並在 log 記一筆 unfreeze（含原因）。名單
+// 檔不存在或解析失敗一律 fail-open，不影響非 UI 專案；目標本身就是 design-frozen.json 時不受此檢查
+// 限制（否則永遠無法解凍）。此檢查與上面的 done 票檢查各自獨立觸發，互不影響、互不依賴。
 import { readFileSync } from 'node:fs';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { homedir } from 'node:os';
@@ -345,11 +351,104 @@ function firstNonEmptyString(...vals) {
 }
 
 // ---------------------------------------------------------------------------
+// 定稿 UI 凍結守衛（見檔頭說明）：讀 `.constellation/design-frozen.json`，命中 frozen 名單的檔案擋下。
+// ---------------------------------------------------------------------------
+const DESIGN_FROZEN_REL = '.constellation/design-frozen.json';
+const DESIGN_FROZEN_PATH_RE = /(^|[\\/])\.constellation[\\/]design-frozen\.json$/i;
+
+// 路徑正規化：反斜線轉正斜線、解析成絕對路徑後去掉 cwd（repo 根）前綴變成 repo 相對路徑、統一小寫
+// 做大小寫不敏感比對。frozen 名單裡的項目本來就是 repo 相對路徑，resolve(cwd, relPath) 會把它接到
+// cwd 下再還原回同一個相對路徑，兩邊（目標檔案／名單項目）都走這條正規化才能公平比較。
+function normalizeRepoRelPath(filePath, cwd) {
+  const root = resolve(cwd).replace(/\\/g, '/');
+  const abs = resolve(cwd, String(filePath)).replace(/\\/g, '/');
+  const rootLower = root.toLowerCase();
+  const absLower = abs.toLowerCase();
+  const rel = absLower.startsWith(rootLower + '/') ? abs.slice(root.length + 1) : abs;
+  return rel.toLowerCase();
+}
+
+// 讀凍結名單：不存在／JSON 解析失敗／格式不對（frozen 不是陣列）一律回 null——呼叫端當作
+// fail-open（跳過此檢查），不誤擋沒有用到定稿凍結機制的專案。
+function readFrozenList(cwd) {
+  try {
+    const p = join(resolve(cwd), '.constellation', 'design-frozen.json');
+    const data = JSON.parse(stripBom(readFileSync(p, 'utf8')));
+    if (!data || !Array.isArray(data.frozen)) return null;
+    return data.frozen.filter(f => typeof f === 'string' && f.length);
+  } catch {
+    return null;
+  }
+}
+
+function frozenMessage(filePath) {
+  return [
+    `Constellation 定稿 UI 凍結守衛：擋下——${filePath}。`,
+    '  → 此檔案是使用者定稿凍結的 UI 元件（design-frozen.json）——要修改必須先經使用者彈窗同意、將該檔' +
+      '從 frozen 移除並在 log 記一筆 unfreeze（含原因），才能編輯。不得未經同意自行解凍。',
+  ].join('\n');
+}
+
+// 給定單一目標檔案路徑，判斷是否命中凍結名單。回 BLOCK(...) 或 null（不擋）——刻意不用 PASS 物件，
+// 因為 PASS 本身是 truthy，呼叫端要能用 `if (result)` 分辨「有擋下」與「沒事」。
+function checkFrozenPath(filePath, cwd) {
+  // 例外：目標本身就是 design-frozen.json → 不受凍結檢查限制，否則永遠無法解凍。
+  if (DESIGN_FROZEN_PATH_RE.test(String(filePath))) return null;
+  if (normalizeRepoRelPath(filePath, cwd) === DESIGN_FROZEN_REL) return null;
+
+  const frozen = readFrozenList(cwd);
+  if (!frozen || !frozen.length) return null; // 名單不存在／解析失敗／空清單 → fail-open
+
+  const rel = normalizeRepoRelPath(filePath, cwd);
+  const hit = frozen.some(f => normalizeRepoRelPath(f, cwd) === rel);
+  return hit ? BLOCK(frozenMessage(filePath)) : null;
+}
+
+// apply_patch：對 patch 內全部 `*** Update File:` 路徑逐一檢查凍結（沿用 checkApplyPatch 同一套
+// marker 解析邏輯；新增/刪除檔案不會撞到既有凍結名單裡的既存檔案路徑判斷，故只看 Update File）。
+function checkFrozenApplyPatch(patchText, cwd) {
+  const lines = patchText.split(/\r?\n/);
+  const markers = [];
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(PATCH_FILE_MARKER_RE);
+    if (m) markers.push({ kind: m[1], path: m[2].trim() });
+  }
+  for (const marker of markers) {
+    if (marker.kind !== 'Update File') continue;
+    const r = checkFrozenPath(resolve(cwd, marker.path), cwd);
+    if (r) return r;
+  }
+  return null;
+}
+
+// 統一入口：依工具型態取出目標檔案路徑（Write／Edit／MultiEdit 用 file_path；apply_patch 用 patch
+// 文字裡的 Update File 路徑），交給 checkFrozenPath／checkFrozenApplyPatch 判定。回 BLOCK(...) 或
+// null（沒事，呼叫端繼續往下走既有的 done 票檢查）。
+function checkFrozenGuard(tool, ti, input) {
+  const cwd = resolveCwd(input);
+
+  if (tool === 'Write' || tool === 'Edit' || tool === 'MultiEdit') {
+    const filePath = String(ti.file_path ?? ti.filePath ?? '');
+    if (!filePath) return null;
+    return checkFrozenPath(filePath, cwd);
+  }
+
+  const patchText = firstNonEmptyString(ti.patch, ti.command, input.patch, input.command);
+  if (patchText) return checkFrozenApplyPatch(patchText, cwd);
+
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // 純判定（不碰 stdin/exit），方便日後測試或整合呼叫。回 { block, message? }。
 // ---------------------------------------------------------------------------
 export function closeGateCheck(input) {
   const tool = input.tool_name ?? input.toolName ?? '';
   const ti = input.tool_input ?? input.toolInput ?? {};
+
+  // 定稿 UI 凍結守衛先檢查——與下面的 done 票檢查各自獨立觸發，不因其中一項 PASS 就跳過另一項。
+  const frozenBlock = checkFrozenGuard(tool, ti, input);
+  if (frozenBlock) return frozenBlock;
 
   if (tool === 'Write') {
     const filePath = String(ti.file_path ?? ti.filePath ?? '');

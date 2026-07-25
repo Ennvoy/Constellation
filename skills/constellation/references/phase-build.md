@@ -43,3 +43,20 @@
   - 涉及權限、金流、個資 scope。
   - 破壞性 DB 操作（`DROP`／`TRUNCATE`／無 `WHERE` 的 `DELETE`/`UPDATE`）。
 - **平行 worker 遇到大事**：那張票標 `blocked` 並寫清楚卡在哪，其餘票繼續做、不用等它；主線把這批裡所有卡住的大事收集起來，一次跟使用者彈窗問清楚——不要每張票各自彈一次窗。
+
+## 撞到凍結怎麼辦
+
+實作中發現需要改到 design 階段定稿凍結的元件（`.constellation/design-frozen.json` 的 `frozen` 名單內，見本檔同目錄的 `phase-design.md` 步驟 4）——例如接資料時發現定稿元件缺一個欄位、需要調整 props 介面——**這屬於「大事」，不能自己動手改**，即使改動看起來很小。實測上，任何 Edit／Write／MultiEdit／apply_patch 對凍結檔案的操作都會被閘門 5（關票刷卡機）機器擋下，不會意外改成功。
+
+處理節奏：
+
+1. **停下彈窗**：用 AskUserQuestion 講清楚三件事——要改哪個檔（給出 `frozen` 名單裡的路徑）、為什麼需要改（例如「接 API 後發現缺 `avatarUrl` 欄位的顯示位置」）、影響範圍（純加欄位／改版面結構／其他）。
+2. **使用者同意**：把該檔的路徑從 `.constellation/design-frozen.json` 的 `frozen` 陣列移除，並在 `log` 陣列補一筆 `unfreeze`（含原因與時間戳）：
+   ```json
+   { "path": "src/components/LoginForm.tsx", "action": "unfreeze", "at": "<ISO 時間戳>", "reason": "接 API 後缺 avatarUrl 顯示位置，使用者同意調整" }
+   ```
+   移除後這個檔案才解除機器擋下，可以正常編輯。
+3. **改完**：若這次改動屬於視覺層調整（版面、互動、外觀有變化）——請使用者再次過目，過目通過後把該檔路徑補回 `frozen` 陣列、在 `log` 補一筆 `action: "refreeze"`（原因寫這次調整了什麼）。若只是介面層小補（例如純加一個內部沒有視覺變化的 prop），可以視情況直接 refreeze，不強制每次都要使用者重新走一次視覺確認，但仍要留 `refreeze` 記錄。
+4. **使用者不同意**：這張票依既有規則標 `blocked`（決議記錄寫清楚卡在哪）或改走不動定稿的替代方案，不能繞過使用者硬改。
+
+**明令：不得未經同意自行解凍**——`log` 是審計軌跡，出貨審查（`phase-ship.md`）的 Spec 軸會核對每筆 `unfreeze` 是否對應得上使用者同意的脈絡（例如某張票的決議記錄、或彈窗當下的對話紀錄），沒有對應同意脈絡的解凍視為阻擋級發現。
