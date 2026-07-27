@@ -14,7 +14,7 @@
 
 - 三個變體共用**同一個**品牌基底（一起換掉配色會讓「哪個結構好」被「哪個配色好」污染，比較不出真正的差異）。
 - 若 `CONTEXT.md`／`decisions/` 裡訪談階段已經記錄使用者的風格偏好，直接沿用，不重問。
-- 沒有既定偏好：先 lazy 讀同目錄 `design-systems/index.md`（只讀索引，不把 150 套內容整份塞進 context），依這次任務的調性／受眾抓 2–3 個候選，套用本檔同目錄的 `phase-grill.md` 的開放問題格式問使用者選（這是有取捨的真決策，不是事實，不用彈窗）：每個候選附一句「適合什麼調性」。
+- 沒有既定偏好：先 lazy 讀同目錄 `design-systems/index.md`（只讀索引，不把 150 套內容整份塞進 context），依這次任務的調性／受眾抓 2–3 個候選，套用本檔同目錄的 `phase-grill.md` 的提問格式問使用者選（這是有取捨的真決策、不是事實，照該檔規則走 AskUserQuestion 彈窗）：每個候選附一句「適合什麼調性」。
 - 選定後，只 lazy 讀那一套的 `design-systems/<slug>/DESIGN.md`（9 段規範）＋ `tokens.css`（CSS 變數），其餘 149 套不讀。三個變體都從這份 tokens 出發做客製化延伸，不是套用預設樣式了事。
 
 ## 步驟 2：生成 3 個結構不同的變體（上限 5）
@@ -53,4 +53,4 @@ DesignSync／canvas 不可用（離線、額度不足、Codex runtime 本來就�
 1. 跳過步驟 3 的 push／pull，直接在瀏覽器開 `?variant=a`／`b`／`c`（或各自的新路由）逐一走查。
 2. 使用者直接用文字講「要哪個、想改哪裡」，agent 依文字回饋改那個變體的 code，反覆調整到使用者滿意。
 3. 滿意即定稿——不需要額外的 pull 動作（本來就在 repo 裡），比照步驟 4 清掉其餘變體與切換器，只留這一份成為正式元件，並一樣寫 `decisions/NNN-slug.md` 定稿記錄。
-- 「是否滿意、是否還要再調」這類封閉確認，Claude Code 端用 AskUserQuestion 彈窗；Codex 端本來就沒有彈窗，比照本檔同目錄的 `phase-grill.md` 的 Codex 降級規則改用文字點列確認。
+- 「是否滿意、是否還要再調」這類封閉確認，Claude Code 端用 AskUserQuestion 彈窗；Codex 端沒有彈窗，比照本檔同目錄 `phase-grill.md` 的 Codex 降級規則改用文字點列確認。

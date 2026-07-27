@@ -53,6 +53,6 @@ description: 當使用者要啟動新功能開發、想走完整開發工作流�
 - 大小分岔（大流程完整走②③④⑤；小流程只在③不拆多票、weave 直接產單一任務卡，之後走輕量⑤）由 `references/phase-grill.md` 在訪談收尾時與使用者一次拍板，本檔不重複判斷。是否需要②（UI 定稿）與大小流程正交、分開決定——不是「小流程＝連②也跳過」。
 - 若讀到的現況互相矛盾（例如 `tickets/` 有檔但 `CONTEXT.md` 不存在），照實告知使用者看到的落差，不自行腦補跳過。
 - **runtime 降級對照**（此對照放總控，是因為 lazy loading 下 Codex 在後期階段讀不到 `phase-grill.md` 裡的降級說明；各 `references/phase-*.md` 提到下列三個工具時，Codex 端一律按此對照執行，紀律不變、形式退化）：
-  - **AskUserQuestion 彈窗** → Codex 端改用跟開放問題同款的文字點列格式呈現封閉確認，選項精簡、一句講清楚哪個是預設；使用者一樣可回數字、回「ok」、或打自由文字。
+  - **AskUserQuestion 彈窗**（Claude Code 端所有提問——開放問題與封閉確認——都走彈窗，一次一題）→ Codex 端沒有這個工具，一律降級為純文字點列格式：一則訊息一題、置於結尾醒目處、推薦排第一並標記；使用者可回數字、回「ok」、或打自由文字。
   - **Workflow 工具（票平行 fan-out）** → Codex 端沒有這個工具，這批票改序列逐張做，不平行。
   - **DesignSync／Claude Design canvas** → Codex 端退化為純本地變體瀏覽器走查（開 `?variant=` 切換），流程其餘不變。
