@@ -20,12 +20,17 @@
 //      對應防護落在本檔「done 票稽核」＋獨立的「關票刷卡機」（gates/close-gate.mjs，票標 done 時檢查
 //      驗證證據存在且新鮮），兩層責任分開：close-gate 管「改檔當下」、commit-gate 管「進歷史前兜底」。
 //   2) 原本 secrets／驗證垃圾判定抽在共用檔 commit-gate-core.mjs（供 git 原生 pre-commit 對應檔
-//      flow-precommit.mjs 共用），Constellation 這次未搬原生 pre-commit 對應檔，故本檔內聯全部判定
-//      邏輯，改為單檔自足，不再依賴外部 core 檔。
+//      flow-precommit.mjs 共用），故本檔內聯全部判定邏輯，改為單檔自足，不再依賴外部 core 檔。
+//      【2026-07-28 補】首次搬遷時連「原生 pre-commit 對應檔」也一併未搬，導致本檔只攔得到 Claude Code
+//      發起的 commit，人在終端機手打的 commit 無人看管。Flow 退役後該缺口曝光，經使用者拍板補上：
+//      不另立執行體，改在本檔加 `--precommit` 入口（見下方 runPrecommit），由 gates/precommit-install.mjs
+//      冪等裝進 .git/hooks/pre-commit。兩條呼叫路徑共用同一組判定函式，杜絕規則漂移。
 //   3) 「驗證垃圾」白名單原本 import 自 flow-toolkit/clean-verify-artifacts.mjs（該檔另兼 CLI 清理／
-//      補 .gitignore 職責，不在本次搬遷範圍）。本檔只內聯 isCommitBlockableArtifact 判定所需的最小規則集
-//      （Tier A 絕對垃圾檔名＋已知產物目錄清單），不含清理或 .gitignore 功能；擋下時的建議動作也相應改為
-//      `git restore --staged` 手動移出，不再呼叫外部清理腳本。
+//      補 .gitignore 職責）。本檔只內聯 isCommitBlockableArtifact 判定所需的最小規則集（Tier A 絕對垃圾
+//      檔名＋已知產物目錄清單），不認 Tier B（散落截圖／影片），避免誤擋使用者故意 commit 的資產。
+//      【2026-07-28 補】當初未搬的「清理／補 .gitignore」職責已補齊為 gates/clean-artifacts.mjs，
+//      並反向 import 本檔 export 的規則（單向依賴：本檔仍不 import 任何外部檔）；擋下時的建議動作
+//      相應改為指向該 CLI。
 //   4) 生效範圍門檻由「.flow 存在」改為「.constellation 存在」——僅在已採用 Constellation 工作流的專案
 //      生效，非本工作流專案不受影響（與原檔「非 flow 專案放行」同一設計精神，只是換了目錄名）。
 //
@@ -38,8 +43,11 @@ import { existsSync, readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { join, resolve, dirname } from 'node:path';
+import { pathToFileURL, fileURLToPath } from 'node:url';
+
+// 清理 CLI 的絕對路徑（由本檔實際所在目錄推導，不受呼叫時 cwd 影響）——擋下驗證垃圾時指路用。
+const CLEAN_CLI = join(dirname(fileURLToPath(import.meta.url)), 'clean-artifacts.mjs');
 
 const exit0 = () => process.exit(0);
 const stripBom = s => (s && s.charCodeAt(0) === 0xfeff ? s.slice(1) : s);
@@ -51,17 +59,48 @@ const BLOCK = msg => ({ block: true, message: msg });
 // dispatcher 時直接 import 呼叫；也保留獨立 main() 讓本檔仍可單獨當 hook 跑（測試/相容）。
 // **只有直接執行本檔時才掛 stdin/main**——被其他程式 import 時不可自動跑，否則會搶先 exit 短路呼叫端。
 if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
-  let raw = '';
-  process.stdin.setEncoding('utf8');
-  process.stdin.on('error', () => process.exit(0));
-  process.stdin.on('data', (c) => (raw += c));
-  process.stdin.on('end', () => {
-    let input;
-    try { input = JSON.parse(stripBom(raw).trim() || '{}'); } catch { return exit0(); }
-    let r; try { r = commitGateCheck(input); } catch { r = null; }   // fail-open
-    if (r && r.block) { process.stderr.write(String(r.message || '') + '\n'); process.exit(2); }
-    exit0();
-  });
+  if (process.argv.includes('--precommit')) {
+    // git 原生 pre-commit 呼叫路徑（gates/precommit-install.mjs 裝進 .git/hooks/pre-commit）。
+    // 延到 nextTick 才跑：本入口位在模組頂部，下方的 const（ARTIFACT_DIRS/TICKET_PATH_RE…）尚在 TDZ，
+    // 同步執行會 ReferenceError。stdin 那條路徑靠事件非同步天然避開，這條得自己延。
+    process.nextTick(runPrecommit);
+  } else {
+    let raw = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('error', () => process.exit(0));
+    process.stdin.on('data', (c) => (raw += c));
+    process.stdin.on('end', () => {
+      let input;
+      try { input = JSON.parse(stripBom(raw).trim() || '{}'); } catch { return exit0(); }
+      let r; try { r = commitGateCheck(input); } catch { r = null; }   // fail-open
+      if (r && r.block) { process.stderr.write(String(r.message || '') + '\n'); process.exit(2); }
+      exit0();
+    });
+  }
+}
+
+// ── git 原生 pre-commit 兜底（--precommit）──
+// 攔的是 PreToolUse 攔不到的整批繞法：使用者在終端機手打 commit／子行程／npm script／release 腳本／
+// MCP run_code。無 stdin JSON、無 command 字串，cwd＝工作樹根。
+// 與 PreToolUse 路徑的差異只有兩點：① 沒有 command 可判，故「--no-verify/-n 繞過」那道不適用（在這條
+// 路徑上 --no-verify 是 git 原生逃生門，人為使用且 reflog 可稽核）；② 其餘三道閘門完全共用同一組函式。
+// （註：Flow 當年的 pre-commit 只跑得動兩道——它第三道要比對 commit message 點名的 task，pre-commit
+// 階段拿不到 message。Constellation 第三道是「done 票稽核」，只看 staged 內容，故這裡三道全跑。）
+// 設計鐵則：fail-open——非 Constellation 專案／取不到 staged／任何例外一律 exit 0 放行，
+// git commit 絕不因 hook bug 卡死。真要跳過用 git 原生 `git commit --no-verify`。
+function runPrecommit() {
+  try {
+    const root = resolveRepoRoot(process.cwd());
+    if (!existsSync(join(root, '.constellation'))) return exit0(); // 非 Constellation 專案
+
+    const staged = stagedFiles(root); // 取不到＝null＝三道全 fail-open
+    const reason = secretsReason(root, staged) || artifactsReason(staged) || doneTicketAuditReason(root, staged);
+    if (reason) {
+      process.stderr.write(reason + '\n  （這是 Constellation 的 git pre-commit 兜底；真要跳過：git commit --no-verify）\n');
+      process.exit(1);
+    }
+  } catch { /* fail-open：任何例外都放行，不卡死 commit */ }
+  exit0();
 }
 
 // ── repo root 解析（新增）：git rev-parse --show-toplevel，失敗 fallback cwd ──
@@ -227,13 +266,15 @@ function verifyTicketEvidence(content, relFsPath, root) {
 // ── 內聯：驗證垃圾白名單判定（原 flow-toolkit/clean-verify-artifacts.mjs 的最小子集，見去 Flow 化紀錄③）──
 // 只認 Tier A（絕對垃圾）＋已知產物目錄；不含原檔的 Tier B（散落截圖/影片，需另查 git untracked 才清），
 // 避免在 commit-gate 這種輕量判定裡誤擋使用者故意 commit 的資產。
-const ARTIFACT_DIRS = new Set([
+// 這組規則對外 export：gates/clean-artifacts.mjs 單向 import 沿用，確保「擋下的」與「清掉的」永遠同一套
+// 標準、不會各養一份而漂移。本檔仍不 import 任何外部檔（單檔自足的安全閘門紀律不變，見去 Flow 化紀錄②）。
+export const ARTIFACT_DIRS = new Set([
   'test-results', 'playwright-report', '.playwright',     // @playwright/test
   '.playwright-mcp', 'playwright-mcp-output',             // @playwright/mcp 操作殘留
   'coverage', '.nyc_output', 'htmlcov',                   // 覆蓋率
   '.pytest_cache', '__pycache__',                         // pytest / Python
 ]);
-const HARD_FILE_RE = [
+export const HARD_FILE_RE = [
   /\.log$/i,
   /^\.last-run\.json$/i,
   /\.trace\.zip$/i,
@@ -243,7 +284,7 @@ const HARD_FILE_RE = [
   /\.tmp$/i,
 ];
 // 絕不誤判：source 測試檔＋刻意留存的 reference data（交付物）優先於上面所有規則。
-const KEEP_RE = [
+export const KEEP_RE = [
   /\.(test|spec)\.[cm]?[jt]sx?$/i, /_test\.[a-z]+$/i, /(^|[/\\])conftest\.py$/i,
   /baseline/i, /golden/i, /snapshot/i, /\.fixture\./i,
 ];
@@ -252,14 +293,14 @@ const KEEP_RE = [
 const AMBIGUOUS_PREFIX_RE = /^(tmp|temp|scratch|debug)[-.]/i;
 const SOURCE_EXT_RE = /\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|rb|php|c|h|hpp|cpp|cc|cs|swift|kt|scala|css|scss|less|vue|svelte|json|jsonc|toml|md|mdx|html?|sql|sh|graphql|gql|proto)$/i;
 
-const keepPath = base => KEEP_RE.some(re => re.test(base));
-const underArtifactDir = relpath => relpath.split(/[/\\]/).some(seg => ARTIFACT_DIRS.has(seg));
-const isHardArtifact = base => {
+export const keepPath = base => KEEP_RE.some(re => re.test(base));
+export const underArtifactDir = relpath => relpath.split(/[/\\]/).some(seg => ARTIFACT_DIRS.has(seg));
+export const isHardArtifact = base => {
   if (keepPath(base) || !HARD_FILE_RE.some(re => re.test(base))) return false;
   if (AMBIGUOUS_PREFIX_RE.test(base) && SOURCE_EXT_RE.test(base)) return false;
   return true;
 };
-function isCommitBlockableArtifact(relpath) {
+export function isCommitBlockableArtifact(relpath) {
   const base = relpath.split(/[/\\]/).pop() || relpath;
   if (keepPath(base)) return false;
   return underArtifactDir(relpath) || isHardArtifact(base);
@@ -315,9 +356,13 @@ function artifactsReason(staged) {
   return [
     'Constellation commit 守門：擋下 commit —— 這些「驗證垃圾」已被 git add 進 staging，會污染交付 diff：',
     show + more,
-    '  先移出 staging 再 commit（多半是測試/驗證跑出的暫存產物，非交付內容）：',
-    ...trash.slice(0, 10).map((p) => `    git restore --staged "${p}"`),
-    '  建議順手補進 .gitignore，避免下次又被 git add -A 吃進來。別手改繞過本閘門。',
+    '  多半是測試／驗證跑出的暫存產物、非交付內容。兩步處理：',
+    '  ① 移出 staging：',
+    ...trash.slice(0, 10).map((p) => `       git restore --staged "${p}"`),
+    '  ② 清掉檔案本身並補 .gitignore（不加 --apply 只預覽要刪什麼，確認後再加）：',
+    `       node "${CLEAN_CLI}"`,
+    `       node "${CLEAN_CLI}" --apply --gitignore`,
+    '  別手改繞過本閘門。',
   ].join('\n');
 }
 

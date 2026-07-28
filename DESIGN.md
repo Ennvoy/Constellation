@@ -104,12 +104,14 @@ zone: src/auth/**, tests/auth/**   # 檔案界線（平行時互斥用）
 | # | 閘門 | 觸發 | 職責 |
 |---|------|------|------|
 | 1 | git 守門 | hook | 擋破壞性 git 操作與未經確認的開/切分支（自 Flow 原封搬入） |
-| 2 | commit 守門 | hook | commit 前掃 secrets／垃圾產物（自 Flow 原封搬入） |
+| 2 | commit 守門 | hook ＋ git pre-commit | commit 前掃 secrets／垃圾產物（自 Flow 原封搬入）。**兩條呼叫路徑、同一套判定**：PreToolUse hook 攔 Claude Code 發起的 commit；git 原生 pre-commit（`--precommit` 入口，由 session 開場冪等安裝）兜住使用者手打／子行程／npm script／MCP 發起的 commit——後者是前者攔不到的整批繞法 |
 | 3 | session 開場注入 | hook | 從 `.constellation/` 重建現況並注入開場 |
 | 4 | 驗證 runner | script | 實跑驗證（`--scope` 分逐票／出貨兩級），pass 證據附簽章寫入票（ship 級寫入 `.constellation/ship-evidence.md`）；內建**斷路器**——同一目標連續 5 次失敗即強制停下請使用者拍板，不無限重試 |
 | 5 | 關票刷卡機 | hook | 票標 done 時機器驗證據簽章與新鮮度（24h）＋驗收條件全勾，不過直接擋下；兼任**定稿 UI 凍結守衛**——編輯 design-frozen.json 名單內的檔案一律擋下，解凍須經使用者同意並留日誌 |
 
 驗證證據由 runner 以本機 secret（install 時生成於使用者家目錄，不進 git）簽章（簽章綁定 repo，防跨專案重放）、刷卡機驗簽——手填時間戳無法通過，「機器擋假完成」才真正成立。commit 守門另做一道 **done 票稽核**：commit 時 staged 的 done 票必須含通過驗簽的證據，堵「用 shell 指令繞過刷卡機改檔」的旁門。
+
+閘門 2 擋下驗證垃圾時，指路 `gates/clean-artifacts.mjs` 收拾：預設 dry-run 先列要刪什麼，`--apply` 才真刪，`--gitignore` 順手補防護。它單向 import 閘門 2 的白名單，「被擋的」與「被清的」永遠同一套標準。分兩級風險：絕對垃圾（log／產物目錄／暫存檔）不論是否 tracked 都清；截圖與錄影只清 git 沒追蹤過的，已 commit 的資產一律不碰，查不到 git 時整批保守略過。**它是工具不是閘門**——沒有它照樣擋得住，只是要自己手動收拾。
 
 原則：**每個閘門只在關鍵事件觸發，平時零開銷**。不設巨石 CLI；除此五件外，一切靠 skill 紀律，不加新硬閘（加閘門需回本文件修訂）。
 
@@ -178,12 +180,15 @@ Desktop\Constellation\
 │   └── grill/             # 獨立訪談入口（殼，引擎在 phase-grill.md）
 │       └── SKILL.md ＋ agents/openai.yaml
 ├── gates/                 # 閘門五件組 .mjs ＋ hooks.claude.json / hooks.codex.json
+│                          # ＋ precommit-install.mjs（裝 git 原生 pre-commit 兜底）
+│                          # ＋ clean-artifacts.mjs（清驗證產物 CLI，被閘門 2 指路）
 └── install.ps1            # 一鍵部署：per-skill junction、掛雙邊 hooks、生成簽章 secret、對賬
 ```
 
 ## 11. 與舊 Flow 的關係
 
-- **全新取代**。新流建好後新任務一律走 Constellation；Flow hooks 暫不拆，退役時機由使用者在新流跑順首個真實任務後拍板。
+- **全新取代**。**Flow 已於 2026-07-28 完整移除**（首個真實任務跑順後由使用者拍板）：全域 32 項自有檔＋7 條 hook 接線＋殘留檔全清，母本 repo 保留可一鍵重裝。
+- **退役後補搬的兩塊**（首次搬遷刻意未搬、Flow 退場後缺口曝光，經使用者拍板補齊）：① git 原生 pre-commit 兜底——原本只有 PreToolUse 那層，人在終端機手打 commit 完全無人看管，secrets 進歷史不可逆且不自我暴露，屬「值得真防護」的缺口；不另立執行體，改在閘門 2 加 `--precommit` 入口。② 驗證產物清理 CLI——原本只搬了「判定要擋」沒搬「幫你清」，被擋下只能自己一條條手動移除。
 - 搬遷零件（血淚資產）：flow-git-guardrail、flow-commit-gate（→ 閘門 1、2）；session-start 重建思路（→ 閘門 3）；150 套 design-systems 資產庫（原封搬入）；另自 mattpocock 改寫除錯迴圈與衝突解法兩篇。EARS 語法不再沿用——票的驗收條件以「實跑可驗證」紀律取代結構化語法。
 - 不搬：五階段儀式、SDD 三件套、31-subcommand 巨石 CLI、多層對抗審查、spec-review 收斂迴圈。
 

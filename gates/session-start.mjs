@@ -9,7 +9,7 @@
 import { readFileSync, existsSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 // R6：驗證 runner 的絕對路徑（不靠使用者猜相對路徑、不受呼叫時 cwd 影響），由本檔實際所在
 // 目錄（gates/）推導出來——避免相對路徑在不同 cwd 下指到錯誤位置（路徑注入/誤觸風險）。
@@ -113,11 +113,24 @@ function buildSummary(cwd) {
   return lines.join('\n');
 }
 
+// git 原生 pre-commit 兜底的冪等安裝（gates/precommit-install.mjs）。只在確認是 Constellation 專案後才呼叫。
+// 動態 import 包在 try：檔案缺失／壞掉一律靜默略過，session 開場絕不因此失敗。
+// 回傳要附進開場摘要的一行（首裝告知／warn 提醒），沒事回 null。
+async function ensurePrecommit(root) {
+  try {
+    const mod = await import(pathToFileURL(join(GATES_DIR, 'precommit-install.mjs')).href);
+    const r = mod.installPrecommit(root);
+    if (r.installed) return '· 已為本 repo 裝上 git pre-commit 兜底——往後在終端機自己打 git commit，也會過 secrets／驗證垃圾檢查。';
+    if (r.warn) return '⚠ ' + r.warn;
+  } catch { /* fail-silent：安裝器缺失/例外都不影響開場 */ }
+  return null;
+}
+
 let raw = '';
 process.stdin.setEncoding('utf8');
 process.stdin.on('error', () => process.exit(0));
 process.stdin.on('data', c => (raw += c));
-process.stdin.on('end', () => {
+process.stdin.on('end', async () => {
   let input = {};
   try { input = JSON.parse(stripBom(raw).trim() || '{}'); } catch { input = {}; }
   // cwd 多鍵名 fallback：Claude Code／Codex 慣用 cwd，防禦性再收兩個常見別名。
@@ -125,7 +138,12 @@ process.stdin.on('end', () => {
 
   let summary = null;
   try { summary = buildSummary(cwd); } catch { summary = null; }
-  if (!summary) return process.exit(0);
+  if (!summary) return process.exit(0); // 非 Constellation 專案：不注入、也不裝 pre-commit
+
+  // summary 非 null＝確定是 Constellation 專案，此時才裝兜底。
+  let notice = null;
+  try { notice = await ensurePrecommit(resolveRepoRoot(cwd)); } catch { notice = null; }
+  if (notice) summary += '\n' + notice;
 
   const out = { hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: summary } };
   process.stdout.write(JSON.stringify(out), () => process.exit(0));
