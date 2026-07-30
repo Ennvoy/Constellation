@@ -13,7 +13,7 @@ description: 當使用者要啟動新功能開發、想走完整開發工作流�
 | 步驟 | 代號 | 一句話 |
 |---|---|---|
 | ① 訪談 | grill | 批次問到 frontier 清空，決議即時落檔 |
-| ② UI 定稿 | design | 生成多變體真元件 → canvas 挑選微調 → 定稿即最終品，不重畫 |
+| ② UI 定稿 | design | 設計基底同步上 Claude Design → 它自己設計 → canvas 調到滿意 → 拉回 repo 一次性轉譯落地 |
 | ③ 合成拆票 | weave | 不再發問，把決議合成任務卡＋垂直拆票（驗收條件、檔案界線） |
 | ④ 逐票實作 | build | 無依賴票平行 fan-out、序列整合，每票測試先行→實作→實跑驗證→關票 |
 | ⑤ 出貨 | ship | 全量真鏈路驗證＋獨立兩軸審查（Standards／Spec 分開報告） |
@@ -55,4 +55,4 @@ description: 當使用者要啟動新功能開發、想走完整開發工作流�
 - **runtime 降級對照**（此對照放總控，是因為 lazy loading 下 Codex 在後期階段讀不到 `phase-grill.md` 裡的降級說明；各 `references/phase-*.md` 提到下列三個工具時，Codex 端一律按此對照執行，紀律不變、形式退化）：
   - **AskUserQuestion 彈窗**（Claude Code 端所有提問——開放問題與封閉確認——都走彈窗，一次一題）→ Codex 端沒有這個工具，一律降級為純文字點列格式：一則訊息一題、置於結尾醒目處、推薦排第一並標記；使用者可回數字、回「ok」、或打自由文字。
   - **Workflow 工具（票平行 fan-out）** → Codex 端沒有這個工具，這批票改序列逐張做，不平行。
-  - **DesignSync／Claude Design canvas** → Codex 端退化為純本地變體瀏覽器走查（開 `?variant=` 切換），流程其餘不變。
+  - **DesignSync／Claude Design canvas** → Codex 端退化為純本地變體瀏覽器走查（在專案裡直接生成變體、開 `?variant=` 切換逐一走查、使用者用文字講要哪個想改哪裡）；因為東西本來就在 repo 裡，少了「拉回」與「轉譯」兩步，定稿記錄與凍結照跑。

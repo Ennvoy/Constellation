@@ -1,8 +1,9 @@
 # Constellation 品牌設計系統索引（lazy 選取用）
 
 > 共 **150 套**，取自 open-design（Apache-2.0；來源與「非官方品牌資產」聲明見 `NOTICE.md`）。
-> `phase-design.md`（UI 定稿階段）挑基底時 **lazy 只讀本索引**，依任務調性抓 2–3 個候選問使用者選，選定後才讀那一套的
-> `<slug>/DESIGN.md`（9 段規範）+ `tokens.css`（CSS 變數），三個結構變體都從這份 tokens 出發做客製化延伸——其餘 149 套不讀，context 零負擔。
+> `phase-design.md`（UI 定稿階段）**空地專案**挑基底時 **lazy 只讀本索引**，依任務調性抓 2–3 個候選問使用者選，選定後才讀那一套的
+> `<slug>/DESIGN.md`（9 段規範）+ `tokens.css`（CSS 變數），把這份 tokens 當設計基底同步上 Claude Design 做客製化延伸——其餘 149 套不讀，context 零負擔。
+> （repo 已經有既有 UI 時不從這裡挑，直接把既有的 tokens／元件／全域樣式／字型當基底；細節見 `phase-design.md` 步驟 1。）
 
 ## AI & LLM
 

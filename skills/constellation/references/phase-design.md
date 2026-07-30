@@ -1,56 +1,257 @@
 # Phase ② UI 定稿（design）
 
-一句話：生成幾個結構真的不同的真元件變體 → push 上 canvas 讓使用者挑選微調 → 定稿 pull 回來就是最終品，不重畫。
+一句話：把這個專案的設計基底同步上 Claude Design → 讓 Claude Design 自己設計出這次要的畫面 → 使用者在它的 canvas 上調到滿意 → 拉回 repo 一次性轉譯成專案自己的元件 → 定稿即凍結。
 
-解決的根本問題是 mockup 與成品不符（出處：母本 DESIGN.md §3，部署後 runtime 不需讀取）——這裡定稿的是**真元件真 code**，不是給人看一眼就丟的圖。
+解決的根本問題是 mockup 與成品不符（出處：母本 DESIGN.md §3，部署後 runtime 不需讀取）。**定稿的是一份完整可執行的設計規格**——真的能跑、能點、能操作的畫面，不是給人看一眼就丟的圖；落地是**一次性轉譯**（把它的檔案格式換成專案自己的元件格式），不是看著圖重畫。這兩件事要據實講清楚：不可以宣稱「原封落地」（格式不同，一定要轉一次），但仍然遠勝「看著 mockup 重畫」——視覺與互動細節都已經被使用者確認過、有一份能跑的東西當對照。
+
+**方向感（這階段最容易走反的地方）**：Claude Design 的價值在於**它自己會設計**——官方定位是「你講你要什麼，它先做一版給你反應，你再一路改到它變成你的」。所以**不要**在本地先做好幾個版本再推上去讓使用者挑：那等於白繞一趟雲端，也浪費了它自己會設計這件事。本地生成變體只在 Claude Design 不可用時才走（見最後的「降級路徑」）。
 
 ## 進場 / 離場
 
-- **進場條件**：本檔同目錄的 `phase-grill.md` 收尾時判定這次任務**需要 UI**（不是純後端／無 UI 任務），frontier 已清空、使用者已拍板。
-- **離場條件**：使用者已經在 canvas（或降級路徑的本地變體走查）挑定並微調出最終版本、pull 回 repo、變體 scaffold 清乾淨只留定稿版本 → 交給本檔同目錄的 `phase-weave.md`。
-- **無 UI 任務**：本檔同目錄的 `phase-grill.md` 判定不需要 UI 時，本階段完全不運行，repo 裡也不會出現任何變體或 canvas 相關檔案，直接由 grill 交給 weave。
+- **進場條件**：本檔同目錄的 `phase-grill.md` 收尾時判定這次任務**需要 UI**（不是純後端／無 UI 任務），frontier 已清空、使用者已拍板。`decisions/grill-close.md` 的「是否需要 UI」欄值是 `是（架構有得選）` 或 `是（照既有架構做）`，**兩者都進場**——差別只在步驟 2 要不要請 Claude Design 生成多個方向讓使用者比較；同步基底、確認調整、拉回、轉譯、寫定稿記錄、凍結一律照跑。
+- **離場條件**：使用者已在 canvas 上挑定並調到滿意 → 設計稿已拉回 repo → 已一次性轉譯成專案自己的元件並自己跑過確認長得一樣 → 定稿記錄已寫 → 凍結名單已寫 → 才交給本檔同目錄的 `phase-weave.md`。只生成一版的那條路徑沒有「挑」這個動作，離場條件相應是：使用者已經看過這一版、點頭定稿（或講完要改哪裡、在 canvas 上改到滿意），其餘步驟完全相同。
+- **無 UI 任務**：本檔同目錄的 `phase-grill.md` 判定不需要 UI 時，本階段完全不運行，也不會去建立或動任何 Claude Design 專案，直接由 grill 交給 weave。
 
-## 步驟 1：挑基底設計系統
+## 這階段誰動手：多數步驟自己代操，只有一步非使用者親自不可
 
-- 三個變體共用**同一個**品牌基底（一起換掉配色會讓「哪個結構好」被「哪個配色好」污染，比較不出真正的差異）。
+Claude Design **沒有可以程式呼叫的「生成」介面**——DesignSync 工具只有讀檔、寫檔、建專案那幾個方法，「生成畫面」與「在 canvas 上編輯」都只存在於網頁上。所以這階段會真的去操作瀏覽器好幾次，要分清楚哪幾次自己做完就好、哪一次一定要停下來等使用者：
+
+| 步驟 | 誰動手 |
+|---|---|
+| 1　推基底上去 | 自己（DesignSync 寫檔） |
+| 1d 觸發編譯 | **自己代開瀏覽器**載入專案頁面（不載入就不會編譯），使用者不必在場 |
+| 2　丟需求生成 | **自己代開瀏覽器**輸入需求、送出、等它畫完，使用者不必在場 |
+| 3　確認與調整 | **⚠ 使用者親自**——挑哪一版、調哪裡是設計決策，不可代為拍板 |
+| 4　拉回 repo | 自己（`get_file`） |
+| 5　轉譯落地 | 自己 |
+| 7　定稿記錄與凍結 | 自己 |
+
+所以實際節奏是：**先把基底推上去、把畫面生成好，然後才把使用者叫來**——給他網址、告訴他手上有哪些工具（見步驟 3），請他看、調、或直接用文字講要改什麼（用文字講的話由自己動手改，不必逼他去拖拉）。不要在步驟 1、2 進行中就把網址丟給使用者要他等；也不要跳過步驟 3、自己覺得哪一版好看就往下走。
+
+## 開工前先分清兩件事：基底哪裡來、要不要多個方向
+
+這兩件事互不相干，各自有各自的決定方式，不要混成一題：
+
+- **基底哪裡來＝事實，自己讀 repo 就知道，絕對不問使用者**（鐵律「事實不問人」，出處：母本 DESIGN.md §2，部署後 runtime 不需讀取）：repo 裡已經有能跑的畫面（既有頁面／元件／樣式）→ 基底就是既有 code 本身，把它真正的 tokens／可重用元件／全域 CSS／字型推上去；repo 是一片空地（全新專案、還沒有任何畫面）→ 才挑一套設計系統當起點。做法見步驟 1。
+- **要不要多個方向＝真決策，使用者在訪談收尾已經拍板**：讀 `decisions/grill-close.md`「是否需要 UI」欄的值——`是（架構有得選）` 就在步驟 2 請 Claude Design 生成多個方向，`是（照既有架構做）` 就只生成一版。**這裡不重問**，值已經在檔案裡了。
+
+兩件事交叉出四條路，實際走法：
+
+| repo 有沒有既有 UI（自己探測） | grill-close.md 記的值 | 這階段怎麼走 |
+|---|---|---|
+| 沒有（空地） | `是（架構有得選）` | 挑一套設計系統推上去當基底 ＋ 請 Claude Design 生成多個方向讓使用者比較 |
+| 沒有（空地） | `是（照既有架構做）` | 挑一套設計系統推上去當基底 ＋ 只生成一版 |
+| 有 | `是（架構有得選）` | 把既有 tokens／元件／全域 CSS／字型推上去當基底 ＋ 生成多個方向 |
+| 有 | `是（照既有架構做）` | 同上基底 ＋ 只生成一版，需求描述裡明講沿用既有的資訊架構 |
+
+**這次是改造某個既有畫面時**（改版、重排、換互動方式）：把現況那幾個元件也一起推進設計系統當基底就好——生成時它會先讀設計系統再設計，自然會參考到現況長什麼樣。**不另外做「現況對照組」這種機制**；使用者真的想拿新舊並排看，就在 canvas 上跟現況畫面對照著看，或請 Claude Design 再生成一版貼近現況的版本。
+
+## 步驟 1：把專案的設計基底同步上 Claude Design
+
+這步的目的只有一個：**讓 Claude Design 設計的時候，用的是這個專案真正的東西，不是它自己想像的近似值**（官方原話是「用你真正的元件，不是近似品」）。做完這步，之後每一次生成都會先讀它、再設計。
+
+> **這整步是手工做法**：官方的 `/design-sync` skill **目前在本機取不到**（實查：Claude Code 2.1.220 已是 npm 最新版本，安裝檔裡搜不到 `design-sync` 字串、官方 marketplace 沒有這個 skill、官方 changelog 從未提及）。所以下面的檔案結構與哨兵都是從 app 端行為反推出來的手工做法。**哪天官方 skill 真的可用了，本步驟應該直接改成呼叫它**，不要繼續維護手工版。
+
+### 1a. 先確認要推的是「設計系統專案」
+
+- 用 `list_projects` 找這個專案有沒有既有的 design system 專案；沒有就 `create_project` 新建（用它建出來的就是設計系統型別）。
+- 推之前用 `get_project` 驗一下 `type` 是不是 `PROJECT_TYPE_DESIGN_SYSTEM`。
+- **型別在建立時就固定、之後不能改**：不能拿一個普通專案（`PROJECT_TYPE_PROJECT`）充當設計系統，把檔案推上去它也不會變成設計系統，只是白推。
+
+### 1b. 基底的內容從哪來
+
+**A. repo 是一片空地（全新專案／還沒有任何畫面）** → 挑一套當起點：
+
 - 若 `CONTEXT.md`／`decisions/` 裡訪談階段已經記錄使用者的風格偏好，直接沿用，不重問。
-- 沒有既定偏好：先 lazy 讀同目錄 `design-systems/index.md`（只讀索引，不把 150 套內容整份塞進 context），依這次任務的調性／受眾抓 2–3 個候選，套用本檔同目錄的 `phase-grill.md` 的提問格式問使用者選（這是有取捨的真決策、不是事實，照該檔規則走 AskUserQuestion 彈窗）：每個候選附一句「適合什麼調性」。
-- 選定後，只 lazy 讀那一套的 `design-systems/<slug>/DESIGN.md`（9 段規範）＋ `tokens.css`（CSS 變數），其餘 149 套不讀。三個變體都從這份 tokens 出發做客製化延伸，不是套用預設樣式了事。
+- 沒有既定偏好：兩種來源都可以，**挑哪一套是有取捨的真決策**，照本檔同目錄 `phase-grill.md` 的提問格式問使用者（走 AskUserQuestion 彈窗，2–4 個選項、推薦排第一、每個候選附一句「適合什麼調性」）：
+  - 同目錄的 `design-systems/index.md`（150 套品牌設計系統資產庫）—— **lazy 只讀索引**，依這次任務的調性／受眾抓 2–3 個候選；使用者選定後才讀那一套的 `design-systems/<slug>/DESIGN.md`（9 段規範）＋ `tokens.css`（CSS 變數），其餘 149 套不讀。
+  - Claude Design 內建的六套（Modernist／Classical／Nocturne／Organic／Broadsheet／Industry）——想要快、不想先攤一套完整 tokens 時用這條。
+- 選定後把那套的 tokens 照下面 1c 的形狀寫成檔案推上去，做客製化延伸，不是套用預設樣式了事。
 
-## 步驟 2：生成 3 個結構不同的變體（上限 5）
+**B. repo 已經有既有 UI** → 基底就是既有 code 本身：
 
-- **結構不同**指資訊架構／導覽模式／互動流程本身不同，不是換個顏色或字體交差。例如同一個功能可以是：卡片網格總覽、側邊欄列表＋詳情面板、逐步式精靈（wizard）——三種使用者要點幾下、資訊怎麼分層看到的方式都不一樣。
-- 每個變體都是**真元件真 code**（能跑、能點），不是靜態圖或截圖。
-- **優先掛在既有頁面**，用 `?variant=` 參數切換到不同結構（例如 `?variant=a`／`?variant=b`／`?variant=c`）——因為空白路由是真空環境，脫離真實使用情境的頁面會讓每個變體都顯得好看，比較不出在實際脈絡下的優劣。
-- 這個功能沒有對應的既有頁面（全新功能／全新頁面）才退而求其次開一個新路由，一樣用 `?variant=` 切換。
-- `?variant=` 切換器本身是**暫時腳手架**，只為了這個階段的比較用；定稿後會被清掉（見步驟 4），正式 code 不會留著三份變體共存或一個切換開關。
+推上去的是**既有的 tokens、可重用元件、全域 CSS、字型**——**不是推做好的頁面**。不必反推、不必猜近似值，直接給真的東西最保真。實務上就是把 repo 裡的設計變數檔、共用元件、全域樣式、字型宣告整理成 1c 的形狀推上去；專案裡沒有集中的 tokens 檔就現場從既有樣式抽出那幾組值（主色／背景／文字／邊框／狀態色、字級階層、間距節奏、圓角與陰影、互動狀態的表現方式），寫成 `tokens.css` 推上去。
 
-## 步驟 3：push 上 canvas（DesignSync）
+**不要為此在 repo 裡新增任何檔案**——設計系統的檔案活在 Claude Design 專案那邊，repo 這邊不留快照（快照會過期，既有 code 才是唯一真相，而且不新增檔案就不用維護它；流程本身不得成為工作量，出處：母本 DESIGN.md §0，部署後 runtime 不需讀取）。
 
-用 DesignSync 工具把變體送上 Claude Design canvas：
+### 1c. 檔案要長什麼形狀（app 端只認這個形狀）
 
-1. `list_projects` 找這個專案既有的 design-system project；沒有就 `create_project` 新建一個。
-2. `finalize_plan`：`writes` 列出這三個變體 preview 檔會寫進 canvas 專案的路徑，`localDir` 指向 repo 裡放這些變體的目錄。
-3. `write_files` 把變體檔案傳上去。每個 preview 檔案第一行加 `<!-- @dsCard group="..." -->` 標記，canvas 會自動依此建卡片索引，不必額外呼叫 `register_assets`（那是給沒有這個標記的手寫舊專案用的）。
-4. 提示使用者去 Claude Design 開這個專案，在 canvas 上視覺化比較三個變體、點選、手動微調。
-5. 使用者調完後，用 `list_files`／`get_file` 把最終版本 pull 回本地——這份 pull 回來的內容就是正式定稿，不再是某個 `variant=N`。
+以下每一條都是實測反編譯 app 端自檢邏輯拿到的**字面規則**，不是慣例猜測。形狀不對的檔案不會壞掉，只會**完全隱形**——這是本階段最容易白做的地方。
 
-## 步驟 4：定稿即最終品，清乾淨腳手架
+**① 根目錄放唯一的樣式入口 `styles.css`**，用 `@import` 串起其餘 CSS：
 
-- 把 pull 回來的定稿內容寫回正式元件／正式路由，移除 `?variant=` 切換器與其餘沒被選中的變體檔案——收尾時 repo 裡只留一份正式版本，沒有殘留的變體開關或死檔案。
-- 收尾寫一筆 `decisions/NNN-slug.md`：記錄用了哪個品牌基底、比較過哪幾種結構、使用者選了哪個、微調了什麼重點。這筆記錄就是 `ticket-template.md`「目標」段落唯一例外提到的「design canvas 定稿記錄」的來源——後續票要引用定稿視覺／互動細節時，指到這筆決議即可。
-- **定稿即凍結**（出處：母本 DESIGN.md §3 第 4 點，部署後 runtime 不需讀取）：上面清乾淨腳手架後，把全部定稿元件的檔案路徑（repo 相對路徑）寫入 `.constellation/design-frozen.json` 的 `frozen` 陣列，並在同檔的 `log` 陣列裡逐一補一筆：
+```css
+@import url("https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;600&display=swap");
+@import "./tokens.css";
+@import "./theme.css";
+@import "./global.css";
+@import "./components.css";
+```
+
+- 入口檔名的優先序：`styles.css` → `index.css` → `global.css` → `globals.css` → `main.css` → `theme.css` → `tokens.css`，**只取第一個命中的，而且只認根目錄**（放在子目錄一律不認）。
+- **沒有被這條 `@import` 鏈碰到的 CSS 檔完全隱形**，寫了等於沒寫。
+- 遠端 `@import`（例如 Google Fonts）沒問題，它會被餵給 manifest 的 `brandFonts`，不會弄壞這條鏈。
+
+**② `tokens.css`：所有設計變數宣告在 `:root` 底下。**
+
+- 宣告在元件類選擇器底下的自訂屬性**會被丟掉**，只有 `:root` 算。
+- **坑**：`--color-text` 會被判成字型類（`kind: "font"`）——因為 font 的比對規則含 `text` 且排在 color 前面。修法是在**同一行的分號後面**加註標：
+
+  ```css
+  :root {
+    --color-text: #1a1a1a; /* @kind color */
+  }
+  ```
+
+  註標**必須貼在同一行分號之後**，單獨寫成一行會被忽略。可用的值：`color`／`spacing`／`radius`／`shadow`／`font`／`other`。
+
+**③ `theme.css`：主題寫成 `:root[data-theme="dark"]`，而且要重新定義至少一個 `:root` 已經有的 token**，才會被收進 manifest 的 `themes`；只寫選擇器卻沒有覆寫任何既有 token 的話不算一個主題。
+
+**④ 每個元件一個資料夾、三件套：**
+
+```
+components/Button/Button.jsx    ← 實作，必須是 ESM export（例如 export function Button(…)）
+components/Button/Button.d.ts   ← 型別，取第一個 interface；名稱尾綴 Props 會被去掉當元件名
+components/Button/button.html   ← 預覽卡，第一行 <!-- @dsCard group="Components" name="Button" -->
+```
+
+- **實作檔一律用 `.jsx`，不要用 `.tsx`**：最終 bundle 只過 babel 的 `react` preset，**沒有 TypeScript preset**——實作檔裡只要出現 TS 語法（型別註記、`interface`、`as`），**整包 bundle 都會轉譯失敗**，不是只壞那一個元件。型別只放 `.d.ts`。
+- 預覽卡建議寫**純靜態 HTML**，樣式用 `<link rel="stylesheet" href="../../styles.css">` 接回根目錄那支入口。真的要在卡片裡長出元件，用 `<script src="../../_ds_bundle.js"></script>` 再取 `window.<Namespace>.<Name>`；直接寫 `<script src="…jsx">` 會被警告。
+- 元件與卡片的配對規則：某個 `.jsx` 的預覽卡＝**同一個資料夾裡第一張** `@dsCard`。
+
+**⑤ 選配的加分項**（不做也能過，做了體驗好很多）：
+
+- 根目錄 `readme.md`：會被當成這套設計系統的使用指南，並注入到用它的專案裡。
+- 根目錄 `thumbnail.html`：讓 manifest 的 `hasThumbnailHtml` 變 `true` 並自動截圖當封面。
+- `templates/<slug>/index.html`，第一行 `<!-- @template name="…" description="…" -->`——**必須在 `templates/` 底下再包一層資料夾**，直接放 `templates/x.html` 會被忽略。
+
+### 1d. 最後放哨兵，然後開瀏覽器觸發編譯
+
+**⑥ 根目錄放一個哨兵檔 `_ds_needs_recompile`**，內容是 JSON：
+
+```json
+{ "by": "constellation" }
+```
+
+**這一步缺了，前面五步全部白做。**實測：不放哨兵直接上傳任何檔案，manifest 完全 byte-identical、一個字都不會變；反過來只上傳哨兵、其他一個字不改，就會觸發全量重新編譯。`by` 的值會成為 manifest 的 `source` 欄位，等一下用來驗證。
+
+**⑦ 觸發編譯**：在瀏覽器開 `https://claude.ai/design/p/<projectId>`。app 端會重新編譯 `_ds_manifest.json`／`_adherence.oxlintrc.json`／`_ds_bundle.js`，然後**自動把哨兵刪掉**——**哨兵消失就是編譯成功的訊號**。
+
+### 1e. 驗證（不要靠「我推上去了」自我宣告）
+
+讀 `_ds_manifest.json` 對三件事：
+
+- `source` 要等於你在哨兵裡寫的 `by`（例如 `constellation`）。**還是舊值就代表根本沒編譯**，回去檢查哨兵有沒有真的放到根目錄。
+- `tokens`／`components`／`globalCssPaths` 都不該是空陣列。空的就代表對應那類檔案形狀不對（最常見是 CSS 沒被 `@import` 鏈串到、或 token 沒宣告在 `:root`）。
+- **卡片預覽是非同步渲染的**：上傳完不會立刻看到圖，要等 app 端編譯完。實測曾經因為 reload 太快就誤判成「渲染失敗」——**等一下再看，別急著判定失敗**、更別急著重推一輪。
+
+### 1f. DesignSync 呼叫的實測坑
+
+- **`finalize_plan` 的 `deletes` 是必填**——沒有要刪任何東西也要給一個空陣列，漏掉會直接失敗。
+- `write_files` 每次最多 256 個檔；每個檔的 `localPath` 必須落在 `finalize_plan` 核准過的 `localDir` 裡面。
+- **`localDir` 指到 repo 外的暫存目錄**（例如系統暫存區底下開一個工作資料夾），不要指到 repo 裡面——這些檔案是為了推上去而擺的中繼物，repo 這邊不留設計系統快照（理由見 1b）。
+- **`register_assets` 確實不需要呼叫**（工具說明把它標成 legacy 是對的）：`@dsCard` 註解就足以填出 manifest 的 `cards`，連 `name`／`subtitle`／`viewport` 都帶得進去。網路上流傳「一定要呼叫 `register_assets`」在這條路徑上不成立，照那樣做只是多繞一步。
+
+## 步驟 2：把需求丟給 Claude Design 生成
+
+- 在 `https://claude.ai/design` 的輸入框描述這次要做的東西——內容來自訪談定版的決議（`CONTEXT.md`＋`decisions/*.md`），不是憑印象重寫一遍需求。`Design system` 欄選步驟 1 那個專案。
+- 它會**先讀設計系統再設計**（實測畫面會顯示「I'll start by exploring the design system.」、「Listing files ×2, Reading ×3」這類動作）。
+- **`grill-close.md` 記的是 `是（架構有得選）` → 要多個方向，就用它自己的迭代追問**（「再給我一版側邊欄式的」「這次改成逐步精靈那種流程」）。**不要回頭在本地手工做幾個變體**——那是舊流程，等於白繞一趟雲端。
+- **記的是 `是（照既有架構做）` → 只生成一版**，並在需求描述裡明講沿用既有的資訊架構（例如「照現有的列表頁排法，只多一個狀態篩選器」）。需求本來只有一種合理排法時（列表加個篩選器、表格多一欄、表單多一個欄位），硬要多個方向只會生出沒人要的假選項，那是流程自己在製造工作量（出處：母本 DESIGN.md §0，部署後 runtime 不需讀取）。
+- 產出的檔名形如 `<Name>.dc.html`，住在它新建的一個**普通專案**（`PROJECT_TYPE_PROJECT`）裡，不是住在步驟 1 那個設計系統專案裡。
+- **成本／效果的實測參考**（拿來設定預期，不是拿來吹）：一句需求描述換到的產出，比本地手工做三個變體完整得多——它自己補上了鍵盤快捷鍵、批次勾選、佇列分類與計數、作者歷史、垃圾自動篩選統計、三組快速回覆模板，並自己跑了一輪自檢把問題修掉。
+
+## 步驟 3：使用者在 canvas 上確認／調整
+
+請使用者去 canvas 上看，並講清楚他手上有哪些工具（多數人不知道 `Tweaks` 是什麼）：
+
+- **`Comment`**：對特定元素留 inline 評論。
+- **`Tweaks`**：**語意化的參數旋鈕**，來自設計稿裡宣告的 `data-props`——例如 `density: comfortable|compact`、`autoAdvance`、`showShortcuts`。它不是拖拉像素，是「這個畫面本來就設計成可以切換的那幾個選項」。
+- **`Edit`**：圖層樹 ＋ 選取／文字／框線工具，有 `Simple`／`Pro`／`Code`／`Tweaks` 四種模式。
+- **`Present`**／**`Share`**：全螢幕呈現與分享。
+
+- **它自己生成的 `.dc.html` 支援直接編輯**；反過來說，**本地推上去的純 `.html` 卡片會顯示「This file does not support automatic edits. You can edit the preview; we will describe changes to Claude to apply on exit.」**——那條翻譯裂縫只存在於「本地推上去的檔」，不存在於「它自己生成的設計」。這正是新流程比「本地做好再推上去讓人挑」好的地方之一。
+- 可以多輪來回，調到使用者滿意為止。滿意與否這類封閉確認照本檔同目錄 `phase-grill.md` 的規則走彈窗（Codex 端改文字點列）。
+
+## 步驟 4：拉回 repo
+
+- 用 DesignSync 的 `get_file` 直接讀 `<Name>.dc.html`——**不需要任何匯出功能**。（`list_files` 對這種普通專案同樣有效，用來先看有哪些檔。）
+- 一併拉 `_ds/<namespace>/_ds_manifest.json` 回來，當轉譯時的 token 對照表（設計稿裡用到的變數名對得回你的 tokens）。
+- **`get_file` 單檔上限 256 KiB**；設計稿大到超過就分次拉相關檔案，不要以為是工具壞了。
+- 拉回來的 `.dc.html` **轉譯完就不留在 repo 裡**（用暫存目錄接它，轉完刪掉）。不是因為它佔空間，是因為一份躺在 repo 裡的設計稿會讓人想「改設計稿再同步一次」——那正是步驟 6 要防的事。真的需要回頭看當初定稿長什麼樣，有兩層軌跡夠用了：定稿記錄寫了關鍵判斷，Claude Design 那個雲端專案原檔也還在。它不是工作流要追蹤的檔案，也不進凍結名單。
+
+## 步驟 5：一次性轉譯成專案自己的元件格式
+
+`.dc.html` 是 Claude Design 專屬的 runtime 格式，**不能直接當專案元件用**。它長這樣：
+
+```html
+<x-dc>
+  <helmet><script src="_ds/…/_ds_bundle.js"></script><style>…全域 CSS…</style></helmet>
+  …template：純 HTML ＋ inline style 字串，用 {{ expr }} 綁值…
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{…語意化參數定義…}">
+  const DATA = [...];                    // Claude Design 產的假資料
+  class Component extends DCLogic { state = {…}; renderVals() { return {…} } }
+</script>
+```
+
+執行時它需要 `support.js`（dc-runtime）＋ `window.React`／`window.ReactDOM`——專案端不需要這些，轉譯就是把它換成專案自己的寫法。
+
+**轉譯對應表**（實測完整轉過一次 347 行的檔案，並對照 dc-runtime 原始碼驗證過）：
+
+| dc 語法 | 對應到 | 難度 |
+|---|---|---|
+| `{{ expr }}` | JSX 表達式 | 機械（注意 dc 會把文字位置的 `{{ }}` 包一層 `<span class="sc-interp">`，落地時這層會消失，DOM 結構有差） |
+| `<sc-if value="{{ c }}">` | 條件渲染 | 機械 |
+| `<sc-for list="{{ a }}" as="x">` | `.map()` | 機械（dc 用陣列 index 當 key，落地建議改用穩定 id） |
+| `hint-placeholder-*` | 丟棄 | 只在生成串流預覽時有意義，執行期無效 |
+| `<helmet>` | 全域 CSS | 機械（裡面那個 `_ds_bundle.js` script 直接丟掉，專案不需要） |
+| `class Component extends DCLogic` | `React.Component` | 機械——`state`／`setState`（支援 updater function 與 shallow merge）／`componentDidMount`／`componentWillUnmount` 全部同名同義 |
+| `renderVals()` | render 前置運算 | 機械 |
+| `data-props` | 元件 props ＋ 預設值 | **部分流失**：`default` 對得上，但 `editor`／`options`／`section`（那是 Claude Design 的 Tweaks 面板 UI）在專案端**沒有任何對應物**；`tsType` 只有輸出 `.tsx` 才救得回來 |
+| `style-*` | CSS 偽類 | **前綴通吃**——不只 `style-hover`／`style-focus`，`style-active`／`style-disabled`／`style-focus-within` 都生效，`style-before`／`style-after` 還會走 pseudo-element 分支，**不可以寫死只有兩種**。dc 自己的實作是每條宣告都加 `!important` |
+| 靜態 `style="…"` 字串 | `className` | 需要判斷（class 怎麼命名、怎麼分類全靠自己發明，來源檔沒有任何命名資訊） |
+| **動態 `style="{{ 拼接字串 }}"`** | class modifier | **★唯一真正機械化不了的**——像 `'background:' + (on ? '#f0e6e1' : 'transparent')`，機器無法判斷哪一段是狀態、哪一段是常數 |
+
+**兩個一定會踩到的陷阱：**
+
+1. **inline style 打敗 CSS**：底色由動態 inline style 決定的元素，`:hover` 會直接失效（inline 永遠贏）。要把底色搬進一個 modifier class（例如 `.is-active`），再讓 `:hover` 規則**排在 modifier 之後**、靠來源順序取勝。dc 自己是靠每條都加 `!important` 無條件贏——落地時若不想用 `!important`，就得自己處理這個 cascade 順序問題。
+2. **假資料**：`.dc.html` 裡的 `DATA` 是 Claude Design 編出來的假資料（含假 email、假 IP）。落地時要換成真的 API，並在檔案裡標註清楚哪裡還接著假資料——不要讓假資料悄悄活到出貨。
+
+**成本預期（實測值，據實寫給人有心理準備）**：347 行 `.dc.html` → 467 行 JSX ＋ 492 行 CSS，位元組是原來的 1.36 倍。**邏輯層幾乎零成本**（175 行基本上原封貼上）；時間全花在拆解動態 style 字串（9 處，約佔一半時間）與 class 命名（79 個）。轉譯後行為與視覺零落差。
+
+轉譯完自己在瀏覽器跑一次對照設計稿看一眼，確認長得一樣、點得動，再往下走——不要只憑「我照表轉完了」就宣告完成。
+
+## 步驟 6：這是單向門（本階段最重要的一條紀律）
+
+轉譯完成後，**專案裡的元件 code 就是唯一真相**，`.dc.html` 降為參考資料。**不建立任何「回頭同步」機制。**
+
+理由要講明白：設計稿第二次改動時，轉換器的輸出會覆蓋掉手工命名的 class 樹與 modifier 結構，**第二次以後比第一次更貴**，不是更便宜。要再改 UI 就走這兩條路：
+
+- **解凍既有元件、直接改 code**（改動不大時；解凍流程見本檔同目錄的 `phase-build.md`「撞到凍結怎麼辦」）。
+- **重跑一次本階段，產一份新的一次性設計稿**（整體結構要換時）。
+
+不做雙向同步——那正是母本 §0 反教訓要防的機制膨脹。
+
+## 步驟 7：收尾——寫定稿記錄、定稿即凍結
+
+- 收尾寫一筆 `decisions/NNN-slug.md`，記這幾件事：**用了哪一套設計系統當基底**（既有 code 的 tokens／元件，或資產庫／內建的哪一套）、**需求是怎麼描述給 Claude Design 的**、**生成了幾個方向**、**使用者選了哪一版**、**在 canvas 上調了什麼**、**轉譯時做了哪些判斷**（動態 style 怎麼拆、class 怎麼命名、哪些 Tweaks 參數在專案端沒有對應物、哪裡還接著假資料）。只生成一版的路徑，「生成了幾個方向」就照實寫「一版——照既有架構做，經使用者拍板不比方向」，其餘照寫。
+  **這筆記錄在四條路徑上都一定要寫**——它同時是下游 weave 判斷「UI 已定稿」的依據（見本檔同目錄的 `phase-weave.md` 進場條件），少寫這筆會讓 weave 判定 UI 沒定稿、把任務又轉回本階段。它也是 `ticket-template.md`「目標」段落唯一例外提到的「design 定稿記錄」的來源——後續票要引用定稿的視覺／互動細節時，指到這筆決議即可。
+- **定稿即凍結**（出處：母本 DESIGN.md §3「定稿即凍結」，部署後 runtime 不需讀取）：把全部定稿元件的檔案路徑（repo 相對路徑）寫入 `.constellation/design-frozen.json` 的 `frozen` 陣列，並在同檔的 `log` 陣列裡逐一補一筆：
   ```json
   { "path": "src/components/LoginForm.tsx", "action": "freeze", "at": "<ISO 時間戳>", "reason": "design 定稿" }
   ```
-  `.constellation/design-frozen.json` 不存在就直接新建（`frozen` 與 `log` 兩個陣列都要有）。**從這一刻起，這些檔案受閘門 5（關票刷卡機）凍結保護**——實作期（build）任何工具想編輯這些檔案都會被機器擋下，不能悄悄改掉使用者已經看過拍板的畫面。
-- **定稿後 UI 不再重畫**：後續拆出的每張票都對著這份定稿開發，不能因為某張票有新想法就重新生成一輪變體比較。build 階段若發現定稿漏了某個狀態（例如錯誤訊息、loading、空狀態）——沿用定稿的視覺語言把那個狀態補上，算票內部的「小事」，不用回頭重跑本階段；只有發現定稿的**整體結構方向**本身有問題（不是漏了一個狀態，是整個資訊架構要換），才算「大事」（出處：母本 DESIGN.md §8，部署後 runtime 不需讀取），停下彈窗問使用者要不要回頭重跑一次本階段。
+  `.constellation/design-frozen.json` 不存在就直接新建（`frozen` 與 `log` 兩個陣列都要有）——上一輪出貨時這份名單已經跟票一起歸檔進 `.constellation/archive/`（出處：母本 DESIGN.md §4，部署後 runtime 不需讀取），所以每一輪都是從空名單開始，開工時看不到這個檔案是正常的，不要去 `archive/` 把舊名單撈回來沿用。**從這一刻起，這些檔案受閘門 5（關票刷卡機）凍結保護**——實作期（build）任何工具想編輯這些檔案都會被機器擋下，不能悄悄改掉使用者已經看過拍板的畫面。
+- **定稿後 UI 不再重畫**：後續拆出的每張票都對著這份定稿開發，不能因為某張票有新想法就回頭再跑一輪生成。build 階段若發現定稿漏了某個狀態（例如錯誤訊息、loading、空狀態）——沿用定稿的視覺語言把那個狀態補上，算票內部的「小事」，不用回頭重跑本階段；只有發現定稿的**整體結構方向**本身有問題（不是漏了一個狀態，是整個資訊架構要換），才算「大事」（出處：母本 DESIGN.md §8，部署後 runtime 不需讀取），停下彈窗問使用者要不要回頭重跑一次本階段。
 
-## 降級路徑：DesignSync 不可用
+## 降級路徑：Claude Design 不可用
 
-DesignSync／canvas 不可用（離線、額度不足、Codex runtime 本來就沒有這個工具——降級表出處：母本 DESIGN.md §9，部署後 runtime 不需讀取）時，退化為**純本地變體走查**，流程其餘不變：
+Claude Design／DesignSync 不可用（離線、額度不足、Codex runtime 本來就沒有這個工具——降級表出處：母本 DESIGN.md §9，部署後 runtime 不需讀取）時，退回**本地變體走查**。**這是降級路徑，不是主線**——能連上 Claude Design 就不要走這條，因為這條等於放棄「讓它自己設計」這件事。
 
-1. 跳過步驟 3 的 push／pull，直接在瀏覽器開 `?variant=a`／`b`／`c`（或各自的新路由）逐一走查。
-2. 使用者直接用文字講「要哪個、想改哪裡」，agent 依文字回饋改那個變體的 code，反覆調整到使用者滿意。
-3. 滿意即定稿——不需要額外的 pull 動作（本來就在 repo 裡），比照步驟 4 清掉其餘變體與切換器，只留這一份成為正式元件，並一樣寫 `decisions/NNN-slug.md` 定稿記錄。
+1. 在專案裡直接生成變體（真元件真 code，能跑能點，不是靜態圖）：`grill-close.md` 記著 `是（架構有得選）` 就做 3 個**結構真的不同**的版本（上限 5）——結構不同指資訊架構／導覽模式／互動流程本身不同（卡片網格總覽／側邊欄列表＋詳情面板／逐步式精靈），不是換顏色字體交差；記著 `是（照既有架構做）` 就只做一版。
+2. **全部變體共用同一個視覺基底**（既有 code 的設計語言，或挑定的那一套）——一起換掉配色會讓「哪個結構好」被「哪個配色好」污染。
+3. **優先掛在既有頁面**，用 `?variant=a`／`b`／`c` 參數切換——空白路由是真空環境，脫離真實使用情境會讓每個變體都顯得好看。這個功能沒有對應的既有頁面（全新頁面）才退而求其次開一個新路由，一樣用 `?variant=` 切換。只做一版時用一個 `?variant=new` 就好。
+4. 在瀏覽器逐一走查，使用者直接用文字講「要哪個、想改哪裡」，依文字回饋改那個變體的 code，反覆調整到滿意。
+5. 滿意即定稿——本來就在 repo 裡，**沒有拉回、也沒有轉譯這兩步**。清掉 `?variant=` 切換器與其餘沒被選中的變體檔案，收尾時 repo 裡只留一份正式版本，沒有殘留的變體開關或死檔案。
+6. 一樣照步驟 7 寫定稿記錄（「用了哪套基底／比較過哪幾種結構／使用者選了哪個／調了什麼」，並註明「走降級路徑，未經 Claude Design」）、一樣凍結。
 - 「是否滿意、是否還要再調」這類封閉確認，Claude Code 端用 AskUserQuestion 彈窗；Codex 端沒有彈窗，比照本檔同目錄 `phase-grill.md` 的 Codex 降級規則改用文字點列確認。

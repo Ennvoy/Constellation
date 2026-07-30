@@ -20,7 +20,7 @@
 - 另開乾淨 context 進行審查，不沿用 build 期累積的對話記憶——避免「這是我剛寫的，看起來沒問題」這種確認偏誤。
 - 兩軸**平行**跑、**分開報告**，禁止合併排名選出一個「總贏家」——這兩軸問的問題本質不同，硬湊成一個分數沒有意義：
   - **Standards 軸**：只看 code 品質。優先套用這個 repo 自己既有的規範（lint 設定、既有 style、命名慣例）；repo 規範沒覆蓋到的地方，才退回 Fowler smells 當 baseline——baseline 是拿來判斷用的參考基準，不是見到就一定要改的鐵律，遇到「有 smell 但現在改風險更大、不值得」的情況可以標記但不強制修。
-  - **Spec 軸**：逐票對照。把每張票的驗收條件一條條拿出來，核對實作是否真的做到，不管 code 寫得好不好看。另外核對 `.constellation/design-frozen.json` 的 `log`——每筆 `unfreeze` 都應有對應的使用者同意脈絡可查（例如某張票的決議記錄提到這次解凍、或彈窗確認的紀錄）；有 `unfreeze` 卻找不到對應同意脈絡的，列為阻擋級發現（出處：母本 DESIGN.md §3 第 4 點，部署後 runtime 不需讀取）。
+  - **Spec 軸**：逐票對照。把每張票的驗收條件一條條拿出來，核對實作是否真的做到，不管 code 寫得好不好看。另外核對 `.constellation/design-frozen.json` 的 `log`——每筆 `unfreeze` 都應有對應的使用者同意脈絡可查（例如某張票的決議記錄提到這次解凍、或彈窗確認的紀錄）；有 `unfreeze` 卻找不到對應同意脈絡的，列為阻擋級發現（出處：母本 DESIGN.md §3「定稿即凍結」，部署後 runtime 不需讀取）。**核對範圍就是本輪的 `log`**——這份名單隨輪歸檔（見步驟 3），現存檔案裡看到的 `unfreeze` 一定是本輪發生的、對應的票也一定還在 `tickets/` 裡找得到；不必也不該跑去 `archive/` 翻上一輪的紀錄來核對。
 - 兩軸各自輸出自己的 findings 清單，不互相參考、不互相調整對方的結論。
 - **第三軸（條件觸發）— security 紅軍**：讀 `decisions/grill-close.md` 的高風險標記，標記為「有」（涉權限／金流／個資）時自動加開；一般任務不加開。做法：另一個獨立 context 以攻擊者視角**實測**攻擊面（越權存取、參數竄改、注入、金額運算邊界、個資外洩路徑），不是看 code 推測——能實際打 API／操作 UI 重現的才算 confirmed。與前兩軸同樣平行跑、分開報告。
 
@@ -45,6 +45,8 @@
 
 離場條件（全量驗證綠燈＋兩軸審查無阻擋級發現＋出貨報告已產出）滿足後，才做這一步——讓下一輪任務從乾淨狀態開始，新舊輪不混淆：
 
-- 把本輪 `tickets/`、`decisions/grill-close.md`、`.constellation/ship-evidence.md` 整批移入 `.constellation/archive/<日期>-<摘要>/`（`<日期>` 用 `yyyy-mm-dd`，`<摘要>` 取 `decisions/grill-close.md` 記錄的一句話任務摘要轉成 kebab-case slug）。
-- `CONTEXT.md` 與其餘 `decisions/NNN-slug.md`（`grill-close.md` 除外）**留在原位、不歸檔**——這些是跨輪累積的專案領域知識，不是單輪產物。
-- 歸檔完成後，`.constellation/` 底下不再有任何 `tickets/*.md`，也沒有 `decisions/grill-close.md`——這是刻意的：下次總控（`skills/constellation/SKILL.md` Step 0）讀到這個狀態，會依「`tickets/` 空＋`grill-close.md` 不存在」判定「訪談尚未完成」，Lazy Read `references/phase-grill.md` 走增量重訪。這正是要的效果——`CONTEXT.md` 與其餘 `decisions/*.md` 還留著跨輪知識，新一輪需求接上既有背景繼續問新的 frontier，不會被上一輪的舊票或舊決議誤判成「還在做上一輪」。
+- 把本輪 `tickets/`、`decisions/grill-close.md`、`.constellation/ship-evidence.md`、`.constellation/design-frozen.json` 整批移入 `.constellation/archive/<日期>-<摘要>/`（`<日期>` 用 `yyyy-mm-dd`，`<摘要>` 取 `decisions/grill-close.md` 記錄的一句話任務摘要轉成 kebab-case slug）。
+- **凍結名單跟票同生命週期**（出處：母本 DESIGN.md §4，部署後 runtime 不需讀取）：`design-frozen.json` 記的是「本輪定稿了哪些畫面、期間解凍過什麼」，出貨後就是歷史，下一輪的 design 階段從空名單重新建。這順手擋掉一個會誤爆的假警報——`log` 若跨輪一直累積，下一輪的 Spec 軸審查者（另開乾淨 context、只看 `.constellation/` 現況）會看到上一輪留下的 `unfreeze` 紀錄，卻因為上一輪的票早已搬進 `archive/` 而查不到對應的同意脈絡，於是報出一條阻擋級發現把出貨卡住；那條發現是假的（同意脈絡當初就在，只是被歸檔了），名單隨輪歸檔後這種誤爆自然不會發生。
+- **這麼做的代價，據實講明**：上一輪定稿、這輪不打算動的畫面，在下一輪不再有閘門 5 的機器保護（名單空了就沒東西可擋，出處：母本 DESIGN.md §11.5，部署後 runtime 不需讀取）——退而靠 weave 劃 `zone`（不把那些檔案排進這輪要動的票）與出貨 Spec 軸的逐票對照兜住。下一輪真的要繼續保護某幾個上輪定稿的檔案，就在那一輪的 design 定稿時把它們一起寫進新的 `frozen` 名單，不是留著舊名單。
+- `CONTEXT.md` 與其餘 `decisions/NNN-slug.md`（`grill-close.md` 除外）**留在原位、不歸檔**——這些是跨輪累積的專案領域知識，不是單輪產物。design 階段的定稿記錄（`decisions/NNN-slug.md`）也留在原位，凍結名單走了它還在，下一輪要沿用上輪的視覺語言時查得到。
+- 歸檔完成後，`.constellation/` 底下不再有任何 `tickets/*.md`，也沒有 `decisions/grill-close.md`，也沒有 `design-frozen.json`（凍結名單歸零；閘門 5 讀不到這個檔案時一律放行，不會擋到下一輪的正常編輯）——這是刻意的：下次總控（`skills/constellation/SKILL.md` Step 0）讀到這個狀態，會依「`tickets/` 空＋`grill-close.md` 不存在」判定「訪談尚未完成」，Lazy Read `references/phase-grill.md` 走增量重訪。這正是要的效果——`CONTEXT.md` 與其餘 `decisions/*.md` 還留著跨輪知識，新一輪需求接上既有背景繼續問新的 frontier，不會被上一輪的舊票或舊決議誤判成「還在做上一輪」。

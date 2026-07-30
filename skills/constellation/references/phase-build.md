@@ -47,7 +47,7 @@
 
 ## 撞到凍結怎麼辦
 
-實作中發現需要改到 design 階段定稿凍結的元件（`.constellation/design-frozen.json` 的 `frozen` 名單內，見本檔同目錄的 `phase-design.md` 步驟 4）——例如接資料時發現定稿元件缺一個欄位、需要調整 props 介面——**這屬於「大事」，不能自己動手改**，即使改動看起來很小。實測上，任何 Edit／Write／MultiEdit／apply_patch 對凍結檔案的操作都會被閘門 5（關票刷卡機）機器擋下，不會意外改成功。
+實作中發現需要改到 design 階段定稿凍結的元件（`.constellation/design-frozen.json` 的 `frozen` 名單內，見本檔同目錄的 `phase-design.md` 步驟 7「收尾——寫定稿記錄、定稿即凍結」）——例如接資料時發現定稿元件缺一個欄位、需要調整 props 介面——**這屬於「大事」，不能自己動手改**，即使改動看起來很小。實測上，任何 Edit／Write／MultiEdit／apply_patch 對凍結檔案的操作都會被閘門 5（關票刷卡機）機器擋下，不會意外改成功。
 
 處理節奏：
 
