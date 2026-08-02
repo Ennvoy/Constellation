@@ -3,9 +3,11 @@
 // 用法：
 //   逐票：node verify-runner.mjs --ticket <票路徑或純票號> [--cwd <專案根>] [--scope ticket]
 //   出貨：node verify-runner.mjs --scope ship [--cwd <專案根>]
-// --scope ticket（預設）：要求 --ticket，只跑 config 的 commands.test，證據寫回該票檔。
-// --scope ship：不要求 --ticket，跑 commands.test＋commands.journey 全量，證據寫入
-//   {cwd}/.constellation/ship-evidence.md（沒有這個檔就自動建立）。
+// --scope ticket（預設）：要求 --ticket。票內有「## 驗證指令」section（weave 拆票時寫定的縮圈清單，
+//   見 ticket-template.md）就跑該清單；沒有就跑 config 的 commands.test 全量——fallback 永遠是全量，
+//   縮圈只因「票裡明寫了」而發生。證據寫回該票檔。
+// --scope ship：不要求 --ticket，跑 commands.test＋commands.journey 全量（票內縮圈清單一律不看），
+//   證據寫入 {cwd}/.constellation/ship-evidence.md（沒有這個檔就自動建立）。
 // --ticket 可以給純票號（如 T-003）：先試直接路徑，找不到就在 .constellation/tickets/ 下
 // glob `<票號>*.md`，唯一命中才用；零命中或多重命中一律報錯並列出候選，不猜。
 // 全部指令 exit 0 才落一筆證據（時間戳＋各指令＋exit code＋stdout 尾 15 行）；任一失敗：印該指令
@@ -101,6 +103,28 @@ function resolveTicketPath(cwd, ticketArg) {
   console.error(`票號 "${prefix}" 對應多張票，無法判斷唯一，請改用完整路徑指定：`);
   for (const c of candidates) console.error(`  - ${join('tickets', c)}`);
   process.exit(1);
+}
+
+// 票級縮圈：票內可選的「## 驗證指令」section（weave 拆票時寫定，規則見 ticket-template.md）。
+// 列項格式與證據筆的指令行同款（- `cmd`）；section 存在且至少一條指令就取代 config 的
+// commands.test，否則回空陣列、由呼叫端 fallback 到全量——寧全量勿漏，縮圈永遠是顯式的。
+// 只在 --scope ticket 生效；ship 全量驗證不看這個 section。
+const SCOPED_HEADING_RE = /^##\s*驗證指令.*$/m;
+const SCOPED_CMD_RE = /^\s*-\s*`(.+)`\s*$/;
+
+function parseScopedCommands(content) {
+  const m = content.match(SCOPED_HEADING_RE);
+  if (!m) return [];
+  const after = m.index + m[0].length;
+  const rest = content.slice(after);
+  const next = rest.match(/\n##\s/);
+  const section = next ? rest.slice(0, next.index) : rest;
+  const cmds = [];
+  for (const line of section.split(/\r?\n/)) {
+    const cm = line.match(SCOPED_CMD_RE);
+    if (cm) cmds.push(cm[1]);
+  }
+  return cmds;
 }
 
 // commands.test / commands.journey 可以是單一字串或字串陣列，統一收成陣列。
@@ -248,9 +272,20 @@ function main() {
     process.exit(1);
   }
   const commandsCfg = config.commands || {};
-  const commands = scope === 'ticket'
-    ? toCommandList(commandsCfg.test)
-    : [...toCommandList(commandsCfg.test), ...toCommandList(commandsCfg.journey)];
+  let commands;
+  let scopedCount = 0;
+  if (scope === 'ticket') {
+    const scoped = parseScopedCommands(stripBom(readFileSync(ticketPath, 'utf8')));
+    if (scoped.length) {
+      commands = scoped;
+      scopedCount = scoped.length;
+      console.log(`票級縮圈：跑票內「驗證指令」${scopedCount} 條（取代 config 全量；出貨 --scope ship 仍跑全量）。`);
+    } else {
+      commands = toCommandList(commandsCfg.test);
+    }
+  } else {
+    commands = [...toCommandList(commandsCfg.test), ...toCommandList(commandsCfg.journey)];
+  }
   if (!commands.length) {
     const which = scope === 'ticket' ? 'commands.test' : 'commands.test／commands.journey';
     console.error(`${configPath} 的 ${which} 都是空的——沒有指令可驗證。補上指令，或這張票該標 blocked（見 phase-weave.md）。`);

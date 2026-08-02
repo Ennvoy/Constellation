@@ -99,6 +99,7 @@ zone: src/auth/**, tests/auth/**   # 檔案界線（平行時互斥用）
 ## 驗收條件（合成階段寫定，逐條可勾）
 - [ ] ...實跑可驗證的條件...
 ## 決議記錄（實作期小事自決落此，可追溯）
+## 驗證指令（可選；票級縮圈清單，weave 寫定——省略則 runner 跑 config 全量）
 ## 驗證證據（關票時由 runner 寫入：指令＋結果摘要＋時間）
 ```
 
@@ -117,7 +118,7 @@ zone: src/auth/**, tests/auth/**   # 檔案界線（平行時互斥用）
 | 1 | git 守門 | hook | 擋破壞性 git 操作與未經確認的開/切分支（自 Flow 原封搬入） |
 | 2 | commit 守門 | hook ＋ git pre-commit | commit 前掃 secrets／垃圾產物（自 Flow 原封搬入）。**兩條呼叫路徑、同一套判定**：PreToolUse hook 攔 Claude Code 發起的 commit；git 原生 pre-commit（`--precommit` 入口，由 session 開場冪等安裝）兜住使用者手打／子行程／npm script／MCP 發起的 commit——後者是前者攔不到的整批繞法 |
 | 3 | session 開場注入 | hook | 從 `.constellation/` 重建現況並注入開場 |
-| 4 | 驗證 runner | script | 實跑驗證（`--scope` 分逐票／出貨兩級），pass 證據附簽章寫入票（ship 級寫入 `.constellation/ship-evidence.md`）；內建**斷路器**——同一目標連續 5 次失敗即強制停下請使用者拍板，不無限重試 |
+| 4 | 驗證 runner | script | 實跑驗證（`--scope` 分逐票／出貨兩級；逐票優先吃票內「驗證指令」縮圈清單，無則 config 全量——縮圈顯式、fallback 全量），pass 證據附簽章寫入票（ship 級寫入 `.constellation/ship-evidence.md`）；內建**斷路器**——同一目標連續 5 次失敗即強制停下請使用者拍板，不無限重試 |
 | 5 | 關票刷卡機 | hook | 票標 done 時機器驗證據簽章與新鮮度（24h）＋驗收條件全勾，不過直接擋下；兼任**定稿 UI 凍結守衛**——編輯 design-frozen.json 名單內的檔案一律擋下，解凍須經使用者同意並留日誌 |
 
 驗證證據由 runner 以本機 secret（install 時生成於使用者家目錄，不進 git）簽章（簽章綁定 repo，防跨專案重放）、刷卡機驗簽——手填時間戳無法通過，「機器擋假完成」才真正成立。commit 守門另做一道 **done 票稽核**：commit 時 staged 的 done 票必須含通過驗簽的證據，堵「用 shell 指令繞過刷卡機改檔」的旁門。
@@ -132,7 +133,7 @@ zone: src/auth/**, tests/auth/**   # 檔案界線（平行時互斥用）
 2. **關票實跑**：真鏈路——涉 UI 用 Playwright 真點擊、涉 API 真打、涉資料真查 DB；資料類驗證走「真 create API seed → UI → 真 API → 真 DB 讀回」。證據落票，刷卡機把關。
 3. **出貨獨立審**：ship 前另開乾淨 context 審一次，**兩軸平行、分開報告、不合併排名**：Standards 軸（code 品質，repo 規範優先、Fowler smells 為 baseline）＋ Spec 軸（與票的驗收條件逐條對照）。取代 Flow 的五層對抗。
 
-**分級**：逐票跑 `commands.test`（快速套件）＋該票驗收條件的實跑檢查；`commands.journey`（全量 journey）留到 ship 一次跑齊——驗證 runner 以 `--scope ticket|ship` 區分兩級。審查產出固定三段報告（做了什麼／驗了什麼／證據在哪），發現分**阻擋級**（修完才出貨）與**建議級**。阻擋級修復後，除受影響範圍複驗綠燈外，並**針對該發現複審**確認修法成立（不重跑全量審查）。**涉權限／金流／個資的任務**（訪談收尾標記於 grill-close.md）兩軸自動加開第三軸——**security 紅軍**（獨立 context 以攻擊者視角實測攻擊面）；一般任務不加開，平時速度不變——審查跟著風險走，不跟著流程走。
+**分級**：逐票跑票內「驗證指令」縮圈清單（weave 寫定；無則 `commands.test` 全量——測試量隨輪增長，票級恆全量會讓驗證時間隨專案越拖越長，縮圈把票級成本鎖在該票影響面）＋該票驗收條件的實跑檢查；`commands.journey`（全量 journey）與 `commands.test` 完整回歸留到 ship 一次跑齊、不受縮圈影響——驗證 runner 以 `--scope ticket|ship` 區分兩級。審查產出固定三段報告（做了什麼／驗了什麼／證據在哪），發現分**阻擋級**（修完才出貨）與**建議級**。阻擋級修復後，除受影響範圍複驗綠燈外，並**針對該發現複審**確認修法成立（不重跑全量審查）。**涉權限／金流／個資的任務**（訪談收尾標記於 grill-close.md）兩軸自動加開第三軸——**security 紅軍**（獨立 context 以攻擊者視角實測攻擊面）；一般任務不加開，平時速度不變——審查跟著風險走，不跟著流程走。
 
 ## 7. 多工政策（票平行＋序列整合）
 

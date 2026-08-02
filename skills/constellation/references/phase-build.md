@@ -15,7 +15,7 @@
    - **禁 tautological test**：測試的期望值不能用跟實作一樣的算法算出來——那等於沒測。
    - **禁 mock 冒充真依賴**：測試要打真依賴（真 DB、真 API、真檔案系統）。依賴還沒 ready（外部服務未接、其他票的介面還沒做完）就把**這張票**標 `blocked`（原因寫進決議記錄，講清楚卡在哪個依賴），不能用 mock 假裝過關。
    - 同一個地方反覆卡住修不動：走本檔同目錄的 `debugging-loop.md` 那套排查節奏，不要在原地無限重試。
-4. **實跑驗證落證據**：跑驗證 runner——絕對路徑由 session 開場注入提供（閘門 3 開場會印出這個路徑）；session 沒印出注入路徑時，用 install 部署的母本路徑 `<母本>\gates\verify-runner.mjs`。逐票跑法：`node <runner 絕對路徑> --ticket <票號> --scope ticket`——只跑 `commands.test`＋這張票驗收條件對應的實跑檢查，不跑 `commands.journey`（那留到 ship 全量一次跑）。把指令、結果摘要、時間寫進票的「驗證證據」欄。執行細節見本檔同目錄的 `verification-playbook.md`。
+4. **實跑驗證落證據**：跑驗證 runner——絕對路徑由 session 開場注入提供（閘門 3 開場會印出這個路徑）；session 沒印出注入路徑時，用 install 部署的母本路徑 `<母本>\gates\verify-runner.mjs`。逐票跑法：`node <runner 絕對路徑> --ticket <票號> --scope ticket`——票內有「## 驗證指令」縮圈清單（weave 寫定）時 runner 跑該清單取代 `commands.test`，省略則跑 `commands.test` 全量；外加這張票驗收條件對應的實跑檢查，不跑 `commands.journey`（那留到 ship 全量一次跑）。**驗證失敗不得靠改窄縮圈清單洗綠**——該修的是 code；要調整清單（漏涵蓋、影響面變了）須在票的決議記錄留一筆原因。把指令、結果摘要、時間寫進票的「驗證證據」欄。執行細節見本檔同目錄的 `verification-playbook.md`。
    - **斷路器**：runner 內建同一張票連續 5 次失敗即強制停下，不會無限重試。撞到這個狀況時，整理目前卡在哪、已經試過什麼，彈窗請使用者拍板下一步（是換排查方向、還是這張票該標 `blocked`）——**不得刪掉 runner 的失敗計數檔硬闖**，那等於把斷路器繞過，失去它原本要擋的「同一個坑一直踩」的保護。
 5. **關票**：runner 綠燈後，把票的 `status` 改 `done`。閘門 5（關票刷卡機）會檢查驗證證據是否存在且夠新鮮，證據不足直接擋下，不能手動繞過。
 6. **Commit**：把這張票的程式改動**與票檔本身**（`status` 改 `done`、驗證證據、決議記錄的變更）一起納入**同一個** commit，訊息描述這張票做了什麼（不是逐檔羅列變更）——不是「commit 完才回頭關票」，避免關票狀態遊離在 commit 之外，讓票的狀態與 git 歷史對不上。

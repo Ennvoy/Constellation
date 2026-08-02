@@ -34,7 +34,7 @@
 
 驗證 runner（絕對路徑取得方式見本檔同目錄的 `phase-build.md`／`phase-ship.md`）用 `--scope ticket|ship` 區分兩級，各自讀 `.constellation/config.json` 對應的指令陣列：
 
-- **逐票（build 階段）**：`node <runner 絕對路徑> --ticket <票號> --scope ticket`——只跑 `commands.test`（快速套件）＋**這張票驗收條件對應的實跑檢查**（驗收條件列了哪些操作，就跑哪些操作，例如對應的 Playwright 點擊、真打 API），**不跑** `commands.journey`；不必每次都跑全量回歸。
+- **逐票（build 階段）**：`node <runner 絕對路徑> --ticket <票號> --scope ticket`——票內有「## 驗證指令」縮圈清單（weave 寫定，見 `ticket-template.md`）就跑該清單，省略則跑 `commands.test`（快速套件）全量；外加**這張票驗收條件對應的實跑檢查**（驗收條件列了哪些操作，就跑哪些操作，例如對應的 Playwright 點擊、真打 API），**不跑** `commands.journey`；不必每次都跑全量回歸。
 - **出貨（ship 階段）**：`node <runner 絕對路徑> --scope ship`——`commands.test` 完整回歸 ＋ `commands.journey` 全量一次跑齊，涵蓋所有已關票的驗收條件加總，抓票與票之間可能互相打壞的地方。這是（出處：母本 DESIGN.md §6，部署後 runtime 不需讀取）兩軸獨立審查之外、屬於「有沒有真的動起來」的那一半驗證，兩者互補、缺一不可。這一輪的全量證據由 runner 簽章寫入 `.constellation/ship-evidence.md`（見本檔同目錄的 `phase-ship.md` 步驟 1），是 ship 級「證據在哪」的唯一落點，不是散落在各票檔裡自己拼湊。
 
 ## 真依賴沒 ready 時怎麼辦
