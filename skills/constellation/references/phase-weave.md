@@ -43,7 +43,7 @@
 拆票時順手為每張票寫「## 驗證指令」section（格式與逐欄規則見本檔同目錄的 `ticket-template.md`）：
 
 - **動機**：`commands.test` 是全量快速套件，測試量隨輪持續增長，票級全量重跑會讓驗證時間隨專案越來越久——縮圈把票級成本鎖在「這張票的影響面」，不再付全專案累積測試量的錢。
-- **怎麼抓**：全域靜態檢查（typecheck／lint）照抄保留＋依票的 zone 與行為影響面挑測試子集（用測試框架的目錄／pattern 過濾，例如 `pnpm test:unit tests/auth`），寧寬勿窄。
+- **怎麼抓**：全域靜態檢查（typecheck／lint）照抄保留＋依票的 zone 與行為影響面挑測試子集（用測試框架的目錄／pattern 過濾，例如 `pnpm test:unit tests/auth`），寧寬勿窄。**不限單元測試**——整合／db 測試同樣照領域子集納入（例如 `pnpm exec playwright test --project=db tests/callcenter`），讓 db 重的票在票級就驗到自己領域的整合面，不必整套全量留到 ship 才第一次跑（全量整合套件動輒數十分鐘，領域子集通常兩三分鐘）。
 - **抓不準就省略**（zone 影響面橫跨大半專案、或測試目錄組織對不上 zone）：整段不寫，runner 自動 fallback 跑 config 全量——縮圈永遠是顯式的，省略永遠安全。
 - **ship 不受影響**：出貨全量 test＋journey 照舊，跨票迴歸在那裡把關。
 
