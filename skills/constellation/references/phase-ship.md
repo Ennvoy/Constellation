@@ -46,6 +46,8 @@
 離場條件（全量驗證綠燈＋兩軸審查無阻擋級發現＋出貨報告已產出）滿足後，才做這一步——讓下一輪任務從乾淨狀態開始，新舊輪不混淆：
 
 - 把本輪 `tickets/`、`decisions/grill-close.md`、`.constellation/ship-evidence.md`、`.constellation/design-frozen.json` 整批移入 `.constellation/archive/<日期>-<摘要>/`（`<日期>` 用 `yyyy-mm-dd`，`<摘要>` 取 `decisions/grill-close.md` 記錄的一句話任務摘要轉成 kebab-case slug）。
+- **同步在 `.constellation/HISTORY.md` 最上方補一段本輪摘要**（沒有這個檔就建立）：`## <日期> <任務摘要>` 起頭，內文 5 行內——本輪幾張票、動了哪些模組、關鍵決策編號（`decisions/NNN`）。**最新一輪永遠在檔案最上方**（session 開場注入取檔案開頭當最近輪次）。票歸檔後明面上就查不到「上一輪做了什麼」，全靠這段摘要接棒——寫完才算歸檔完成。
+- **專案根沒有 `CLAUDE.md`／`AGENTS.md` 時，順勢彈窗提議生成最小版**（一句話專案定位＋常用指令＋一行指向 `.constellation/` 是工作流狀態目錄；十行內）：這是 runtime 原生每場必讀的專案地圖，是 `.constellation/` 注入之外多一層免費接續。使用者不要就算了，不強推、下輪 ship 再提。
 - **凍結名單跟票同生命週期**（出處：母本 DESIGN.md §4，部署後 runtime 不需讀取）：`design-frozen.json` 記的是「本輪定稿了哪些畫面、期間解凍過什麼」，出貨後就是歷史，下一輪的 design 階段從空名單重新建。這順手擋掉一個會誤爆的假警報——`log` 若跨輪一直累積，下一輪的 Spec 軸審查者（另開乾淨 context、只看 `.constellation/` 現況）會看到上一輪留下的 `unfreeze` 紀錄，卻因為上一輪的票早已搬進 `archive/` 而查不到對應的同意脈絡，於是報出一條阻擋級發現把出貨卡住；那條發現是假的（同意脈絡當初就在，只是被歸檔了），名單隨輪歸檔後這種誤爆自然不會發生。
 - **這麼做的代價，據實講明**：上一輪定稿、這輪不打算動的畫面，在下一輪不再有閘門 5 的機器保護（名單空了就沒東西可擋，出處：母本 DESIGN.md §11.5，部署後 runtime 不需讀取）——退而靠 weave 劃 `zone`（不把那些檔案排進這輪要動的票）與出貨 Spec 軸的逐票對照兜住。下一輪真的要繼續保護某幾個上輪定稿的檔案，就在那一輪的 design 定稿時把它們一起寫進新的 `frozen` 名單，不是留著舊名單。
 - `CONTEXT.md` 與其餘 `decisions/NNN-slug.md`（`grill-close.md` 除外）**留在原位、不歸檔**——這些是跨輪累積的專案領域知識，不是單輪產物。design 階段的定稿記錄（`decisions/NNN-slug.md`）也留在原位，凍結名單走了它還在，下一輪要沿用上輪的視覺語言時查得到。

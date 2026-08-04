@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // Constellation 閘門 3 —— session 開場注入（SessionStart hook）。
-// 純讀檔：掃 {root}/.constellation/tickets/*.md，解析 status／blocked-by／票名（首行 # 標題）與
-// 「## 驗收條件」勾選進度，組成繁中摘要，供 runtime 注入開場。DESIGN.md §4／§5 閘門 3。
+// 純讀檔：掃 {root}/.constellation/ 重建現況組成繁中摘要，供 runtime 注入開場。DESIGN.md §4／§5 閘門 3。
+// 注入四段：①票況（tickets/*.md 的 status／blocked-by／票名／「## 驗收條件」勾選進度）
+// ②CONTEXT.md 全文 ③decisions/ 索引＋最近三筆全文 ④HISTORY.md 最近輪次（最新在檔案最上）。
+// 各段有行數上限、超限截斷並指路原檔（防注入膨脹）；知識軌每段獨立 fail-open——單段壞檔只少那一段，不拖垮票況。
 // root 解析：git rev-parse --show-toplevel（在 cwd 下跑），失敗 fallback cwd（與 gates/commit-gate.mjs
 // 的 resolveRepoRoot 同一套規則）——在子目錄下開 session 也掃得到專案根的 .constellation。
 // 沒有 .constellation/ 的專案（非 Constellation 專案）一律靜默 exit 0，不干擾。
@@ -58,10 +60,85 @@ function parseTicket(raw) {
 
 const STATUSES = ['open', 'in-progress', 'blocked', 'done'];
 
+// 知識軌注入上限（DESIGN.md §4「接續」：各段設行數上限、超限截斷並指路原檔）。
+const CONTEXT_MAX_LINES = 200;       // CONTEXT.md 全文
+const DECISION_INDEX_MAX = 50;       // decisions/ 索引筆數（超過只列最近 N 筆）
+const DECISION_RECENT = 3;           // 最近幾筆決策附全文
+const DECISION_BODY_MAX_LINES = 15;  // 每筆決策全文上限
+const HISTORY_MAX_LINES = 40;        // HISTORY.md（最新在最上，取檔案開頭即最近輪次）
+
+function readTextSafe(p) {
+  try { return stripBom(readFileSync(p, 'utf8')); } catch { return null; }
+}
+
+// 去尾端空行後截到上限；超限時補一行指路。回傳行陣列。
+function capLines(text, max, refPath) {
+  const lines = String(text).split(/\r?\n/);
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+  if (lines.length <= max) return lines;
+  return [...lines.slice(0, max), `…（其餘 ${lines.length - max} 行略，全文見 ${refPath}）`];
+}
+
+function buildContextSection(base) {
+  const raw = readTextSafe(join(base, 'CONTEXT.md'));
+  if (!raw || !raw.trim()) return null;
+  return ['【專案詞彙與業務規則（.constellation/CONTEXT.md）】',
+    ...capLines(raw, CONTEXT_MAX_LINES, '.constellation/CONTEXT.md')].join('\n');
+}
+
+function buildDecisionsSection(base) {
+  const dir = join(base, 'decisions');
+  let files = [];
+  // 只收數字開頭的正式決策（slug 可缺，落檔時少打 slug 也不無聲消失）；grill-close.md 是流程標記不在此列。
+  try {
+    files = readdirSync(dir)
+      .filter(f => /^\d+([-_].*)?\.md$/i.test(f))
+      .sort((a, b) => parseInt(a, 10) - parseInt(b, 10));
+  } catch { return null; }
+  if (!files.length) return null;
+
+  // 每檔的索引行：首個一級標題「# 」優先（(?!#) 擋掉 ## 二級標題誤中），讀不到退回檔名。
+  const titleOf = f => {
+    const raw = readTextSafe(join(dir, f));
+    const m = raw && raw.match(/^#(?!#)\s*(.+)$/m);
+    return m ? `${f.replace(/\.md$/i, '')}：${m[1].trim()}` : f.replace(/\.md$/i, '');
+  };
+
+  const lines = [`【決策記錄（.constellation/decisions/）】共 ${files.length} 筆：`];
+  const indexFiles = files.slice(-DECISION_INDEX_MAX);
+  if (indexFiles.length < files.length) lines.push(`  （僅列最近 ${indexFiles.length} 筆，其餘見目錄）`);
+  for (const f of indexFiles) lines.push(`  - ${titleOf(f)}`);
+
+  const recent = files.slice(-DECISION_RECENT);
+  lines.push(`最近 ${recent.length} 筆全文：`);
+  for (const f of recent) {
+    const raw = readTextSafe(join(dir, f));
+    if (!raw) continue;
+    for (const l of capLines(raw, DECISION_BODY_MAX_LINES, `.constellation/decisions/${f}`)) lines.push(`  ${l}`);
+    lines.push('');
+  }
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+  return lines.join('\n');
+}
+
+function buildHistorySection(base) {
+  const raw = readTextSafe(join(base, 'HISTORY.md'));
+  if (!raw || !raw.trim()) return null;
+  return ['【出貨輪次史（.constellation/HISTORY.md，最新在上）】',
+    ...capLines(raw, HISTORY_MAX_LINES, '.constellation/HISTORY.md')].join('\n');
+}
+
+// 專案根沒有 runtime 原生每場必讀的專案地圖時提醒一句（生成留給 ship 收尾提議，不在開場動手）。
+function claudeMdReminder(root) {
+  if (existsSync(join(root, 'CLAUDE.md')) || existsSync(join(root, 'AGENTS.md'))) return null;
+  return '· 提示：專案根尚無 CLAUDE.md／AGENTS.md（runtime 開場必讀的專案地圖）——下次 ship 收尾時可提議生成最小版。';
+}
+
 // repo root 解析：git rev-parse --show-toplevel，失敗 fallback cwd（與 commit-gate.mjs 鏡像）。
 function resolveRepoRoot(cwd) {
   try {
-    const out = execFileSync('git', ['-C', cwd, 'rev-parse', '--show-toplevel'], { maxBuffer: 1 << 20 })
+    const out = execFileSync('git', ['-C', cwd, 'rev-parse', '--show-toplevel'],
+      { maxBuffer: 1 << 20, stdio: ['ignore', 'pipe', 'ignore'] }) // 靜默 stderr：非 git 目錄不漏 fatal 兩行
       .toString('utf8').trim();
     if (out) return out;
   } catch {} // 非 git repo／git 不存在等 → fallback cwd
@@ -109,6 +186,11 @@ function buildSummary(cwd) {
       lines.push(`  - ${t.label}（${reason}）`);
     }
   }
+  // 知識軌（DESIGN.md §4「接續」②③④）：每段獨立 try——單段解析炸掉只少那一段，票況照常注入。
+  for (const build of [buildContextSection, buildDecisionsSection, buildHistorySection]) {
+    try { const s = build(base); if (s) lines.push(s); } catch { /* fail-open */ }
+  }
+  try { const r = claudeMdReminder(root); if (r) lines.push(r); } catch { /* fail-open */ }
   lines.push(`驗證 runner：node "${VERIFY_RUNNER_ABS_PATH}"`);
   return lines.join('\n');
 }
