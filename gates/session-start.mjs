@@ -67,6 +67,7 @@ const STATUSES = ['open', 'in-progress', 'blocked', 'done'];
 const DECISION_INDEX_MAX = 80;       // decisions/ 索引筆數（超過只列最近 N 筆）
 const CONTEXT_TERMS_MAX = 120;       // CONTEXT.md 詞條名清單上限
 const HISTORY_MAX_LINES = 40;        // HISTORY.md（最新在最上，取檔案開頭即最近輪次）
+const MAP_INDEX_MAX_LINES = 55;      // MAP.md 只注入「模組索引」表；其餘章節同樣走導航靠 Read
 const SUMMARY_MAX_CHARS = 9000;      // 總量 failsafe：runtime 10k 字元門檻的安全線，超線硬截保可見
 
 function readTextSafe(p) {
@@ -79,6 +80,73 @@ function capLines(text, max, refPath) {
   while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
   if (lines.length <= max) return lines;
   return [...lines.slice(0, max), `…（其餘 ${lines.length - max} 行略，全文見 ${refPath}）`];
+}
+
+// MAP.md 的同步點標記：值可能是佔位字串（樣板剛落地、還沒跑過同步），所以抽出來後
+// 還要驗形狀——只有 hex 樣的才當真 sha，PLACEHOLDER_COMMIT／<sha>／TODO 一律視為「尚未標記」。
+const MAP_SYNCED_AT_RE = /<!--\s*constellation-map-synced-at\s*:\s*(\S+?)\s*-->/i;
+const looksLikeSha = s => /^[0-9a-f]{4,40}$/i.test(s);
+
+// 過期偵測：地圖記的是「什麼東西在哪個路徑」，不記檔案內容，所以純改內容不會讓它過期——
+// 只有新增（A）／刪除（D）／改名（R）才會讓「在哪」這件事失準，故 --diff-filter=ADR。
+// 這樣同步點放久一點也不會被日常改 code 洗出滿江紅的假警報。
+function mapStaleWarning(root, sha) {
+  let out;
+  try {
+    out = execFileSync('git', ['-C', root, 'diff', '--name-status', `${sha}..HEAD`, '--diff-filter=ADR'],
+      { maxBuffer: 1 << 20, stdio: ['ignore', 'pipe', 'ignore'] }).toString('utf8');
+  } catch { return null; } // sha 不存在／非 git repo／git 缺席 → 這個檢查整個略過，不擋不吵
+  const changed = [];
+  for (const line of out.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    const cols = line.split('\t');
+    const p = cols[cols.length - 1].trim(); // R 是「舊路徑\t新路徑」，取末欄即改名後的位置
+    if (!p) continue;
+    if (/^(\.constellation|node_modules|dist|test-results|\.git)\//.test(p)) continue; // 地圖不記這些
+    // 文件性目錄底下的純文字檔搬來搬去不影響「程式碼在哪」，不值得為它報過期。
+    if (/(^|\/)(docs|specs)\//i.test(p) && /\.(md|txt|json)$/i.test(p)) continue;
+    changed.push(p);
+  }
+  if (!changed.length) return null;
+  return `⚠ 地圖可能已過期：上次同步（${sha.slice(0, 7)}）之後有 ${changed.length} 個檔案新增/刪除/改名` +
+    `（例：${changed.slice(0, 3).join('、')}）。動工前請先核對 MAP.md。`;
+}
+
+// 專案現況地圖導航：只注入「模組索引」那一章（東西在哪、進哪個檔改），資料表／已知資料缺口／
+// 地雷等章節留在檔案裡靠置頂指令引導 Read——與知識軌同一套導航紀律，不讓地圖把注入額度吃光。
+// 整段 fail-open：地圖是輔助資訊，壞檔／git 異常都只是少這一段，絕不拖垮票況注入。
+function buildMapSection(base, root) {
+  try {
+    const raw = readTextSafe(join(base, 'MAP.md'));
+    if (!raw || !raw.trim()) return null;
+    const all = raw.split(/\r?\n/);
+    const lineCount = all.length;
+
+    // 章節標題可能帶編號與括號補述（「## 一、模組索引（開場注入用…）」），故只認關鍵字不認整串。
+    const start = all.findIndex(l => /^##\s.*模組索引/.test(l.trim()));
+    let body = [];
+    if (start >= 0) {
+      let end = all.length;
+      for (let i = start + 1; i < all.length; i++) {
+        if (/^##\s/.test(all[i])) { end = i; break; } // 下一個二級標題為界（### 子節仍算本章）
+      }
+      body = all.slice(start + 1, end);
+      while (body.length && !body[0].trim()) body.shift();
+    }
+    const shown = body.length
+      ? capLines(body.join('\n'), MAP_INDEX_MAX_LINES, '.constellation/MAP.md')
+      : ['  （MAP.md 尚無模組索引章節——請直接 Read 原檔）'];
+
+    const m = raw.match(MAP_SYNCED_AT_RE);
+    const sha = m && looksLikeSha(m[1]) ? m[1] : null;
+    const note = sha ? mapStaleWarning(root, sha)
+      : '· 地圖尚未標記同步點（缺 constellation-map-synced-at），無法判斷是否過期。';
+
+    const lines = ['【專案現況地圖（.constellation/MAP.md，完整內容含資料表、已知資料缺口與地雷請 Read 原檔）】'];
+    if (note) lines.push(note); // 警告放表格前面，免得被 55 行索引蓋掉看不見
+    lines.push(...shown);
+    return { text: lines.join('\n'), lineCount };
+  } catch { return null; } // fail-open
 }
 
 // CONTEXT.md 導航：只列詞條名（`- **詞**：` 形，fallback ## 標題），內文由置頂指令引導 Read。
@@ -189,18 +257,22 @@ function buildSummary(cwd) {
     }
   }
   // 知識軌導航（DESIGN.md §4「接續」）：每段獨立 try——單段解析炸掉只少那一段，票況照常注入。
-  let ctx = null, dec = null, hist = null;
+  let map = null, ctx = null, dec = null, hist = null;
+  try { map = buildMapSection(base, root); } catch { /* fail-open */ }
   try { ctx = buildContextSection(base); } catch { /* fail-open */ }
   try { dec = buildDecisionsSection(base); } catch { /* fail-open */ }
   try { hist = buildHistorySection(base); } catch { /* fail-open */ }
 
   // 置頂強制讀檔指令：知識本體不在注入裡——放最前面，任何情況下最先被看到。
-  if (ctx || dec) {
+  if (map || ctx || dec) {
     const reads = [];
+    // 地圖排第一：動手前最先要知道的是「東西在哪」，其次才是詞彙與過往決策。
+    if (map) reads.push(`.constellation/MAP.md（專案現況地圖，全文 ${map.lineCount} 行）`);
     if (ctx) reads.push(`.constellation/CONTEXT.md（專案詞彙與業務規則，全文 ${ctx.lineCount} 行）`);
     if (dec) reads.push(`.constellation/decisions/ 最近幾筆（共 ${dec.count} 筆決策，編號越大越新）`);
     lines.unshift(`【開工前必讀】本專案知識軌不隨開場注入內文，動手任何工作前先 Read：${reads.join('＋')}。下方僅為導航索引。`);
   }
+  if (map) lines.push(map.text); // 票況之後、知識軌之前：先知道東西在哪，再談脈絡
   if (hist) lines.push(hist.text);
   if (dec) lines.push(dec.text);
   if (ctx) lines.push(ctx.text);
