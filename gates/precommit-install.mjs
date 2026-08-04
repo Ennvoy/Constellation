@@ -7,7 +7,7 @@
 // 使用者自己在終端機打 git commit、或子行程／npm script／release 腳本／MCP run_code 發起的 commit
 // 全都繞過那層。git 原生 pre-commit 是唯一能兜住這整批繞法的位置。
 // （Flow 時代這層由 flow-precommit.mjs + precommit-install.mjs 提供；Constellation 首次搬遷時
-// 刻意未搬，2026-07-28 Flow 退役後缺口曝光，經使用者拍板補上。判定邏輯不另立門戶，
+// 刻意未搬，Flow 退役後缺口曝光，經使用者拍板補上。判定邏輯不另立門戶，
 // 一律回頭呼叫 commit-gate.mjs 本尊，確保兩條呼叫路徑永遠同一套規則、不會漂移。）
 //
 // 紀律：

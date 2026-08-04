@@ -3,7 +3,7 @@
 // commit-gate.mjs 擋下 staged 驗證垃圾時，叫你跑的就是這支（它負責「擋」，這支負責「清」）。
 // 判定規則不自己養一份，一律從 commit-gate.mjs import——「被擋的」與「被清的」永遠同一套標準。
 // （Flow 時代對應 flow-toolkit/clean-verify-artifacts.mjs；Constellation 首次搬遷時只搬了判定、
-// 沒搬清理與 .gitignore 職責，2026-07-28 經使用者拍板補齊到同級。）
+// 沒搬清理與 .gitignore 職責，經使用者拍板補齊到同級。）
 //
 // 設計鐵則：
 //   1) 白名單刪除——只刪「已知產物目錄／已知殘留檔樣式」，絕不盲掃。

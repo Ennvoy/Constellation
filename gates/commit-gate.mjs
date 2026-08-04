@@ -21,14 +21,14 @@
 //      驗證證據存在且新鮮），兩層責任分開：close-gate 管「改檔當下」、commit-gate 管「進歷史前兜底」。
 //   2) 原本 secrets／驗證垃圾判定抽在共用檔 commit-gate-core.mjs（供 git 原生 pre-commit 對應檔
 //      flow-precommit.mjs 共用），故本檔內聯全部判定邏輯，改為單檔自足，不再依賴外部 core 檔。
-//      【2026-07-28 補】首次搬遷時連「原生 pre-commit 對應檔」也一併未搬，導致本檔只攔得到 Claude Code
+//      首次搬遷時連「原生 pre-commit 對應檔」也一併未搬，導致本檔只攔得到 Claude Code
 //      發起的 commit，人在終端機手打的 commit 無人看管。Flow 退役後該缺口曝光，經使用者拍板補上：
 //      不另立執行體，改在本檔加 `--precommit` 入口（見下方 runPrecommit），由 gates/precommit-install.mjs
 //      冪等裝進 .git/hooks/pre-commit。兩條呼叫路徑共用同一組判定函式，杜絕規則漂移。
 //   3) 「驗證垃圾」白名單原本 import 自 flow-toolkit/clean-verify-artifacts.mjs（該檔另兼 CLI 清理／
 //      補 .gitignore 職責）。本檔只內聯 isCommitBlockableArtifact 判定所需的最小規則集（Tier A 絕對垃圾
 //      檔名＋已知產物目錄清單），不認 Tier B（散落截圖／影片），避免誤擋使用者故意 commit 的資產。
-//      【2026-07-28 補】當初未搬的「清理／補 .gitignore」職責已補齊為 gates/clean-artifacts.mjs，
+//      當初未搬的「清理／補 .gitignore」職責已補齊為 gates/clean-artifacts.mjs，
 //      並反向 import 本檔 export 的規則（單向依賴：本檔仍不 import 任何外部檔）；擋下時的建議動作
 //      相應改為指向該 CLI。
 //   4) 生效範圍門檻由「.flow 存在」改為「.constellation 存在」——僅在已採用 Constellation 工作流的專案

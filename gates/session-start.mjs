@@ -5,7 +5,7 @@
 // ①票況（tickets/*.md 的 status／blocked-by／票名／「## 驗收條件」勾選進度）②HISTORY.md 最近輪次
 // ③decisions/ 標題索引（不含內文）④CONTEXT.md 詞條名清單（不含內文）。知識本體留在檔案裡由指令引導 Read——
 // 不注全文是因為 runtime 對 hook 注入有 10,000 字元硬門檻，超線整包被持久化、開場只剩 2KB 預覽（比索引更糟）；
-// 知識軌單調成長，任何活躍專案遲早撞線，故一律導航（2026-08-04 使用者拍板，見 .constellation/decisions/002）。
+// 知識軌單調成長，任何活躍專案遲早撞線，故一律導航（見 .constellation/decisions/002）。
 // 知識軌每段獨立 fail-open——單段壞檔只少那一段，不拖垮票況。
 // root 解析：git rev-parse --show-toplevel（在 cwd 下跑），失敗 fallback cwd（與 gates/commit-gate.mjs
 // 的 resolveRepoRoot 同一套規則）——在子目錄下開 session 也掃得到專案根的 .constellation。
