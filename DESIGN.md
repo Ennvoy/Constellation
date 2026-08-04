@@ -110,7 +110,7 @@ zone: src/auth/**, tests/auth/**   # 檔案界線（平行時互斥用）
 
 另有 **`config.json`**：該專案的驗證指令設定（`commands.test`＝逐票快速套件、`commands.journey`＝全量 journey、`timeoutSec`＝單指令逾時），weave 階段生成、驗證 runner 讀取；weave 票清單經使用者核准後在此寫入 `"approved": true`（機讀核准標記，總控據此才准進 build）。**出貨後歸檔**：ship 完成即把本輪 tickets/、grill-close.md、ship-evidence.md、design-frozen.json 移入 `.constellation/archive/<日期>-<摘要>/`，並同步在 `HISTORY.md` 最上方補一段本輪摘要——下一輪任務從乾淨狀態開始，新舊輪不混淆。**凍結名單與票同生命週期**（下一輪 design 從空名單重建）：它記的是本輪定稿了哪些畫面、期間解凍過什麼，出貨後即歷史；隨輪歸檔順手根治一個假警報——`log` 若跨輪累積，下一輪 Spec 軸審查者（乾淨 context、只看現況）會看到上輪的 `unfreeze` 卻查不到已被歸檔的同意脈絡，誤報阻擋級發現把出貨卡住。代價見 §11.5。
 
-**接續**：新 session 開場由 session-start 閘門自動注入四件事——①票況（有哪些票、各自狀態、進行中的做到哪，含驗證 runner 絕對路徑）②`CONTEXT.md` 全文 ③`decisions/` 索引（一筆一行）＋最近三筆全文 ④`HISTORY.md` 最近輪次。各段設行數上限、超限截斷並指路原檔（防注入膨脹）；**知識軌寫了就會被端上桌**，不是寫給人翻的死檔案——換 session 不重讀專案、決議不靠對話記憶，正是靠這一注。專案根沒有 `CLAUDE.md`／`AGENTS.md`（runtime 原生每場必讀的專案地圖）時，開場注入附一行提醒，ship 收尾提議生成最小版。中斷即中斷，讀檔即接手。（2026-08-04 前僅注入票況——CONTEXT.md 與 decisions/ 寫了沒人端上桌，新 session 照樣失憶，實測「活動計算」專案 195 行業務規則＋37 筆決策全數未注入，據此修訂。）
+**接續**：新 session 開場由 session-start 閘門自動注入**導航摘要**——置頂【開工前必讀】強制讀檔指令（動手任何工作前先 Read `CONTEXT.md` 與最近 `decisions/`，指令寫明行數與筆數）＋①票況（含驗證 runner 絕對路徑）②`HISTORY.md` 最近輪次 ③`decisions/` 標題索引 ④`CONTEXT.md` 詞條名清單；**知識內文不注入，由指令引導 Read 原檔**。不注全文的原因：runtime 對 hook 注入有 10,000 字元硬門檻，超線整包被持久化、開場只剩 2KB 預覽（比索引更糟）；知識軌單調成長、任何活躍專案遲早撞線，截斷式又會給模型「已拿到全文」的假象——導航索引與專案規模解耦、永不撞線（2026-08-04 headless 實測後拍板，決策記錄 002；同日稍早曾短暫採「全文注入」版，實測「活動計算」專案 9,600+ 字元撞線即改）。專案根沒有 `CLAUDE.md`／`AGENTS.md`（runtime 原生每場必讀的專案地圖）時，開場注入附一行提醒，ship 收尾提議生成最小版。中斷即中斷，讀檔即接手。
 
 ## 5. 閘門五件組（確定性檢查點，全部小而專）
 
@@ -118,7 +118,7 @@ zone: src/auth/**, tests/auth/**   # 檔案界線（平行時互斥用）
 |---|------|------|------|
 | 1 | git 守門 | hook | 擋破壞性 git 操作與未經確認的開/切分支（自 Flow 原封搬入） |
 | 2 | commit 守門 | hook ＋ git pre-commit | commit 前掃 secrets／垃圾產物（自 Flow 原封搬入）。**兩條呼叫路徑、同一套判定**：PreToolUse hook 攔 Claude Code 發起的 commit；git 原生 pre-commit（`--precommit` 入口，由 session 開場冪等安裝）兜住使用者手打／子行程／npm script／MCP 發起的 commit——後者是前者攔不到的整批繞法 |
-| 3 | session 開場注入 | hook | 從 `.constellation/` 重建現況並注入開場——票況＋知識軌（CONTEXT.md 全文、decisions/ 索引與最近三筆、HISTORY.md 最近輪次），各段有行數上限（§4） |
+| 3 | session 開場注入 | hook | 從 `.constellation/` 重建現況並注入開場導航——置頂強制讀檔指令＋票況＋HISTORY 最近輪次＋決策標題索引＋詞條名清單，知識內文不注入（§4） |
 | 4 | 驗證 runner | script | 實跑驗證（`--scope` 分逐票／出貨兩級；逐票優先吃票內「驗證指令」縮圈清單，無則 config 全量——縮圈顯式、fallback 全量），pass 證據附簽章寫入票（ship 級寫入 `.constellation/ship-evidence.md`）；內建**斷路器**——同一目標連續 5 次失敗即強制停下請使用者拍板，不無限重試 |
 | 5 | 關票刷卡機 | hook | 票標 done 時機器驗證據簽章與新鮮度（24h）＋驗收條件全勾，不過直接擋下；兼任**定稿 UI 凍結守衛**——編輯 design-frozen.json 名單內的檔案一律擋下，解凍須經使用者同意並留日誌 |
 
@@ -213,7 +213,8 @@ Desktop\Constellation\
 以下缺口經雙路對抗審查（本家＋Codex 跨家族）確認存在，但依「審查跟著風險走／harness 不得成為工作量」原則**刻意不補機制**，白紙黑字揭露：
 
 - **未經拍板的訪談細節不落檔**，中斷重訪可能重問——by-design（§2 已註明），避免訪談狀態檔膨脹。（2026-08-04 落檔門檻放寬後，凡使用者拍板的取捨一律落 `decisions/`（§4），會蒸發的只剩「沒問到拍板那一層」的隨口偏好與細節。）
-- **SessionStart 注入在 resume／compact 時也整包重注**：hook 無 matcher（startup／resume／clear／compact 全觸發），知識軌注入後單次 payload 上限約 350 行——compact 後重注是補血（摘要後找回知識軌原文），resume 重注則是重複吃 context 預算。可接受的取捨，不為此加 matcher 分流機制。
+- **SessionStart 注入在 resume／compact 時也整包重注**：hook 無 matcher（startup／resume／clear／compact 全觸發）——導航模式下單次 payload 僅索引級（通常 1–3KB），重注成本低；compact 後重注還是補血（摘要後找回導航）。可接受的取捨，不為此加 matcher 分流機制。
+- **導航模式下，知識內文的送達靠指令不靠機器**：開場注入只保證「導航索引＋置頂讀檔指令」可見，模型若忽略【開工前必讀】就會帶著不完整背景動工。這是 runtime 10,000 字元注入門檻下的取捨——注全文：超線整包被持久化只剩 2KB 預覽；截斷：給「已拿到全文」的假象且知識軌單調成長、越截越多。指令置頂＋寫明行數筆數已把遵從成本壓到最低，不再為此加機制（閘門 3 另設 9,000 字元 failsafe 硬截，保「開場可見」）。10,000 字元門檻是 Claude Code 官方文件數字；Codex 端門檻未實測——導航 payload 僅 1–4KB，2026-08-04 兩邊 headless 實測注入均完整送達（Claude Code 端模型當場照指令讀完 CONTEXT.md 全文；Codex 端 `hook: SessionStart Completed` 且原封複述注入），離任何合理門檻都遠，不為此加探測。
 - **同一次編輯「改 done＋刪證據」的複合操作**理論上可騙過刷卡機的磁碟現檔檢查——由 commit 守門的 done 票稽核在 commit 時兜底。
 - **驗證通過後 24h 內再改壞 code 仍可關票**——改壞的 code 會在 ship 全量驗證爆出（自我暴露型），不為它加即時防護。
 - **install.ps1 非交易式**（中途失敗可能半完成）、多 clone 場景卸載可能誤拔——單人單機低頻情境，有備份與重跑冪等即可。

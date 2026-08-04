@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 // Constellation 閘門 3 —— session 開場注入（SessionStart hook）。
 // 純讀檔：掃 {root}/.constellation/ 重建現況組成繁中摘要，供 runtime 注入開場。DESIGN.md §4／§5 閘門 3。
-// 注入四段：①票況（tickets/*.md 的 status／blocked-by／票名／「## 驗收條件」勾選進度）
-// ②CONTEXT.md 全文 ③decisions/ 索引＋最近三筆全文 ④HISTORY.md 最近輪次（最新在檔案最上）。
-// 各段有行數上限、超限截斷並指路原檔（防注入膨脹）；知識軌每段獨立 fail-open——單段壞檔只少那一段，不拖垮票況。
+// 注入走「導航模式」（單一形狀，與專案規模解耦）：置頂「開工前必讀」強制讀檔指令＋
+// ①票況（tickets/*.md 的 status／blocked-by／票名／「## 驗收條件」勾選進度）②HISTORY.md 最近輪次
+// ③decisions/ 標題索引（不含內文）④CONTEXT.md 詞條名清單（不含內文）。知識本體留在檔案裡由指令引導 Read——
+// 不注全文是因為 runtime 對 hook 注入有 10,000 字元硬門檻，超線整包被持久化、開場只剩 2KB 預覽（比索引更糟）；
+// 知識軌單調成長，任何活躍專案遲早撞線，故一律導航（2026-08-04 使用者拍板，見 .constellation/decisions/002）。
+// 知識軌每段獨立 fail-open——單段壞檔只少那一段，不拖垮票況。
 // root 解析：git rev-parse --show-toplevel（在 cwd 下跑），失敗 fallback cwd（與 gates/commit-gate.mjs
 // 的 resolveRepoRoot 同一套規則）——在子目錄下開 session 也掃得到專案根的 .constellation。
 // 沒有 .constellation/ 的專案（非 Constellation 專案）一律靜默 exit 0，不干擾。
@@ -60,12 +63,11 @@ function parseTicket(raw) {
 
 const STATUSES = ['open', 'in-progress', 'blocked', 'done'];
 
-// 知識軌注入上限（DESIGN.md §4「接續」：各段設行數上限、超限截斷並指路原檔）。
-const CONTEXT_MAX_LINES = 200;       // CONTEXT.md 全文
-const DECISION_INDEX_MAX = 50;       // decisions/ 索引筆數（超過只列最近 N 筆）
-const DECISION_RECENT = 3;           // 最近幾筆決策附全文
-const DECISION_BODY_MAX_LINES = 15;  // 每筆決策全文上限
+// 導航模式各段上限（DESIGN.md §4「接續」）。索引級內容成長極慢，這些只是防怪檔的保險。
+const DECISION_INDEX_MAX = 80;       // decisions/ 索引筆數（超過只列最近 N 筆）
+const CONTEXT_TERMS_MAX = 120;       // CONTEXT.md 詞條名清單上限
 const HISTORY_MAX_LINES = 40;        // HISTORY.md（最新在最上，取檔案開頭即最近輪次）
+const SUMMARY_MAX_CHARS = 9000;      // 總量 failsafe：runtime 10k 字元門檻的安全線，超線硬截保可見
 
 function readTextSafe(p) {
   try { return stripBom(readFileSync(p, 'utf8')); } catch { return null; }
@@ -79,11 +81,21 @@ function capLines(text, max, refPath) {
   return [...lines.slice(0, max), `…（其餘 ${lines.length - max} 行略，全文見 ${refPath}）`];
 }
 
+// CONTEXT.md 導航：只列詞條名（`- **詞**：` 形，fallback ## 標題），內文由置頂指令引導 Read。
 function buildContextSection(base) {
   const raw = readTextSafe(join(base, 'CONTEXT.md'));
   if (!raw || !raw.trim()) return null;
-  return ['【專案詞彙與業務規則（.constellation/CONTEXT.md）】',
-    ...capLines(raw, CONTEXT_MAX_LINES, '.constellation/CONTEXT.md')].join('\n');
+  const lineCount = raw.split(/\r?\n/).length;
+  let names = [...raw.matchAll(/^\s*-\s*\*\*(.+?)\*\*/gm)].map(m => m[1].trim());
+  if (!names.length) names = [...raw.matchAll(/^##\s+(.+)$/gm)].map(m => m[1].trim());
+  const shown = names.slice(0, CONTEXT_TERMS_MAX);
+  const lines = [`【專案詞彙與業務規則導航（.constellation/CONTEXT.md，全文 ${lineCount} 行，內文請 Read 原檔）】`];
+  if (shown.length) {
+    lines.push('  ' + shown.join('、') + (names.length > shown.length ? `、…等共 ${names.length} 條` : ''));
+  } else {
+    lines.push('  （非詞條格式，無法列清單——請直接 Read 原檔）');
+  }
+  return { text: lines.join('\n'), lineCount };
 }
 
 function buildDecisionsSection(base) {
@@ -104,28 +116,18 @@ function buildDecisionsSection(base) {
     return m ? `${f.replace(/\.md$/i, '')}：${m[1].trim()}` : f.replace(/\.md$/i, '');
   };
 
-  const lines = [`【決策記錄（.constellation/decisions/）】共 ${files.length} 筆：`];
+  const lines = [`【決策記錄導航（.constellation/decisions/）】共 ${files.length} 筆（編號越大越新，內文請 Read 原檔）：`];
   const indexFiles = files.slice(-DECISION_INDEX_MAX);
   if (indexFiles.length < files.length) lines.push(`  （僅列最近 ${indexFiles.length} 筆，其餘見目錄）`);
   for (const f of indexFiles) lines.push(`  - ${titleOf(f)}`);
-
-  const recent = files.slice(-DECISION_RECENT);
-  lines.push(`最近 ${recent.length} 筆全文：`);
-  for (const f of recent) {
-    const raw = readTextSafe(join(dir, f));
-    if (!raw) continue;
-    for (const l of capLines(raw, DECISION_BODY_MAX_LINES, `.constellation/decisions/${f}`)) lines.push(`  ${l}`);
-    lines.push('');
-  }
-  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
-  return lines.join('\n');
+  return { text: lines.join('\n'), count: files.length };
 }
 
 function buildHistorySection(base) {
   const raw = readTextSafe(join(base, 'HISTORY.md'));
   if (!raw || !raw.trim()) return null;
-  return ['【出貨輪次史（.constellation/HISTORY.md，最新在上）】',
-    ...capLines(raw, HISTORY_MAX_LINES, '.constellation/HISTORY.md')].join('\n');
+  return { text: ['【出貨輪次史（.constellation/HISTORY.md，最新在上）】',
+    ...capLines(raw, HISTORY_MAX_LINES, '.constellation/HISTORY.md')].join('\n') };
 }
 
 // 專案根沒有 runtime 原生每場必讀的專案地圖時提醒一句（生成留給 ship 收尾提議，不在開場動手）。
@@ -186,13 +188,33 @@ function buildSummary(cwd) {
       lines.push(`  - ${t.label}（${reason}）`);
     }
   }
-  // 知識軌（DESIGN.md §4「接續」②③④）：每段獨立 try——單段解析炸掉只少那一段，票況照常注入。
-  for (const build of [buildContextSection, buildDecisionsSection, buildHistorySection]) {
-    try { const s = build(base); if (s) lines.push(s); } catch { /* fail-open */ }
+  // 知識軌導航（DESIGN.md §4「接續」）：每段獨立 try——單段解析炸掉只少那一段，票況照常注入。
+  let ctx = null, dec = null, hist = null;
+  try { ctx = buildContextSection(base); } catch { /* fail-open */ }
+  try { dec = buildDecisionsSection(base); } catch { /* fail-open */ }
+  try { hist = buildHistorySection(base); } catch { /* fail-open */ }
+
+  // 置頂強制讀檔指令：知識本體不在注入裡——放最前面，任何情況下最先被看到。
+  if (ctx || dec) {
+    const reads = [];
+    if (ctx) reads.push(`.constellation/CONTEXT.md（專案詞彙與業務規則，全文 ${ctx.lineCount} 行）`);
+    if (dec) reads.push(`.constellation/decisions/ 最近幾筆（共 ${dec.count} 筆決策，編號越大越新）`);
+    lines.unshift(`【開工前必讀】本專案知識軌不隨開場注入內文，動手任何工作前先 Read：${reads.join('＋')}。下方僅為導航索引。`);
   }
+  if (hist) lines.push(hist.text);
+  if (dec) lines.push(dec.text);
+  if (ctx) lines.push(ctx.text);
   try { const r = claudeMdReminder(root); if (r) lines.push(r); } catch { /* fail-open */ }
   lines.push(`驗證 runner：node "${VERIFY_RUNNER_ABS_PATH}"`);
-  return lines.join('\n');
+
+  let summary = lines.join('\n');
+  // failsafe：索引級內容理論上不會超線；萬一撞上（極端怪檔），硬截保「開場可見」優先於完整——
+  // 超過 runtime 10k 字元門檻會整包被持久化、只剩 2KB 預覽，比截斷更糟。
+  if (summary.length > SUMMARY_MAX_CHARS) {
+    summary = summary.slice(0, SUMMARY_MAX_CHARS) +
+      '\n…（導航超過注入上限被截斷，完整現況請直接查看 .constellation/ 目錄）';
+  }
+  return summary;
 }
 
 // git 原生 pre-commit 兜底的冪等安裝（gates/precommit-install.mjs）。只在確認是 Constellation 專案後才呼叫。
