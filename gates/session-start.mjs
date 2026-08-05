@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 // Constellation 閘門 3 —— session 開場注入（SessionStart hook）。
 // 純讀檔：掃 {root}/.constellation/ 重建現況組成繁中摘要，供 runtime 注入開場。DESIGN.md §4／§5 閘門 3。
-// 注入走「導航模式」（單一形狀，與專案規模解耦）：置頂「開工前必讀」強制讀檔指令＋
+// 注入走「純導航模式」（單一形狀，與專案規模解耦）：置頂「開工前必讀」強制讀檔指令＋
 // ①票況（tickets/*.md 的 status／blocked-by／票名／「## 驗收條件」勾選進度）②HISTORY.md 最近輪次
-// ③decisions/ 標題索引（不含內文）④CONTEXT.md 詞條名清單（不含內文）。知識本體留在檔案裡由指令引導 Read——
+// ③decisions/ 一行摘要（總筆數＋最近編號範圍＋查法，不逐筆列標題）④CONTEXT.md 一行摘要（行數＋詞條數）。
+// ③④刻意不列清單：清單會隨決議數量單調成長吃光額度，且截斷方向是「越舊越先丟」，而越舊的往往
+// 越根本（早期那批地基決議），丟掉比長度撞線更傷；改為只給座標與查法，內文一律引導 Read／搜尋——
 // 不注全文是因為 runtime 對 hook 注入有 10,000 字元硬門檻，超線整包被持久化、開場只剩 2KB 預覽（比索引更糟）；
 // 知識軌單調成長，任何活躍專案遲早撞線，故一律導航（見 .constellation/decisions/002）。
 // 知識軌每段獨立 fail-open——單段壞檔只少那一段，不拖垮票況。
@@ -64,8 +66,7 @@ function parseTicket(raw) {
 const STATUSES = ['open', 'in-progress', 'blocked', 'done'];
 
 // 導航模式各段上限（DESIGN.md §4「接續」）。索引級內容成長極慢，這些只是防怪檔的保險。
-const DECISION_INDEX_MAX = 80;       // decisions/ 索引筆數（超過只列最近 N 筆）
-const CONTEXT_TERMS_MAX = 120;       // CONTEXT.md 詞條名清單上限
+const DECISION_LIST_MAX = 20;        // decisions/ ≤ 此數才逐筆列標題；超過只給「總數＋最近編號範圍＋查法」
 const HISTORY_MAX_LINES = 40;        // HISTORY.md（最新在最上，取檔案開頭即最近輪次）
 const MAP_INDEX_MAX_LINES = 55;      // MAP.md 只注入「模組索引」表；其餘章節同樣走導航靠 Read
 const SUMMARY_MAX_CHARS = 9000;      // 總量 failsafe：runtime 10k 字元門檻的安全線，超線硬截保可見
@@ -149,21 +150,21 @@ function buildMapSection(base, root) {
   } catch { return null; } // fail-open
 }
 
-// CONTEXT.md 導航：只列詞條名（`- **詞**：` 形，fallback ## 標題），內文由置頂指令引導 Read。
+// CONTEXT.md 導航：只給「多少行、多少詞條」，詞條名與內文一律由置頂指令引導 Read 全文。
+// 詞條數兩種寫法都算，取較大者：專案可能用 `- **詞**：` 條列，也可能用 `## 詞` 分節；
+// 只認一種會誤判——條列式檔案常有 `##` 分組標題，分節式檔案內文也常有偶然的 `- **粗體**`。
 function buildContextSection(base) {
   const raw = readTextSafe(join(base, 'CONTEXT.md'));
   if (!raw || !raw.trim()) return null;
   const lineCount = raw.split(/\r?\n/).length;
-  let names = [...raw.matchAll(/^\s*-\s*\*\*(.+?)\*\*/gm)].map(m => m[1].trim());
-  if (!names.length) names = [...raw.matchAll(/^##\s+(.+)$/gm)].map(m => m[1].trim());
-  const shown = names.slice(0, CONTEXT_TERMS_MAX);
-  const lines = [`【專案詞彙與業務規則導航（.constellation/CONTEXT.md，全文 ${lineCount} 行，內文請 Read 原檔）】`];
-  if (shown.length) {
-    lines.push('  ' + shown.join('、') + (names.length > shown.length ? `、…等共 ${names.length} 條` : ''));
-  } else {
-    lines.push('  （非詞條格式，無法列清單——請直接 Read 原檔）');
-  }
-  return { text: lines.join('\n'), lineCount };
+  const bulletTerms = [...raw.matchAll(/^\s*-\s*\*\*(.+?)\*\*/gm)].length;
+  const headingTerms = [...raw.matchAll(/^##\s+(.+)$/gm)].length;
+  const termCount = Math.max(bulletTerms, headingTerms);
+  const scale = termCount ? `共 ${lineCount} 行、${termCount} 個詞條` : `共 ${lineCount} 行`;
+  return {
+    text: `【專案詞彙（.constellation/CONTEXT.md）】${scale}，動手前請 Read 全文。`,
+    lineCount,
+  };
 }
 
 function buildDecisionsSection(base) {
@@ -184,10 +185,18 @@ function buildDecisionsSection(base) {
     return m ? `${f.replace(/\.md$/i, '')}：${m[1].trim()}` : f.replace(/\.md$/i, '');
   };
 
-  const lines = [`【決策記錄導航（.constellation/decisions/）】共 ${files.length} 筆（編號越大越新，內文請 Read 原檔）：`];
-  const indexFiles = files.slice(-DECISION_INDEX_MAX);
-  if (indexFiles.length < files.length) lines.push(`  （僅列最近 ${indexFiles.length} 筆，其餘見目錄）`);
-  for (const f of indexFiles) lines.push(`  - ${titleOf(f)}`);
+  const lines = [`【決策記錄（.constellation/decisions/）】共 ${files.length} 筆，編號越大越新，內文請 Read 原檔。`];
+  if (files.length <= DECISION_LIST_MAX) {
+    // 小專案：全部列得完就照舊逐筆列標題，沒有截斷問題，也省一趟查目錄。
+    for (const f of files) lines.push(`  - ${titleOf(f)}`);
+  } else {
+    // 大專案：只給座標。刻意不試圖解析「第幾輪」——決議檔沒有可靠的機讀輪次邊界，
+    // 硬猜會給出假精確；用固定的「最近 N 筆」當範圍即可，反正真要看還是得列目錄。
+    const numOf = f => (f.match(/^\d+/) || [f])[0];
+    const recent = files.slice(-DECISION_LIST_MAX);
+    lines.push(`  最近 ${recent.length} 筆：${numOf(recent[0])}~${numOf(recent[recent.length - 1])}`);
+    lines.push('  查法：列目錄 `ls .constellation/decisions/` ／ 找特定主題用關鍵字搜檔名與內文');
+  }
   return { text: lines.join('\n'), count: files.length };
 }
 
@@ -266,11 +275,18 @@ function buildSummary(cwd) {
   // 置頂強制讀檔指令：知識本體不在注入裡——放最前面，任何情況下最先被看到。
   if (map || ctx || dec) {
     const reads = [];
-    // 地圖排第一：動手前最先要知道的是「東西在哪」，其次才是詞彙與過往決策。
+    // 地圖排第一：動手前最先要知道的是「東西在哪」，其次才是詞彙。
     if (map) reads.push(`.constellation/MAP.md（專案現況地圖，全文 ${map.lineCount} 行）`);
     if (ctx) reads.push(`.constellation/CONTEXT.md（專案詞彙與業務規則，全文 ${ctx.lineCount} 行）`);
-    if (dec) reads.push(`.constellation/decisions/ 最近幾筆（共 ${dec.count} 筆決策，編號越大越新）`);
-    lines.unshift(`【開工前必讀】本專案知識軌不隨開場注入內文，動手任何工作前先 Read：${reads.join('＋')}。下方僅為導航索引。`);
+    const parts = ['【開工前必讀】本專案知識軌不隨開場注入內文，下方只是座標。'];
+    if (reads.length) parts.push(`動手任何工作前先 Read：${reads.join('＋')}。`);
+    // 決議改成「講查法」而不是列清單：開場看不到清單≠沒有那筆決議，這句是防止模型
+    // 因為索引消失就自行推論「本專案沒相關決議」而繞過既有拍板。
+    if (dec) {
+      parts.push(`決議在 .constellation/decisions/，共 ${dec.count} 筆，編號越大越新；` +
+        '要查特定主題請列目錄或用關鍵字搜尋（檔名與內文都搜），不要假設沒看到就不存在。');
+    }
+    lines.unshift(parts.join(''));
   }
   if (map) lines.push(map.text); // 票況之後、知識軌之前：先知道東西在哪，再談脈絡
   if (hist) lines.push(hist.text);
