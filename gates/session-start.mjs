@@ -83,14 +83,58 @@ function capLines(text, max, refPath) {
   return [...lines.slice(0, max), `…（其餘 ${lines.length - max} 行略，全文見 ${refPath}）`];
 }
 
-// MAP.md 的同步點標記：值可能是佔位字串（樣板剛落地、還沒跑過同步），所以抽出來後
-// 還要驗形狀——只有 hex 樣的才當真 sha，PLACEHOLDER_COMMIT／<sha>／TODO 一律視為「尚未標記」。
-const MAP_SYNCED_AT_RE = /<!--\s*constellation-map-synced-at\s*:\s*(\S+?)\s*-->/i;
 const looksLikeSha = s => /^[0-9a-f]{4,40}$/i.test(s);
+const MAP_REL_PATH = '.constellation/MAP.md';
+const DEAD_PATH_MAX_REPORT = 5; // 死路徑一次最多點名幾條（其餘只給總數，免得洗掉後面的模組索引）
 
-// 過期偵測：地圖記的是「什麼東西在哪個路徑」，不記檔案內容，所以純改內容不會讓它過期——
-// 只有新增（A）／刪除（D）／改名（R）才會讓「在哪」這件事失準，故 --diff-filter=ADR。
-// 這樣同步點放久一點也不會被日常改 code 洗出滿江紅的假警報。
+// 過期基準：地圖自己「最後一次被 commit 的那個 commit」，由閘門自己算，不看任何人工標記
+// （DESIGN.md §4）。人工 sha 要求「改地圖」與「改標記」每次都同時做到，漏一次基準就永遠停在
+// 過去、警示從此常亮，而天天亮的警示等於沒亮。回 null 代表「此刻不必比對」：
+// 地圖有未提交改動＝正在校對，拿任何歷史 commit 當基準都會報出其實已經處理掉的假警報。
+function mapBaselineCommit(root) {
+  const git = args => execFileSync('git', ['-C', root, ...args],
+    { maxBuffer: 1 << 20, stdio: ['ignore', 'pipe', 'ignore'] }).toString('utf8');
+  try {
+    if (git(['status', '--porcelain', '--', MAP_REL_PATH]).trim()) return null;
+    const sha = git(['log', '-1', '--format=%H', '--', MAP_REL_PATH]).trim();
+    return looksLikeSha(sha) ? sha : null; // 從未被 commit（新落檔的地圖）→ 空字串 → 不比對
+  } catch { return null; } // 非 git repo／git 缺席 → 這個檢查整個略過，不擋不吵
+}
+
+// 第①道：死路徑點名。地圖寫的路徑若檔案已經不在，那是**確定**過期，而且指得到是哪一行——
+// 這是全套機制裡唯一能精準到行、且修完就會熄的檢查（第②道只能說「某處可能過期」）。
+// 零誤報優先：只認「去掉尾斜線後仍含 /」的字串。這條規則同時擋掉三類非路徑的反引號內容——
+// 指令（含空格）、資料表名與單一檔名（無 /）、以及地圖裡常見的省略寫法（`overview/` 這種
+// 承前省略前綴的片段，去尾斜線後就不含 / 了）；含 glob 的樣式無法用 existsSync 驗，一併略過。
+function mapDeadPaths(raw, root) {
+  const dead = [];
+  const seen = new Set();
+  const topExists = new Map(); // 頂層片段的存在性快取，同一份地圖大量重複 app/、lib/、scripts/
+  const lines = raw.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    for (const m of lines[i].matchAll(/`([^`\r\n]+)`/g)) {
+      const rel = m[1].trim().replace(/^\.\//, '').replace(/[/\\]+$/, '');
+      if (!rel.includes('/')) continue;                 // 去尾斜線後仍要有目錄分隔才當路徑
+      if (/[\s*?<>|"]/.test(rel)) continue;             // 指令與 glob 樣式驗不了
+      if (rel.startsWith('/') || /^[a-z]+:/i.test(rel)) continue; // 絕對路徑／URL／協定字串不驗
+      // 只驗「從 repo 根寫得起」的路徑：頂層片段必須真的存在於根。地圖為了精簡大量使用承前
+      // 省略（同一列先寫 `app/api/activity/`，後面就接 `[id]/_lib/`、`admin/tokens/`、
+      // `.../callcenter/projects/`），這些片段單看都含 /，卻不是從根解析得了的路徑——
+      // 用「頂層存在」一次擋掉整類。代價是整個頂層目錄被搬走時這道不報（少報優於誤報）。
+      const top = rel.slice(0, rel.indexOf('/'));
+      if (!topExists.has(top)) topExists.set(top, existsSync(join(root, top)));
+      if (!topExists.get(top)) continue;
+      if (seen.has(rel)) continue;
+      seen.add(rel);
+      if (!existsSync(join(root, rel))) dead.push(`第 ${i + 1} 行 \`${m[1].trim()}\``);
+    }
+  }
+  return dead;
+}
+
+// 第②道：結構變動提示。地圖第一段記的是「什麼東西在哪個路徑」，只有新增（A）／刪除（D）／
+// 改名（R）會讓「在哪」失準，故 --diff-filter=ADR；純改內容不動它，日常改 code 不會洗出假警報。
+// 代價（DESIGN.md §4 已載明）：資料表口徑／缺口／地雷那三段是語意，這道測不出來。
 function mapStaleWarning(root, sha) {
   let out;
   try {
@@ -109,8 +153,8 @@ function mapStaleWarning(root, sha) {
     changed.push(p);
   }
   if (!changed.length) return null;
-  return `⚠ 地圖可能已過期：上次同步（${sha.slice(0, 7)}）之後有 ${changed.length} 個檔案新增/刪除/改名` +
-    `（例：${changed.slice(0, 3).join('、')}）。動工前請先核對 MAP.md。`;
+  return `· 地圖最後更新（${sha.slice(0, 7)}）之後有 ${changed.length} 個檔案新增/刪除/改名` +
+    `（例：${changed.slice(0, 3).join('、')}）——模組索引可能少了東西，動工前順手核對。`;
 }
 
 // 專案現況地圖導航：只注入「模組索引」那一章（東西在哪、進哪個檔改），資料表／已知資料缺口／
@@ -138,13 +182,23 @@ function buildMapSection(base, root) {
       ? capLines(body.join('\n'), MAP_INDEX_MAX_LINES, '.constellation/MAP.md')
       : ['  （MAP.md 尚無模組索引章節——請直接 Read 原檔）'];
 
-    const m = raw.match(MAP_SYNCED_AT_RE);
-    const sha = m && looksLikeSha(m[1]) ? m[1] : null;
-    const note = sha ? mapStaleWarning(root, sha)
-      : '· 地圖尚未標記同步點（缺 constellation-map-synced-at），無法判斷是否過期。';
+    // 兩道過期檢查（DESIGN.md §4）。死路徑排在結構提示前面：它是確定的、且指得到哪一行，
+    // 該優先被看到；兩者都放表格前面，免得被 55 行模組索引蓋掉。
+    const notes = [];
+    const dead = mapDeadPaths(raw, root);
+    if (dead.length) {
+      const shownDead = dead.slice(0, DEAD_PATH_MAX_REPORT).join('、');
+      const more = dead.length > DEAD_PATH_MAX_REPORT ? `…等 ${dead.length} 處` : '';
+      notes.push(`⚠ 地圖有 ${dead.length} 個路徑已不存在（${shownDead}${more}）——這幾行是確定過期，動工前先修掉。`);
+    }
+    const sha = mapBaselineCommit(root);
+    if (sha) {
+      const stale = mapStaleWarning(root, sha);
+      if (stale) notes.push(stale);
+    }
 
     const lines = ['【專案現況地圖（.constellation/MAP.md，完整內容含資料表、已知資料缺口與地雷請 Read 原檔）】'];
-    if (note) lines.push(note); // 警告放表格前面，免得被 55 行索引蓋掉看不見
+    lines.push(...notes);
     lines.push(...shown);
     return { text: lines.join('\n'), lineCount };
   } catch { return null; } // fail-open
