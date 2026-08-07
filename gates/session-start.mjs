@@ -85,7 +85,8 @@ function capLines(text, max, refPath) {
 
 const looksLikeSha = s => /^[0-9a-f]{4,40}$/i.test(s);
 const MAP_REL_PATH = '.constellation/MAP.md';
-const DEAD_PATH_MAX_REPORT = 5; // 死路徑一次最多點名幾條（其餘只給總數，免得洗掉後面的模組索引）
+const DEAD_PATH_MAX_REPORT = 5;       // 死路徑一次最多點名幾條（其餘只給總數，免得洗掉後面的模組索引）
+const SEMANTIC_DRIFT_MAX_REPORT = 4;  // 語意漂移是可能級提示，比死路徑更該克制，報更少
 
 // 過期基準：地圖自己「最後一次被 commit 的那個 commit」，由閘門自己算，不看任何人工標記
 // （DESIGN.md §4）。人工 sha 要求「改地圖」與「改標記」每次都同時做到，漏一次基準就永遠停在
@@ -106,17 +107,47 @@ function mapBaselineCommit(root) {
 // 零誤報優先：只認「去掉尾斜線後仍含 /」的字串。這條規則同時擋掉三類非路徑的反引號內容——
 // 指令（含空格）、資料表名與單一檔名（無 /）、以及地圖裡常見的省略寫法（`overview/` 這種
 // 承前省略前綴的片段，去尾斜線後就不含 / 了）；含 glob 的樣式無法用 existsSync 驗，一併略過。
+// 反引號內外都抽：地圖的缺口／地雷段大量在括號裡裸寫來源檔（「（data-health.md；scripts/db/x.mjs）」），
+// 只認反引號會漏掉一半。誤報由呼叫端的「頂層須存在於 repo 根」把關——那道足以擋掉日期
+// （2026/08/04 的頂層 2026 不存在）等偶然含斜線的字串。
+const PATH_TOKEN_RE = /[\w.@()[\]{}~-]+(?:\/[\w.@()[\]{}~-]+)+\/?/g;
+// 裸檔名（無目錄）：地圖第二段的「定義在哪」直接寫 migration 檔名不寫路徑，只抽路徑會整段抓不到。
+// 純比對用，不驗存在性（不知道它在哪）；泛用檔名排除掉——一個 repo 裡幾十個 route.ts，命中無意義。
+const FILE_TOKEN_RE = /\b[\w.@-]+\.[a-z0-9]{1,6}\b/gi;
+const GENERIC_FILENAMES = /^(index|route|page|layout|types?|utils?|config|main|app|db|schema)\.[a-z0-9]+$/i;
+
+// 抽出一行裡的路徑 token（含目錄分隔、可從 repo 根解析者）。
+function extractPaths(line) {
+  const out = [];
+  for (const m of line.matchAll(PATH_TOKEN_RE)) {
+    // glob 樣式（`app/api/_lib/stats-*.ts`）會被切成 `app/api/_lib/stats-` 這種前綴，
+    // 前綴當然「不存在」，直接拿去驗就是誤報。但整段丟掉又太可惜——退一層取父目錄仍然有效：
+    // 目錄沒了代表這行確實過期，目錄有變動代表這行該複驗。
+    const next = line[m.index + m[0].length];
+    if (next === '*' || next === '?') {
+      const cut = m[0].lastIndexOf('/');
+      const dir = cut > 0 ? m[0].slice(0, cut) : '';
+      if (dir.includes('/')) out.push(dir);
+      continue;
+    }
+    const rel = m[0].replace(/^\.\//, '').replace(/[/\\]+$/, '');
+    if (!rel.includes('/')) continue;                           // 去尾斜線後仍要有目錄分隔
+    if (/[-._]$/.test(rel)) continue;                           // 以連字號／點／底線收尾＝被切斷了
+    if (rel.startsWith('/') || /^[a-z]+:/i.test(rel)) continue; // 絕對路徑／URL／協定字串不驗
+    out.push(rel);
+  }
+  return out;
+}
+
+// 第①道：死路徑點名。地圖寫的路徑若檔案已經不在，那是**確定**過期，而且指得到是哪一行——
+// 這是全套機制裡唯一能精準到行、且修完就會熄的檢查（第②道只能說「某處可能過期」）。
 function mapDeadPaths(raw, root) {
   const dead = [];
   const seen = new Set();
   const topExists = new Map(); // 頂層片段的存在性快取，同一份地圖大量重複 app/、lib/、scripts/
   const lines = raw.split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
-    for (const m of lines[i].matchAll(/`([^`\r\n]+)`/g)) {
-      const rel = m[1].trim().replace(/^\.\//, '').replace(/[/\\]+$/, '');
-      if (!rel.includes('/')) continue;                 // 去尾斜線後仍要有目錄分隔才當路徑
-      if (/[\s*?<>|"]/.test(rel)) continue;             // 指令與 glob 樣式驗不了
-      if (rel.startsWith('/') || /^[a-z]+:/i.test(rel)) continue; // 絕對路徑／URL／協定字串不驗
+    for (const rel of extractPaths(lines[i])) {
       // 只驗「從 repo 根寫得起」的路徑：頂層片段必須真的存在於根。地圖為了精簡大量使用承前
       // 省略（同一列先寫 `app/api/activity/`，後面就接 `[id]/_lib/`、`admin/tokens/`、
       // `.../callcenter/projects/`），這些片段單看都含 /，卻不是從根解析得了的路徑——
@@ -126,7 +157,7 @@ function mapDeadPaths(raw, root) {
       if (!topExists.get(top)) continue;
       if (seen.has(rel)) continue;
       seen.add(rel);
-      if (!existsSync(join(root, rel))) dead.push(`第 ${i + 1} 行 \`${m[1].trim()}\``);
+      if (!existsSync(join(root, rel))) dead.push({ line: i + 1, rel });
     }
   }
   return dead;
@@ -135,19 +166,31 @@ function mapDeadPaths(raw, root) {
 // 第②道：結構變動提示。地圖第一段記的是「什麼東西在哪個路徑」，只有新增（A）／刪除（D）／
 // 改名（R）會讓「在哪」失準，故 --diff-filter=ADR；純改內容不動它，日常改 code 不會洗出假警報。
 // 代價（DESIGN.md §4 已載明）：資料表口徑／缺口／地雷那三段是語意，這道測不出來。
-function mapStaleWarning(root, sha) {
+// baseline..HEAD 的變更清單，一次拿齊給第②③道共用。git 在大 repo 上每次呼叫都是 2~3 秒的
+// 固定成本（本機實測），而這是每場 session 都要跑的 hook——同樣的 diff 呼叫兩次是純浪費。
+// 回傳 [{ status, path }]；status 首字母 A/D/R/M 由第②道自行過濾。
+function mapChangedFiles(root, sha) {
   let out;
   try {
-    out = execFileSync('git', ['-C', root, 'diff', '--name-status', `${sha}..HEAD`, '--diff-filter=ADR'],
+    out = execFileSync('git', ['-C', root, 'diff', '--name-status', `${sha}..HEAD`],
       { maxBuffer: 1 << 20, stdio: ['ignore', 'pipe', 'ignore'] }).toString('utf8');
   } catch { return null; } // sha 不存在／非 git repo／git 缺席 → 這個檢查整個略過，不擋不吵
-  const changed = [];
+  const rows = [];
   for (const line of out.split(/\r?\n/)) {
     if (!line.trim()) continue;
     const cols = line.split('\t');
     const p = cols[cols.length - 1].trim(); // R 是「舊路徑\t新路徑」，取末欄即改名後的位置
     if (!p) continue;
     if (/^(\.constellation|node_modules|dist|test-results|\.git)\//.test(p)) continue; // 地圖不記這些
+    rows.push({ status: cols[0].trim(), path: p });
+  }
+  return rows;
+}
+
+function mapStaleWarning(rows, sha) {
+  const changed = [];
+  for (const { status, path: p } of rows) {
+    if (!/^[ADR]/.test(status)) continue; // 只看新增／刪除／改名
     // 文件性目錄底下的純文字檔搬來搬去不影響「程式碼在哪」，不值得為它報過期。
     if (/(^|\/)(docs|specs)\//i.test(p) && /\.(md|txt|json)$/i.test(p)) continue;
     changed.push(p);
@@ -155,6 +198,58 @@ function mapStaleWarning(root, sha) {
   if (!changed.length) return null;
   return `· 地圖最後更新（${sha.slice(0, 7)}）之後有 ${changed.length} 個檔案新增/刪除/改名` +
     `（例：${changed.slice(0, 3).join('、')}）——模組索引可能少了東西，動工前順手核對。`;
+}
+
+// 第③道：語意段落的來源歸因。第二～四段（資料表口徑／缺口／地雷）記的是語意，「內容改了但
+// 檔名沒變」時第①②道都測不出來——機器讀不懂語意，這是硬限制，繞不過去。
+// 能做的是退一步問「這條的依據還是原樣嗎」：這些條目幾乎都寫了自己的來源（migration 檔名、
+// 腳本路徑、報告檔），來源在地圖更新後被動過，描述就有相當機率跟著失準。於是把「複驗整段
+// 兩百多行」壓縮成「複驗這幾行」。**這是可能級提示，不是確定級**——來源動過不等於描述就錯，
+// 但沒動過的行幾乎可以放心跳過，省下的正是複驗成本。
+// 模組索引那段排除在外：它記路徑不記語意，內容變動本來就不該讓它過期（由第①②道負責）。
+function mapSemanticDrift(raw, root, rows, skipFrom, skipTo, deadLines) {
+  const changedPaths = new Set();
+  const changedFiles = new Set();
+  const changedDirs = new Set(); // 變更檔案的所有祖先目錄，讓「地圖寫目錄」也能 O(1) 命中
+  for (const { path: p } of rows) {
+    changedPaths.add(p);
+    changedFiles.add(p.slice(p.lastIndexOf('/') + 1));
+    for (let i = p.indexOf('/'); i > 0; i = p.indexOf('/', i + 1)) changedDirs.add(p.slice(0, i));
+  }
+  if (!changedPaths.size) return null;
+
+  const hits = [];
+  const topExists = new Map();
+  const lines = raw.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    if (i >= skipFrom && i < skipTo) continue; // 模組索引段
+    if (deadLines.has(i)) continue; // 已被第①道判定為確定過期，不必再用可能級提示重報一次
+    const line = lines[i];
+    let hit = null;
+    let hasRealPath = false; // 這一行有沒有寫出「可從 repo 根解析」的完整路徑
+    for (const rel of extractPaths(line)) {
+      const top = rel.slice(0, rel.indexOf('/'));
+      if (!topExists.has(top)) topExists.set(top, existsSync(join(root, top)));
+      if (!topExists.get(top)) continue; // 承前省略片段，不算指名了路徑
+      hasRealPath = true;
+      if (changedPaths.has(rel) || changedDirs.has(rel)) { hit = rel; break; }
+    }
+    // 裸檔名只在「這行沒指名任何路徑」時才退而求其次——跨目錄同名檔會誤命中（同一個 repo 裡
+    // 好幾支 activity.ts，改到 A 目錄那支卻報講 B 目錄那支的行），而已經寫出路徑的行不需要猜。
+    if (!hit && !hasRealPath) {
+      for (const m of line.matchAll(FILE_TOKEN_RE)) {
+        const f = m[0];
+        if (GENERIC_FILENAMES.test(f)) continue;
+        if (changedFiles.has(f)) { hit = f; break; }
+      }
+    }
+    if (hit) hits.push(`第 ${i + 1} 行 \`${hit}\``);
+  }
+  if (!hits.length) return null;
+  const shown = hits.slice(0, SEMANTIC_DRIFT_MAX_REPORT).join('、');
+  const more = hits.length > SEMANTIC_DRIFT_MAX_REPORT ? `…等 ${hits.length} 行` : '';
+  return `· 語意段落有 ${hits.length} 行的來源在地圖更新後動過（${shown}${more}）` +
+    `——資料表口徑／缺口／地雷是機器讀不懂的，請逐條複驗這幾行還算不算數。`;
 }
 
 // 專案現況地圖導航：只注入「模組索引」那一章（東西在哪、進哪個檔改），資料表／已知資料缺口／
@@ -170,8 +265,9 @@ function buildMapSection(base, root) {
     // 章節標題可能帶編號與括號補述（「## 一、模組索引（開場注入用…）」），故只認關鍵字不認整串。
     const start = all.findIndex(l => /^##\s.*模組索引/.test(l.trim()));
     let body = [];
+    let end = start; // 模組索引段的行範圍［start, end），第③道要拿它排除這一段
     if (start >= 0) {
-      let end = all.length;
+      end = all.length;
       for (let i = start + 1; i < all.length; i++) {
         if (/^##\s/.test(all[i])) { end = i; break; } // 下一個二級標題為界（### 子節仍算本章）
       }
@@ -182,19 +278,23 @@ function buildMapSection(base, root) {
       ? capLines(body.join('\n'), MAP_INDEX_MAX_LINES, '.constellation/MAP.md')
       : ['  （MAP.md 尚無模組索引章節——請直接 Read 原檔）'];
 
-    // 兩道過期檢查（DESIGN.md §4）。死路徑排在結構提示前面：它是確定的、且指得到哪一行，
-    // 該優先被看到；兩者都放表格前面，免得被 55 行模組索引蓋掉。
+    // 三道過期檢查（DESIGN.md §4），一律放表格前面免得被 55 行模組索引蓋掉。
+    // 順序＝確定性由高到低：死路徑（確定過期、指得到行）→ 結構變動 → 語意漂移（可能級）。
     const notes = [];
     const dead = mapDeadPaths(raw, root);
     if (dead.length) {
-      const shownDead = dead.slice(0, DEAD_PATH_MAX_REPORT).join('、');
+      const shownDead = dead.slice(0, DEAD_PATH_MAX_REPORT).map(d => `第 ${d.line} 行 \`${d.rel}\``).join('、');
       const more = dead.length > DEAD_PATH_MAX_REPORT ? `…等 ${dead.length} 處` : '';
       notes.push(`⚠ 地圖有 ${dead.length} 個路徑已不存在（${shownDead}${more}）——這幾行是確定過期，動工前先修掉。`);
     }
     const sha = mapBaselineCommit(root);
-    if (sha) {
-      const stale = mapStaleWarning(root, sha);
+    const rows = sha ? mapChangedFiles(root, sha) : null; // 一次 diff，②③共用
+    if (rows && rows.length) {
+      const stale = mapStaleWarning(rows, sha);
       if (stale) notes.push(stale);
+      const deadLines = new Set(dead.map(d => d.line - 1)); // 轉 0-based 供第③道去重
+      const drift = mapSemanticDrift(raw, root, rows, start, end, deadLines);
+      if (drift) notes.push(drift);
     }
 
     const lines = ['【專案現況地圖（.constellation/MAP.md，完整內容含資料表、已知資料缺口與地雷請 Read 原檔）】'];
