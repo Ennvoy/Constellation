@@ -12,6 +12,8 @@
 // glob `<票號>*.md`，唯一命中才用；零命中或多重命中一律報錯並列出候選，不猜。
 // 全部指令 exit 0 才落一筆證據（時間戳＋各指令＋exit code＋stdout 尾 15 行）；任一失敗：印該指令
 // 完整輸出、不寫證據、exit 1（或斷路器觸發時 exit 2）——證據不能靠人手填，必須是這支 runner 親自跑出來的。
+// 證據筆另附一行各指令耗時（「- 耗時：合計 Ns｜…」，獨立行、不帶反引號、不含「（exit」）——close-gate／
+// commit-gate 的證據行解析（COMMAND_LINE_RE 行尾錨定「（exit N）」）天然忽略本行；儀表用途，不參與簽章。
 //
 // R1 證據防偽：光「不能手填時間戳」不夠——時間戳本身也是純文字，手改票檔一樣能塞一個 24 小時內的
 // ISO 字串。真正的防偽來自簽章：對「ISO 時間戳＋票檔相對路徑（或 "ship"）＋全部指令串接＋輸出尾行
@@ -296,7 +298,9 @@ function main() {
   const timeoutMs = (Number.isFinite(timeoutSec) && timeoutSec > 0 ? timeoutSec : 600) * 1000;
 
   const results = [];
+  const scopeStartMs = Date.now();
   for (const cmd of commands) {
+    const cmdStartMs = Date.now();
     const r = spawnSync(cmd, {
       cwd,
       shell: true,
@@ -305,12 +309,13 @@ function main() {
       maxBuffer: 20 * 1024 * 1024,
       timeout: timeoutMs,
     });
+    const durSec = Math.round((Date.now() - cmdStartMs) / 1000);
     const outDecoded = decodeOutput(r.stdout);
     const errDecoded = decodeOutput(r.stderr);
     const timedOut = r.error && r.error.code === 'ETIMEDOUT';
     const exitCode = r.error ? 1 : (r.status ?? 1);
     if (exitCode !== 0) {
-      console.error(`驗證失敗：\`${cmd}\`（exit ${exitCode}）`);
+      console.error(`驗證失敗：\`${cmd}\`（exit ${exitCode}，${durSec}s）`);
       if (timedOut) console.error(`逾時：超過 ${timeoutMs / 1000} 秒未結束，已強制終止該指令。`);
       if (r.error) console.error(`spawn 錯誤：${r.error.message}`);
       console.error('--- stdout ---');
@@ -331,7 +336,7 @@ function main() {
     const realTailText = tail(outDecoded.text, 15);
     // 註記獨立於 fenced block 之外（不混進去）：簽章的「輸出尾行」只認 block 內的真實內容，
     // 註記文字本身絕不能被誤當成輸出內容去參與簽章——兩者職責分開，關票刷卡機解析時才不會混淆。
-    results.push({ cmd, realTailText, note: outDecoded.note, realLastLine: lastNonBlankLine(realTailText) });
+    results.push({ cmd, durSec, realTailText, note: outDecoded.note, realLastLine: lastNonBlankLine(realTailText) });
   }
 
   // 全部通過 → 斷路器歸零 → 落證據（含簽章）
@@ -348,6 +353,10 @@ function main() {
       entryLines.push('    ```');
     }
   }
+  // 耗時行：獨立一行、不帶反引號、不含「（exit」——close-gate／commit-gate 的證據行解析
+  // （COMMAND_LINE_RE 行尾錨定「（exit N）」）天然忽略本行；儀表用途，不參與下方簽章運算。
+  const totalSec = Math.round((Date.now() - scopeStartMs) / 1000);
+  entryLines.push(`  - 耗時：合計 ${totalSec}s｜${results.map(r => `${r.cmd} ${r.durSec}s`).join('｜')}`);
 
   const secret = readSecret();
   if (secret) {
@@ -371,16 +380,16 @@ function main() {
     const raw = stripBom(readFileSync(ticketPath, 'utf8'));
     writeFileSync(ticketPath, appendEvidence(raw, entryText), 'utf8');
     const title = ticketTitle(raw) || basename(ticketPath);
-    console.log(`驗證通過（${title}）：${results.length} 項指令全數 exit 0，證據已寫入 ${ticketPath}`);
+    console.log(`驗證通過（${title}）：${results.length} 項指令全數 exit 0（總耗時 ${totalSec}s），證據已寫入 ${ticketPath}`);
   } else {
     const shipEvidencePath = join(cwd, '.constellation', 'ship-evidence.md');
     const existing = existsSync(shipEvidencePath)
       ? stripBom(readFileSync(shipEvidencePath, 'utf8'))
       : '# Constellation 出貨驗證證據\n\n> 由 `verify-runner.mjs --scope ship` 寫入，證據筆格式與票內完全相同（見 DESIGN.md §5）。\n';
     writeFileSync(shipEvidencePath, appendEvidence(existing, entryText), 'utf8');
-    console.log(`出貨驗證通過：${results.length} 項指令（test＋journey 全量）全數 exit 0，證據已寫入 ${shipEvidencePath}`);
+    console.log(`出貨驗證通過：${results.length} 項指令（test＋journey 全量）全數 exit 0（總耗時 ${totalSec}s），證據已寫入 ${shipEvidencePath}`);
   }
-  for (const r of results) console.log(`  - ${r.cmd}（exit 0）`);
+  for (const r of results) console.log(`  - ${r.cmd}（exit 0，${r.durSec}s）`);
   process.exit(0);
 }
 
