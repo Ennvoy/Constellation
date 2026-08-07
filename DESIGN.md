@@ -150,7 +150,7 @@ zone: src/auth/**, tests/auth/**   # 檔案界線（平行時互斥用）
 ## 6. 驗證（三道保險＋分級）
 
 1. **測試先行（輕量 TDD）**：動手前先跟使用者確認過的 seam 上寫失敗測試，再實作轉綠。垂直切片（一測試→一實作），禁 tautological test（期望值與實作同算法）、禁 mock 冒充真依賴——真依賴未 ready 標 blocked。
-2. **關票實跑**：真鏈路——涉 UI 用 Playwright 真點擊、涉 API 真打、涉資料真查 DB；資料類驗證走「真 create API seed → UI → 真 API → 真 DB 讀回」。證據落票，刷卡機把關。
+2. **關票實跑**：真鏈路——涉 UI 用 Playwright 真點擊、涉 API 真打、涉資料真查 DB；資料類驗證走「真 create API seed → UI → 真 API → 真 DB 讀回」。測試資料帶可識別記號、清理只清自己產生的資料、禁全庫／全表清除當清理手段（verification-playbook「測試資料衛生」）。證據落票，刷卡機把關。
 3. **出貨獨立審**：ship 前另開乾淨 context 審一次，**兩軸平行、分開報告、不合併排名**：Standards 軸（code 品質，repo 規範優先、Fowler smells 為 baseline）＋ Spec 軸（與票的驗收條件逐條對照）。取代 Flow 的五層對抗。
 
 **分級**：逐票跑票內「驗證指令」縮圈清單（weave 寫定；無則 `commands.test` 全量——測試量隨輪增長，票級恆全量會讓驗證時間隨專案越拖越長，縮圈把票級成本鎖在該票影響面）＋該票驗收條件的實跑檢查；`commands.journey`（全量 journey）與 `commands.test` 完整回歸留到 ship 一次跑齊、不受縮圈影響——驗證 runner 以 `--scope ticket|ship` 區分兩級。審查產出固定三段報告（做了什麼／驗了什麼／證據在哪），發現分**阻擋級**（修完才出貨）與**建議級**。阻擋級修復後，除受影響範圍複驗綠燈外，並**針對該發現複審**確認修法成立（不重跑全量審查）。**涉權限／金流／個資的任務**（訪談收尾標記於 grill-close.md）兩軸自動加開第三軸——**security 紅軍**（獨立 context 以攻擊者視角實測攻擊面）；一般任務不加開，平時速度不變——審查跟著風險走，不跟著流程走。

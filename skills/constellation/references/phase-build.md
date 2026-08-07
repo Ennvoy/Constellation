@@ -43,7 +43,7 @@
   - 驗收條件互相矛盾（照著做會打架）。
   - 要動資料結構（schema 變更）。
   - 涉及權限、金流、個資 scope。
-  - 破壞性 DB 操作（`DROP`／`TRUNCATE`／無 `WHERE` 的 `DELETE`/`UPDATE`）。
+  - 破壞性 DB 操作（`DROP`／`TRUNCATE`／無 `WHERE` 的 `DELETE`/`UPDATE`）——包含把這類操作寫進測試的 setup／teardown／清理程式碼（測試執行時一樣會發生；測試資料的記號與清理範圍規則見本檔同目錄 `verification-playbook.md`「測試資料衛生」）。
 - **平行 worker 遇到大事**：那張票標 `blocked` 並寫清楚卡在哪，其餘票繼續做、不用等它；主線把這批裡所有卡住的大事收集起來，一次跟使用者彈窗問清楚——不要每張票各自彈一次窗。
 - **大事拍板後即時落檔**：彈窗拿到的答案屬取捨型拍板 → 當場寫一筆 `.constellation/decisions/NNN-slug.md`（背景＋決定＋原因＋證據，見總控 SKILL.md「拍板即落檔」通則），再回頭繼續實作；只寫進當下對話不落檔，下個 session 就蒸發。
 
