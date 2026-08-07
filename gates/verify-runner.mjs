@@ -111,21 +111,76 @@ function resolveTicketPath(cwd, ticketArg) {
 // 列項格式與證據筆的指令行同款（- `cmd`）；section 存在且至少一條指令就取代 config 的
 // commands.test，否則回空陣列、由呼叫端 fallback 到全量——寧全量勿漏，縮圈永遠是顯式的。
 // 只在 --scope ticket 生效；ship 全量驗證不看這個 section。
-const SCOPED_HEADING_RE = /^##\s*驗證指令.*$/m;
+// ⚠ 三道防呆：本函式最危險的失效方式**不是報錯，是靜默少跑卻照樣蓋章**——產出一份看似完整、
+// 實則沒驗到的簽章證據。紅燈操作者看得見，假合格證看不見。三種踩法都實際發生過：
+//   ① 指令行後面加了說明文字（`- ``cmd``（需先起 server）`）→ 該行不符 SCOPED_CMD_RE 被靜默跳過，
+//      runner 回報「跑 3 條、全數通過」卻不提第 4 條漏了。**唯一會產生假證據的一種，故 fail-stop。**
+//   ② 標題寫成「## 驗證指令的兩點說明」→ 舊的 `.*$` 正則把說明段當成 section，讀出 0 條。
+//   ③ 檔內出現兩個「## 驗證指令」標題（其一為空）→ runner 只讀第一個，另一個無聲失效。
+// ②③ 的後果是 fallback 到 config 全量（比縮圈更嚴、不會漏驗），但操作者會誤以為縮圈生效，故一律出聲。
+const SCOPED_HEADING_RE = /^##[ \t]*驗證指令[ \t]*$/m; // 只認純標題，不吃後綴
+const SCOPED_HEADING_LOOSE_RE = /^##[ \t]*驗證指令.*$/m; // 偵測「像標題但寫壞了」
 const SCOPED_CMD_RE = /^\s*-\s*`(.+)`\s*$/;
+const SCOPED_ITEM_RE = /^\s*-\s+\S/; // section 內的任何列項
 
-function parseScopedCommands(content) {
+function parseScopedCommands(content, ticketPath = '(票檔)') {
+  const heads = content.match(new RegExp(SCOPED_HEADING_RE.source, 'gm')) || [];
+  if (heads.length > 1) {
+    console.error(
+      `Constellation 驗證 runner：擋下——${ticketPath} 有 ${heads.length} 個「## 驗證指令」標題。\n` +
+        `runner 只會讀第一個，其餘無聲失效。請合併成一個；說明文字改用 ### 小標，` +
+        `且小標不要以「驗證指令」開頭。`,
+    );
+    process.exit(1);
+  }
+
   const m = content.match(SCOPED_HEADING_RE);
-  if (!m) return [];
+  if (!m) {
+    const loose = content.match(SCOPED_HEADING_LOOSE_RE);
+    if (loose) {
+      console.warn(
+        `⚠ ${ticketPath} 的「${loose[0].trim()}」帶了後綴文字，不算縮圈清單——這一輪改跑 config 的全量 commands.test。\n` +
+          `  縮圈清單的標題必須剛好是「## 驗證指令」；說明請寫在清單外的 ### 小標底下。`,
+      );
+    }
+    return [];
+  }
+
   const after = m.index + m[0].length;
   const rest = content.slice(after);
   const next = rest.match(/\n##\s/);
   const section = next ? rest.slice(0, next.index) : rest;
   const cmds = [];
+  const bad = [];
   for (const line of section.split(/\r?\n/)) {
     const cm = line.match(SCOPED_CMD_RE);
-    if (cm) cmds.push(cm[1]);
+    if (cm) {
+      cmds.push(cm[1]);
+      continue;
+    }
+    if (SCOPED_ITEM_RE.test(line)) bad.push(line.trim());
   }
+
+  if (bad.length) {
+    console.error(
+      `Constellation 驗證 runner：擋下——${ticketPath} 的「## 驗證指令」清單裡有 ${bad.length} 個列項不是合法指令行。\n` +
+        `這些行會被無聲跳過而少驗，但 runner 仍會回報「全數通過」——產出看似完整、實則沒驗到的簽章證據：\n` +
+        bad.map((b) => `    ${b}`).join('\n') +
+        `\n\n格式規則：整行只能是「- \`指令\`」，收尾反引號後面不得有任何文字（含中文括號說明）。\n` +
+        `說明一律寫在清單外的 ### 小標底下。`,
+    );
+    process.exit(1);
+  }
+
+  if (!cmds.length) {
+    console.error(
+      `Constellation 驗證 runner：擋下——${ticketPath} 有「## 驗證指令」標題，但一條指令都讀不出來。\n` +
+        `本票若不需要縮圈，請把整個 section 刪掉（runner 會自動跑 config 的全量 commands.test）；\n` +
+        `需要縮圈就補上「- \`指令\`」格式的列項。`,
+    );
+    process.exit(1);
+  }
+
   return cmds;
 }
 
@@ -277,7 +332,7 @@ function main() {
   let commands;
   let scopedCount = 0;
   if (scope === 'ticket') {
-    const scoped = parseScopedCommands(stripBom(readFileSync(ticketPath, 'utf8')));
+    const scoped = parseScopedCommands(stripBom(readFileSync(ticketPath, 'utf8')), ticketPath);
     if (scoped.length) {
       commands = scoped;
       scopedCount = scoped.length;
