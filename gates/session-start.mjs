@@ -361,12 +361,6 @@ function buildHistorySection(base) {
     ...capLines(raw, HISTORY_MAX_LINES, '.constellation/HISTORY.md')].join('\n') };
 }
 
-// 專案根沒有 runtime 原生每場必讀的專案地圖時提醒一句（生成留給 ship 收尾提議，不在開場動手）。
-function claudeMdReminder(root) {
-  if (existsSync(join(root, 'CLAUDE.md')) || existsSync(join(root, 'AGENTS.md'))) return null;
-  return '· 提示：專案根尚無 CLAUDE.md／AGENTS.md（runtime 開場必讀的專案地圖）——下次 ship 收尾時可提議生成最小版。';
-}
-
 // repo root 解析：git rev-parse --show-toplevel，失敗 fallback cwd（與 commit-gate.mjs 鏡像）。
 function resolveRepoRoot(cwd) {
   try {
@@ -446,7 +440,6 @@ function buildSummary(cwd) {
   if (hist) lines.push(hist.text);
   if (dec) lines.push(dec.text);
   if (ctx) lines.push(ctx.text);
-  try { const r = claudeMdReminder(root); if (r) lines.push(r); } catch { /* fail-open */ }
   lines.push(`驗證 runner：node "${VERIFY_RUNNER_ABS_PATH}"`);
 
   let summary = lines.join('\n');
