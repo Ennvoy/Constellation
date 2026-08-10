@@ -50,6 +50,8 @@
   - 每題附推薦答案（含理由與代價，白話、不用術語轟人）。
   - **事實不問人**：能讀檔、跑工具、查官方文件得到的答案，agent 自己查；只有真決策才問。
   - **frontier 清空前禁止動手實作**；清空後仍須使用者確認才進下一步。
+  - **詞彙挑戰**：使用者用詞與 CONTEXT.md 既有定義衝突、或一詞多義時，當場點出並問清；模糊詞當場提議定案詞、其餘列 avoid——詞彙表是主動防漂移的工具，不是被動記錄。
+- **邏輯原型繞道**：frontier 題若「文字選項講不清、且選錯返工代價高」（典型：狀態流程先 A 再 B 該如何、資料形狀裝不裝得下某案例），先產單檔 HTML 拋棄式樣品（純域語言、狀態面板＋每動作一鈕＋2–3 個情境走查）給使用者實際玩過，再照常彈窗拍板；結論落 decisions/（證據＝原型結論），樣品放暫存、閱後即焚、不進 repo。細節在 `logic-prototype.md`。
 - 訪談中的決議**即時落檔**（不批次）：詞彙進 CONTEXT.md、關鍵取捨進決策記錄（見 §4）。
 
 **完整性四保險（避免「使用者沒想到＋AI 也沒問到」）**：
@@ -156,8 +158,8 @@ zone: src/auth/**, tests/auth/**   # 檔案界線（平行時互斥用）
 ## 6. 驗證（三道保險＋分級）
 
 1. **測試先行（輕量 TDD）**：動手前先跟使用者確認過的 seam 上寫失敗測試，再實作轉綠。垂直切片（一測試→一實作），禁 tautological test（期望值與實作同算法）、禁 mock 冒充真依賴——真依賴未 ready 標 blocked。
-2. **關票實跑**：真鏈路——涉 UI 用 Playwright 真點擊、涉 API 真打、涉資料真查 DB；資料類驗證走「真 create API seed → UI → 真 API → 真 DB 讀回」。測試資料帶可識別記號、清理只清自己產生的資料、禁全庫／全表清除當清理手段（verification-playbook「測試資料衛生」）。證據落票，刷卡機把關。
-3. **出貨獨立審**：ship 前另開乾淨 context 審一次，**兩軸平行、分開報告、不合併排名**：Standards 軸（code 品質，repo 規範優先、Fowler smells 為 baseline）＋ Spec 軸（與票的驗收條件逐條對照）。取代 Flow 的五層對抗。
+2. **關票實跑**：真鏈路——涉 UI 用 Playwright 真點擊、涉 API 真打、涉資料真查 DB；資料類驗證走「真 create API seed → UI → 真 API → 真 DB 讀回」。測試資料帶可識別記號、清理只清自己產生的資料、禁全庫／全表清除當清理手段（verification-playbook「測試資料衛生」）。證據落票，刷卡機把關。證據落檔一律**遮密**：金鑰／token／個資改寫 `<REDACTED>`、指令用環境變數引用不落明文——遮值不遮形（status、筆數、表名照留），細則在 verification-playbook「證據遮密」。
+3. **出貨獨立審**：ship 前另開乾淨 context 審一次，**兩軸平行、分開報告、不合併排名**：Standards 軸（code 品質，repo 規範優先、Fowler smells 為 baseline）＋ Spec 軸（與票的驗收條件逐條對照）。取代 Flow 的五層對抗。Standards 軸**審查定錨**：範圍鎖定「上輪出貨後的改動」——基準自動取 `HISTORY.md` 最後一次被 commit 的那個 commit（`git log -1 -- .constellation/HISTORY.md`，與 §4 地圖基準同手法、零人工維護；首輪無 HISTORY.md 則全 repo），只審 `git diff <基準>...HEAD`；開審前先在主線驗基準可解析且 diff 非空，不成立先停下處理，不燒獨立審查 context。baseline 用固定 12 條 Fowler smells 清單（全文在 phase-ship.md，隨審查指派原文帶給 Standards 軸）＋三規則：repo 規範壓過 baseline、工具已強制的不重複報、baseline 命中一律 judgement call；每軸報告以 400 字為度、結尾一行「發現數＋該軸最嚴重一條」。
 
 **分級**：逐票跑票內「驗證指令」縮圈清單（weave 寫定；無則 `commands.test` 全量——測試量隨輪增長，票級恆全量會讓驗證時間隨專案越拖越長，縮圈把票級成本鎖在該票影響面）＋該票驗收條件的實跑檢查；`commands.journey`（全量 journey）與 `commands.test` 完整回歸留到 ship 一次跑齊、不受縮圈影響——驗證 runner 以 `--scope ticket|ship` 區分兩級。審查產出固定三段報告（做了什麼／驗了什麼／證據在哪），發現分**阻擋級**（修完才出貨）與**建議級**。阻擋級修復走批次：全軸報告出齊後去重合併同根因、一批修完、一次受影響範圍複驗；複審由原提出軸同回合逐條確認修法成立（不重跑全量審查；修復動到共用契約／schema／權限／全域設定時仍重跑全量驗證）。**涉權限／金流／個資的任務**（訪談收尾標記於 grill-close.md）兩軸自動加開第三軸——**security 紅軍**（獨立 context 以攻擊者視角實測攻擊面）；一般任務不加開，平時速度不變——審查跟著風險走，不跟著流程走。
 
@@ -166,6 +168,7 @@ zone: src/auth/**, tests/auth/**   # 檔案界線（平行時互斥用）
 ## 7. 多工政策（票平行＋序列整合）
 
 - 合成拆票時即劃定每票 `zone`（檔案界線），無依賴且 zone 不重疊的票**同批平行 fan-out**（Workflow 腳本，worker 用便宜模型）。
+- **寬改動例外（expand–contract）**：單一機械改動、爆炸半徑跨大半 repo（rename 欄位、共用型別改形、全域 API 簽名變更）時，垂直切片與 zone 互斥會全面互撞——不硬拆，改走三段式：expand（新舊並存、不破壞）→ migrate（按爆炸半徑分批遷移、每批一票 blocked-by expand）→ contract（零殘留後刪舊、blocked-by 全部遷移票）；批次無法獨綠時共用整合分支＋最終 integrate-and-verify 票。細節在 phase-weave.md。
 - **模型分派要逐一落實**：Workflow script 裡沒寫 `model` 的 `agent()` 會默默繼承主迴圈模型，「worker 用便宜模型」不會自動成立——每個 `agent()` 都要顯式指定，並在 script 開頭把各階段模型寫成常數，讓分派意圖看得見。
 - 整合**一張張序列**：合併 → 跑該票正式驗證 → 關票 → 下一張。整合前檢查 worker 改動未越 zone。worker 不跑正式 runner（只以測試框架自測單點、不落證據），證據以整合後那次為準——整合前的簽章證明不了整合後的狀態。
 - fan-out 僅三場景：①票平行實作 ②研究/盤點（背景跑不擋主線）③出貨獨立審。其餘一律主線直做。
@@ -219,6 +222,7 @@ Desktop\Constellation\
 │   │   ├── SKILL.md ＋ agents/openai.yaml
 │   │   └── references/    # phase-grill / phase-design / phase-weave / phase-build / phase-ship
 │   │                      # ＋ ticket-template / verification-playbook / debugging-loop / merge-conflicts
+│   │                      # ＋ logic-prototype / design-sync-details / design-translate-details
 │   │                      # ＋ design-systems/（150 套品牌資產庫，自 flow-toolkit 原封搬入）
 │   └── grill/             # 獨立訪談入口（殼，引擎在 phase-grill.md）
 │       └── SKILL.md ＋ agents/openai.yaml

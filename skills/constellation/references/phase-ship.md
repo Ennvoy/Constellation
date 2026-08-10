@@ -19,11 +19,29 @@
 ## 步驟 2：獨立兩軸審查
 
 - 另開乾淨 context 進行審查，不沿用 build 期累積的對話記憶——避免「這是我剛寫的，看起來沒問題」這種確認偏誤。
+- **Standards 軸審查定錨——只審本輪 diff**：基準自動取 `HISTORY.md` 最後一次被 commit 的那個 commit（`git log -1 --format=%H -- .constellation/HISTORY.md`；首輪還沒有 HISTORY.md 就全 repo），審查範圍＝`git diff <基準>...HEAD`。**開審前先在主線驗兩件事**——基準能解析、diff 非空；任一不成立先停下查清楚（歸檔異常或真的沒改動），不把壞基準帶進獨立審查 context 空燒一輪。Spec 軸不受此限（它本來就以票為圈）。
 - 兩軸**平行**跑、**分開報告**，禁止合併排名選出一個「總贏家」——這兩軸問的問題本質不同，硬湊成一個分數沒有意義：
-  - **Standards 軸**：只看 code 品質。優先套用這個 repo 自己既有的規範（lint 設定、既有 style、命名慣例）；repo 規範沒覆蓋到的地方，才退回 Fowler smells 當 baseline——baseline 是拿來判斷用的參考基準，不是見到就一定要改的鐵律，遇到「有 smell 但現在改風險更大、不值得」的情況可以標記但不強制修。另掃本檔同目錄 `verification-playbook.md`「真鏈路也要快」的效率鐵則，違反列建議級發現。
+  - **Standards 軸**：只看 code 品質，範圍鎖定上面定錨的本輪 diff。優先套用這個 repo 自己既有的規範（lint 設定、既有 style、命名慣例）；repo 規範沒覆蓋到的地方，才退回 baseline——即下方「固定 12 條 smell 清單」，**隨審查指派把清單原文帶給 Standards 軸**（獨立 context 沒有其他管道拿到它）。三條判定規則：①repo 已文件化／lint 化的規範永遠壓過 baseline，衝突時以 repo 為準；②typecheck／lint 等工具已強制的不重複報；③baseline 命中一律標「judgement call」（與 repo 規範硬違規分開列），遇到「有 smell 但現在改風險更大、不值得」可以標記但不強制修。另掃本檔同目錄 `verification-playbook.md`「真鏈路也要快」的效率鐵則，違反列建議級發現。**報告紀律（兩軸皆適用）**：每軸以 400 字為度、結尾一行摘要（發現數＋該軸內最嚴重一條）；依舊分開報告、不合併排名。
   - **Spec 軸**：逐票對照。把每張票的驗收條件一條條拿出來，核對實作是否真的做到，不管 code 寫得好不好看。另外核對 `.constellation/design-frozen.json` 的 `log`——每筆 `unfreeze` 都應有對應的使用者同意脈絡可查（例如某張票的決議記錄提到這次解凍、或彈窗確認的紀錄）；有 `unfreeze` 卻找不到對應同意脈絡的，列為阻擋級發現（出處：母本 DESIGN.md §3「定稿即凍結」，部署後 runtime 不需讀取）。**核對範圍就是本輪的 `log`**——這份名單隨輪歸檔（見步驟 3），現存檔案裡看到的 `unfreeze` 一定是本輪發生的、對應的票也一定還在 `tickets/` 裡找得到；不必也不該跑去 `archive/` 翻上一輪的紀錄來核對。
 - 兩軸各自輸出自己的 findings 清單，不互相參考、不互相調整對方的結論。
 - **第三軸（條件觸發）— security 紅軍**：讀 `decisions/grill-close.md` 的高風險標記，標記為「有」（涉權限／金流／個資）時自動加開；一般任務不加開。做法：另一個獨立 context 以攻擊者視角**實測**攻擊面（越權存取、參數竄改、注入、金額運算邊界、個資外洩路徑），不是看 code 推測——能實際打 API／操作 UI 重現的才算 confirmed。與前兩軸同樣平行跑、分開報告。
+
+### Standards 軸 baseline：固定 12 條 smell（症狀 → 修法方向）
+
+出自 Fowler《Refactoring》ch.3 選集，逐條「是什麼→怎麼修」；對照 diff 判讀，命中一律是 judgement call：
+
+- **Mysterious Name（名不副實）**：函式／變數／型別的名字看不出它做什麼、裝什麼 → 改名；取不出誠實的名字代表設計本身混濁。
+- **Duplicated Code（複製貼上）**：同一形狀的邏輯出現在改動的多個 hunk／檔案 → 抽出共用形狀，兩邊呼叫它。
+- **Feature Envy（戀慕他物）**：方法伸手拿別的物件的資料多過用自己的 → 把方法搬去它戀慕的資料那邊。
+- **Data Clumps（資料結伴）**：同幾個欄位／參數總是結伴出現 → 收成一個型別，傳它。
+- **Primitive Obsession（原始型別硬撐）**：字串／數字硬代一個該有自己型別的領域概念 → 給概念立一個小型別。
+- **Repeated Switches（重複分支）**：對同一型別的 switch／if 串在改動中反覆出現 → 多型，或共用一張對照表。
+- **Shotgun Surgery（散彈手術）**：一個邏輯改動迫使 diff 散落多檔零碎修改 → 把會一起變的聚進同一模組。
+- **Divergent Change（理由發散）**：同一檔／模組因多個不相干理由被改 → 拆開，讓每個模組只因一種理由變。
+- **Speculative Generality（投機通用化）**：為 spec 沒有的需求加抽象／參數／hook → 刪掉；真需求出現前先內聯回去。
+- **Message Chains（連環呼叫）**：呼叫端依賴 a.b().c().d() 的長鏈導覽 → 首物件上包一個方法藏起這段路。
+- **Middle Man（中間人）**：類別／函式幾乎只是轉手委派 → 砍掉，直接呼叫真目標。
+- **Refused Bequest（拒絕遺產）**：子類忽略或覆寫大部分繼承物 → 放棄繼承，改用組合。
 
 ## 發現的處理
 
