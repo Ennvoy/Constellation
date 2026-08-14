@@ -361,6 +361,50 @@ function buildHistorySection(base) {
     ...capLines(raw, HISTORY_MAX_LINES, '.constellation/HISTORY.md')].join('\n') };
 }
 
+// 閘門 3 兼任的 design 哨兵（DESIGN.md §5 閘門 3、§3 第 5b／7 點）。純讀檔，不是第六個閘門。
+// 要抓的病：**「定稿記錄寫好了、畫面根本沒落地」曾經整輪放行過**——某輪 `_v2/` 只留一個空資料夾、
+// 該輪連 design-frozen.json 都沒有，而 weave 舊條文只驗「有沒有定稿決議這筆檔」就放行，於是四個
+// 子分頁改由 build 照決議散文重畫，與談好的稿差了 12 個區塊，八天後才被使用者走查抓到。
+// 只在「grill-close 記著需要 UI」且「已經有定稿記錄」時才驗——還沒定稿的情況 weave 本來就會轉交 design，
+// 在這裡叫只是重複。fail-open：任何解析異常一律不叫，不拖垮開場。
+function buildDesignSentinel(base, root) {
+  const close = readTextSafe(join(base, 'decisions', 'grill-close.md'));
+  if (!close || !/是否需要\s*UI[^\n]*是（/.test(close)) return null; // 不需要 UI／沒有這個標記 → 不適用
+
+  let names = [];
+  try { names = readdirSync(join(base, 'decisions')).filter(f => f.toLowerCase().endsWith('.md')); } catch { return null; }
+  const finalDoc = names.find(f => /design-final/i.test(f));
+  if (!finalDoc) return null; // 還沒定稿——交給 weave 轉交 design，這裡不叫
+
+  const problems = [];
+  const frozenPath = join(base, 'design-frozen.json');
+  if (!existsSync(frozenPath)) {
+    problems.push('design-frozen.json 不存在 → 定稿沒有凍結，畫面很可能根本沒落地（就是上面那個病的樣態）');
+  } else {
+    try {
+      const parsed = JSON.parse(readTextSafe(frozenPath) || '{}');
+      const frozen = Array.isArray(parsed.frozen) ? parsed.frozen : [];
+      if (frozen.length === 0) problems.push('design-frozen.json 的 frozen 是空陣列 → 沒有任何定稿檔案被鎖住');
+      else {
+        const missing = frozen.filter(p => typeof p === 'string' && !existsSync(join(root, p)));
+        if (missing.length) {
+          problems.push(`凍結名單有 ${missing.length} 個路徑在 repo 找不到：` +
+            `${missing.slice(0, 3).join('、')}${missing.length > 3 ? '…' : ''}`);
+        }
+      }
+      if (!parsed.source) problems.push('design-frozen.json 缺 source 欄（取稿座標）→ 日後走查會憑記憶找設計稿專案，曾因此找錯而誤判「稿不見了」');
+    } catch { problems.push('design-frozen.json 解析失敗（JSON 壞了）'); }
+  }
+  if (!/逐區塊元件清單/.test(readTextSafe(join(base, 'decisions', finalDoc)) || '')) {
+    problems.push(`定稿記錄 ${finalDoc} 沒有「逐區塊元件清單」→ 下游拆票只看得到區塊名字，區塊內部會整段蒸發且看不出來`);
+  }
+  if (!problems.length) return null;
+
+  return ['⚠【design 定稿哨兵】這一輪記著需要 UI、也已經有定稿記錄，但下列項目不成立——依 DESIGN.md §3 第 5b／7 點，這代表 UI 其實還沒定稿完成（weave 進場的機器三驗會擋下）：',
+    ...problems.map(p => `  · ${p}`),
+    '  處置：Read skills/constellation/references/phase-design.md，補做步驟 5（直接改專案正式頁面 code）→ 5b（開本地 dev server 請使用者親自點過拍板）→ 7（定稿記錄附逐區塊清單、寫凍結名單與 source 欄）。'].join('\n');
+}
+
 // repo root 解析：git rev-parse --show-toplevel，失敗 fallback cwd（與 commit-gate.mjs 鏡像）。
 function resolveRepoRoot(cwd) {
   try {
@@ -414,11 +458,12 @@ function buildSummary(cwd) {
     }
   }
   // 知識軌導航（DESIGN.md §4「接續」）：每段獨立 try——單段解析炸掉只少那一段，票況照常注入。
-  let map = null, ctx = null, dec = null, hist = null;
+  let map = null, ctx = null, dec = null, hist = null, designWarn = null;
   try { map = buildMapSection(base, root); } catch { /* fail-open */ }
   try { ctx = buildContextSection(base); } catch { /* fail-open */ }
   try { dec = buildDecisionsSection(base); } catch { /* fail-open */ }
   try { hist = buildHistorySection(base); } catch { /* fail-open */ }
+  try { designWarn = buildDesignSentinel(base, root); } catch { /* fail-open */ }
 
   // 置頂強制讀檔指令：知識本體不在注入裡——放最前面，任何情況下最先被看到。
   if (map || ctx || dec) {
@@ -436,6 +481,9 @@ function buildSummary(cwd) {
     }
     lines.unshift(parts.join(''));
   }
+  // design 哨兵緊跟票況：它講的是「這一輪的 UI 到底定稿了沒」，屬於現況而非知識軌，
+  // 且不成立時會擋住 weave，所以要排在地圖與脈絡之前先被看到。
+  if (designWarn) lines.push(designWarn);
   if (map) lines.push(map.text); // 票況之後、知識軌之前：先知道東西在哪，再談脈絡
   if (hist) lines.push(hist.text);
   if (dec) lines.push(dec.text);
