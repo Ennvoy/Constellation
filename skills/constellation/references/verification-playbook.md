@@ -58,6 +58,7 @@
 3. **登入態一次取得、全套件重用**：用測試框架的 setup 機制（如 Playwright setup project＋storageState）登一次、全套件共用；不讓每支測試各自重走登入 UI。
 4. **資料隔離用輕量手法**：API／DB 層測試用交易回滾，e2e 層用最小範圍清理；不每測 truncate 全表、不在 beforeEach 逐句清理疊固定成本。
 5. **追蹤產物只留失敗**：trace／video／screenshot 設「失敗才保留」級別；不分成敗全程錄影會拖慢執行並塞爆磁碟。
+6. **執行平行度拉滿**：測試 runner 的並行度按機器核心數設定（Playwright `workers`、vitest／jest 的 thread 數等），不留在框架的保守預設。測試互撞（搶同一張表、共用固定帳號）時改用第 4 條的資料隔離解決，不靠全域調回單工——那是拿整個套件的時間補少數幾支測試的耦合。
 
 ## 分級規則
 
