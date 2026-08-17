@@ -300,8 +300,33 @@ function buildMapSection(base, root) {
     const lines = ['【專案現況地圖（.constellation/MAP.md，完整內容含資料表、已知資料缺口與地雷請 Read 原檔）】'];
     lines.push(...notes);
     lines.push(...shown);
-    return { text: lines.join('\n'), lineCount };
+    return { text: lines.join('\n'), lineCount, hazardCount: countMapHazards(all) };
   } catch { return null; } // fail-open
+}
+
+// 地圖「缺口／地雷」區的**條數**（不是內容）。只回一個數字，永遠一行——注入量與專案規模解耦
+// 那條原則（決議 002）因此不受影響，而讀的人知道自己還有多少沒看過的坑。
+//
+// 為什麼值得多這一個數字（2026-08-17，實際踩過）：那兩區記的多半是**動手方式**的坑
+// （測試怎麼跑、腳本怎麼下、查詢怎麼寫），光看模組索引不會意識到需要它；而它們正好不在注入
+// 內容裡。當時的判斷是「只是回答問題、不是開工」而略過全文，結果撞上區裡早就寫著的那條
+// （測試的還原機制會把剛匯入的資料日倒退回去）。
+//
+// 判準刻意寬鬆：標題含「地雷／缺口／未竟」的二級章節即算，`~~劃掉~~` 的條目是已解決不計。
+// 專案沒有這種章節時回 0，呼叫端就不印那句——不同專案的地圖結構本來就不必一致。
+function countMapHazards(allLines) {
+  let inSection = false;
+  let n = 0;
+  for (const line of allLines) {
+    if (/^##\s/.test(line)) { // ### 子節不中斷（第三個 # 不是空白，故不匹配）
+      inSection = /^##\s.*(地雷|缺口|未竟)/.test(line.trim());
+      continue;
+    }
+    if (!inSection) continue;
+    const t = line.trim();
+    if (/^-\s/.test(t) && !/^-\s*~~/.test(t)) n++;
+  }
+  return n;
 }
 
 // CONTEXT.md 導航：只給「多少行、多少詞條」，詞條名與內文一律由置頂指令引導 Read 全文。
@@ -472,7 +497,22 @@ function buildSummary(cwd) {
     if (map) reads.push(`.constellation/MAP.md（專案現況地圖，全文 ${map.lineCount} 行）`);
     if (ctx) reads.push(`.constellation/CONTEXT.md（專案詞彙與業務規則，全文 ${ctx.lineCount} 行）`);
     const parts = ['【開工前必讀】本專案知識軌不隨開場注入內文，下方只是座標。'];
-    if (reads.length) parts.push(`動手任何工作前先 Read：${reads.join('＋')}。`);
+    if (reads.length) {
+      // 「只是查一下」那句是 2026-08-17 補的：原本只寫「動手任何工作前」，而純查詢型的開場
+      // （使用者問「為什麼會這樣」）會被判定成不算動手而略過全文——但查問題查到一半就跑測試、
+      // 連正式庫是常態，地圖的缺口／地雷區記的正是那些動作上的坑，且那一區不在注入內容裡。
+      let sentence = `動手任何工作前先 Read：${reads.join('＋')}。` +
+        '「只是回答問題／只是查一下」同樣要讀——查到一半就跑測試、連正式庫是常態';
+      // 後半句只在真的有地圖時才講：沒有 MAP.md 的專案（例如工作流母本自己）提「地圖的地雷區」
+      // 會指向一個不存在的東西，讀的人得花時間確認那是不是自己漏看了。
+      if (map) {
+        sentence += '，而地圖的「已知缺口與地雷」區記的正是那些動作上的坑，開場只注入模組索引、那一區不在裡面' +
+          (map.hazardCount ? `（該區目前 ${map.hazardCount} 條）。` : '。');
+      } else {
+        sentence += '。';
+      }
+      parts.push(sentence);
+    }
     // 決議改成「講查法」而不是列清單：開場看不到清單≠沒有那筆決議，這句是防止模型
     // 因為索引消失就自行推論「本專案沒相關決議」而繞過既有拍板。
     if (dec) {
