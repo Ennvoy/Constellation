@@ -83,6 +83,8 @@
 }
 ```
 
+使用者本來就長開、不希望被碰的埠，可另加 `"protectedPorts": [3000]`——runner 每條指令收尾的埠差集補刀一律跳過這些埠（不確定要不要加就別加，這是逃生閥不是預設值）。
+
 探測順序：先看 `package.json` 的 `scripts.test`／`scripts.e2e`／`scripts.journey`，找不到再看既有 CI 設定（如 `.github/workflows/*.yml`）裡出現的測試指令。兩邊都探不到，對應陣列留空，並在 `config.json` 加一個 `"_note"` 註記欄記「驗證指令待補」（例如 `"_note": "package.json 與 CI 設定都探不到驗證指令，待使用者補上"`），同時在對應那張票（或小流程的任務卡）的「決議記錄」留一筆同樣的待補說明——不為此發問，本階段一律不再開新題。`gates/verify-runner.mjs` 會讀這份 config 決定要跑什麼（細節見本檔同目錄的 `verification-playbook.md`）；指令是空陣列時，依賴它的驗收條件在 build 階段跑不出證據，該標 blocked，等使用者補上指令才解除。
 
 **journey 合併規則**：探測出的 journey 指令若屬同一測試框架的多個 project／多支分開呼叫（如 `playwright test --project=e2e` 與 `--project=auth` 兩支），合併成單一次呼叫（`--project=e2e --project=auth`）——production build、服務啟動、登入 setup 這類昂貴固定成本在一次 journey 裡只付一次，拆開呼叫會重複付。

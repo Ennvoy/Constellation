@@ -376,6 +376,7 @@ Constellation/
     ├── close-gate.mjs             # 閘門 5
     ├── precommit-install.mjs      # 冪等安裝 git 原生 pre-commit
     ├── clean-artifacts.mjs        # 驗證產物清理工具
+    ├── serve.mjs                  # 臨時 server 記帳起停工具（SessionEnd 自動收尾）
     ├── hooks.claude.json          # Claude Code 端觸發設定
     └── hooks.codex.json           # Codex 端觸發設定
 ```

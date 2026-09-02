@@ -12,6 +12,18 @@
         ]
       }
     ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"{{ROOT}}\\gates\\serve.mjs\" reap",
+            "timeout": 60,
+            "_constellation": true
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Edit|Write|apply_patch",

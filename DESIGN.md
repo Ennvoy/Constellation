@@ -80,7 +80,7 @@
 3. **使用者在 canvas 確認／調整**：`Comment`（inline 評論）／`Tweaks`（語意化參數旋鈕，來自 `data-props`，不是拖像素）／`Edit`（圖層樹＋Simple・Pro・Code・Tweaks 四模式）／`Present`／`Share`，多輪來回到滿意。**這一步點頭只算「設計方向確認」、不算定版**——定版在第 5b 點的本地畫面上，這裡先講明，才不會又出現「canvas 點過頭就宣稱已定稿」。**它自己生成的 `.dc.html` 支援直接編輯**——「不支援自動編輯」那條翻譯裂縫只存在於本地推上去的純 `.html`，這正是新方向比舊做法好的地方之一。
 4. **拉回 repo**：DesignSync `get_file` 直讀 `<Name>.dc.html`，**不需要任何匯出功能**；一併拉 `_ds_manifest.json` 當 token 對照表（單檔上限 256 KiB）。
 5. **直接改專案的正式頁面 code**（不是「產一份元件檔就算落地」）：改動就落在**正式檔案、正式路由**上——**不掛暫時網址、不開 `?variant=`、不做預覽區、不另建假資料檔層**（`mock-data.ts` 那種獨立假資料檔事後刪它還得先解凍，多一道手續）；**保險是 git**，不行就復原。資料來源照這條規則：**後端已經有就直接接真 API**（省掉「假資料→再換一次」的白工），**後端還沒有**才把最小範例值寫死在元件裡、build 接真 API 時整段刪掉，並在定稿記錄記明哪幾處是寫死的。轉譯本身仍是這一步的手段：`.dc.html` 是 Claude Design 專屬 runtime 格式，不能直接當專案元件用。多數語法機械對應（`{{ }}`／`sc-if`／`sc-for`／`DCLogic`→`React.Component` 同名同義）；**唯一真正機械化不了的是動態 inline style 拼接字串**要拆成 class modifier（機器分不出哪段是狀態、哪段是常數），另外 inline style 會打敗 `:hover`、假資料要換成真 API 兩個陷阱必踩。實測 347 行 `.dc.html` → 467 行 JSX ＋ 492 行 CSS（1.36x），邏輯層幾乎零成本，時間全花在拆 style 與 class 命名，轉完行為與視覺零落差。
-5b. **開本地 dev server，請使用者實際點過——這是唯一的定版點**：把本地網址給使用者，請他**自己點**（每個分頁、每個子分頁、每個互動都點得動，不留「按了沒反應」的示意 stub），他拍板才算定稿。這一步**不可代為拍板、不可用截圖替代**（截圖點不動，看不出互動是不是真的接上了），也不可跳過去寫定稿記錄。**沒有這一步，第 6、7 點一律不准開始**：不准寫定稿記錄、不准凍結、不准進 weave（weave 進場另有機器三驗兜底，見 `phase-weave.md`）。
+5b. **開本地 dev server，請使用者實際點過——這是唯一的定版點**：把本地網址給使用者，請他**自己點**（每個分頁、每個子分頁、每個互動都點得動，不留「按了沒反應」的示意 stub），他拍板才算定稿。這一步**不可代為拍板、不可用截圖替代**（截圖點不動，看不出互動是不是真的接上了），也不可跳過去寫定稿記錄。**沒有這一步，第 6、7 點一律不准開始**：不准寫定稿記錄、不准凍結、不准進 weave（weave 進場另有機器三驗兜底，見 `phase-weave.md`）。**這台 server 經 `gates/serve.mjs` 起**（它起之前先查該埠有沒有殘留進程，避免拿別人的舊 server 當自己的畫面看）；使用者拍板後就把它關掉，並在正文一句話講明釋放了哪個埠——使用者明說要留著繼續看才留。
 
    **雙 runtime 分工（§9）**：這一步的主體——起本地 server、把網址交給使用者、使用者拿自己的瀏覽器點——**與 runtime 無關，兩邊完全一樣**；拍板動作照 §9 降級表（Claude Code 走彈窗、Codex 走文字點列）。**只有「交件前執行端自己預檢一次」那一小步不對等**：Claude Code 端有瀏覽器工具就自己開起來看過再交；**Codex 端沒有內建瀏覽器**（§11.5 已載明，裸 CLI 不提供），降級為「打 HTTP 確認頁面回 200、關鍵區塊標記出現在 HTML 裡」＋既有的元件 render 測試，並在交件那句話**誠實講明「我沒有親眼看過渲染結果，破圖請直接說」**——不得因為看不到就跳過這一步，也不得假稱看過。
 
@@ -155,19 +155,21 @@ zone: src/auth/**, tests/auth/**   # 檔案界線（平行時互斥用）
 | 1 | git 守門 | hook | 擋破壞性 git 操作與未經確認的開/切分支（自 Flow 原封搬入） |
 | 2 | commit 守門 | hook ＋ git pre-commit | commit 前掃 secrets／垃圾產物（自 Flow 原封搬入）。**兩條呼叫路徑、同一套判定**：PreToolUse hook 攔 Claude Code 發起的 commit；git 原生 pre-commit（`--precommit` 入口，由 session 開場冪等安裝）兜住使用者手打／子行程／npm script／MCP 發起的 commit——後者是前者攔不到的整批繞法 |
 | 3 | session 開場注入 | hook | 兼任**「定稿有沒有真的落地」的哨兵**（§3 第 5b／7 點）：`grill-close.md` 記著需要 UI、且已有 design 定稿決議時，順手驗 `design-frozen.json` 存在、`frozen` 非空、名單每個路徑都真的在 repo——不成立就在開場印醒目警示。**這是既有閘門加一段讀檔，不是第六個閘門**（不違反本節末「不加新硬閘」）。從 `.constellation/` 重建現況並注入**純導航**——置頂強制讀檔指令（含決議查法）＋票況＋**地圖模組索引與過期警示**＋HISTORY 最近輪次＋決策一行摘要＋詞彙一行摘要（§4）。**只有地圖是清單級，其餘皆摘要級**，故注入量與專案年齡解耦。過期警示只比對檔案增刪改名、不解析內容，故不因專案語言而異 |
-| 4 | 驗證 runner | script | 實跑驗證（`--scope` 分逐票／出貨兩級；逐票優先吃票內「驗證指令」縮圈清單，無則 config 全量——縮圈顯式、fallback 全量），pass 證據附簽章寫入票（ship 級寫入 `.constellation/ship-evidence.md`）；內建**斷路器**——同一目標連續 5 次失敗即強制停下請使用者拍板，不無限重試；證據筆附各指令耗時行（純紀錄，不參與簽章與判定） |
+| 4 | 驗證 runner | script | 實跑驗證（`--scope` 分逐票／出貨兩級；逐票優先吃票內「驗證指令」縮圈清單，無則 config 全量——縮圈顯式、fallback 全量），pass 證據附簽章寫入票（ship 級寫入 `.constellation/ship-evidence.md`）；內建**斷路器**——同一目標連續 5 次失敗即強制停下請使用者拍板，不無限重試；證據筆附各指令耗時行（純紀錄，不參與簽章與判定）。**逾時或 runner 自己被中斷時殺整棵進程樹**（殺 shell 時連坐子孫，否則只殺得到外殼、`npx`→測試框架→webServer 那串孫進程會繼續跑），**每條指令收尾另跑一次埠差集補刀**抓外殼已退出的孤兒——只殺「本條指令期間才新出現、進程啟動時間晚於指令開始、且沿父進程鏈追得回本條指令外殼」的埠佔用者（外殼與中間層都已退出的多層孤兒追不回，寧漏勿誤殺；那一類靠殺樹與 serve.mjs 記帳兜底，不靠補刀），config 的 `protectedPorts` 白名單豁免，每次補刀在 runner 自己的 stderr 留一行；失敗路徑（斷路器與一般失敗）每個出口都先收拾再退出。兩層清理靠 `netstat`／`taskkill`，僅 Windows 生效 |
 | 5 | 關票刷卡機 | hook | 票標 done 時機器驗證據簽章與新鮮度（24h）＋驗收條件全勾，不過直接擋下；兼任**定稿 UI 凍結守衛**——編輯 design-frozen.json 名單內的檔案一律擋下，解凍須經使用者同意並留日誌；兼任**現況覆蓋閘門**（2026-08-18 使用者拍板加入，同閘門 3 模式屬既有閘門加職責、非第六閘）——定稿凍結（寫入 design-frozen.json 且 frozen 非空）時驗 `.constellation/design-baseline.json`：每張畫面判過 new/rework、rework 的 sources 非空且路徑存在（fail-closed），防「改造型畫面沒把現況送上設計服務、憑文字畫出相似新頁面」（§3；起因 2026-08-18 實踩） |
 
 驗證證據由 runner 以本機 secret（install 時生成於使用者家目錄，不進 git）簽章（簽章綁定 repo，防跨專案重放）、刷卡機驗簽——手填時間戳無法通過，「機器擋假完成」才真正成立。commit 守門另做一道 **done 票稽核**：commit 時 staged 的 done 票必須含通過驗簽的證據，堵「用 shell 指令繞過刷卡機改檔」的旁門。
 
 閘門 2 擋下驗證垃圾時，指路 `gates/clean-artifacts.mjs` 收拾：預設 dry-run 先列要刪什麼，`--apply` 才真刪，`--gitignore` 順手補防護。它單向 import 閘門 2 的白名單，「被擋的」與「被清的」永遠同一套標準。分兩級風險：絕對垃圾（log／產物目錄／暫存檔）不論是否 tracked 都清；截圖與錄影只清 git 沒追蹤過的，已 commit 的資產一律不碰，查不到 git 時整批保守略過。**它是工具不是閘門**——沒有它照樣擋得住，只是要自己手動收拾。
 
+**臨時 server 的記帳起停：`gates/serve.mjs`（同樣是工具不是閘門）**。閘門 4 只管得到自己起的那棵樹，agent 為了讓使用者走查畫面、或為了餵下一張票的測試而手動起的 server 完全在它視野外——那才是殘留的主因（起的動作不在任何保證會執行的收尾點上）。所以臨時 server 一律經它起：`start` 起 server 並把 PID／埠／啟動時間／session 登記到 `.constellation/.servers.json`（起之前先查該埠有沒有殘留），`stop` 連自己起的外殼樹帶綁著那個 socket 的進程一起收（只殺外殼會漏掉真正佔埠的那支），`list` 列現況。**只殺自己登記的，殺之前比對 PID 與啟動時間**（PID 會被系統回收再發給無關進程），絕不掃描整台機器的埠去猜哪個該死（查殺同樣靠 `netstat`／`taskkill`，僅 Windows 生效）。記帳檔是本機執行期狀態、不進版控、讀寫失敗一律降級不擋主流程（同 runner 的失敗計數檔）。**收尾接線：SessionEnd hook**——兩份 hook fragment（`gates/hooks.claude.json`／`gates/hooks.codex.json`）各掛一條 `serve.mjs reap`，session 結束時自動收掉本 session 登記的 server；兩個 runtime 都有這個事件，故雙邊都接。它不是唯一保險、也不保證每種結束方式都觸發，所以登記的紀錄一律當「可能早就死了」處理——這正是殺之前要比對啟動時間的理由。**認不出是誰起的就不收**：hook 沒帶 session_id 時只清已死的登記、不擊殺任何還活著的 server（全收會殺到平行 session 正在用的那台，是決議 020 明文否決的行為）；同理，**subagent 經它起的登記記在 subagent 自己的 session 名下，主 session 的 SessionEnd 收不到**，那條路以 worker 自己收工 `stop` 為準。
+
 原則：**每個閘門只在關鍵事件觸發，平時零開銷**。不設巨石 CLI；除此五件外，一切靠 skill 紀律，不加新硬閘（加閘門需回本文件修訂）。
 
 ## 6. 驗證（三道保險＋分級）
 
 1. **測試先行（輕量 TDD）**：動手前先跟使用者確認過的 seam 上寫失敗測試，再實作轉綠。垂直切片（一測試→一實作），禁 tautological test（期望值與實作同算法）、禁 mock 冒充真依賴——真依賴未 ready 標 blocked。
-2. **關票實跑**：真鏈路——涉 UI 用 Playwright 真點擊、涉 API 真打、涉資料真查 DB；資料類驗證走「真 create API seed → UI → 真 API → 真 DB 讀回」。測試資料帶可識別記號、清理只清自己產生的資料、禁全庫／全表清除當清理手段（verification-playbook「測試資料衛生」）。證據落票，刷卡機把關。證據落檔一律**遮密**：金鑰／token／個資改寫 `<REDACTED>`、指令用環境變數引用不落明文——遮值不遮形（status、筆數、表名照留），細則在 verification-playbook「證據遮密」。
+2. **關票實跑**：真鏈路——涉 UI 用 Playwright 真點擊、涉 API 真打、涉資料真查 DB；資料類驗證走「真 create API seed → UI → 真 API → 真 DB 讀回」。測試資料帶可識別記號、清理只清自己產生的資料、禁全庫／全表清除當清理手段（verification-playbook「測試資料衛生」）。證據落票，刷卡機把關。證據落檔一律**遮密**：金鑰／token／個資改寫 `<REDACTED>`、指令用環境變數引用不落明文——遮值不遮形（status、筆數、表名照留），細則在 verification-playbook「證據遮密」。**驗證或除錯自己起的臨時 server，一律經 `gates/serve.mjs` 起、收工經它關**——殘留的舊 server 會讓整輪 e2e 跑在舊 build 上蓋出合格證據，那是正確性問題、不只是佔埠拖慢機器（來龍去脈與收法見 verification-playbook「臨時 server 的起與收」）。
 3. **出貨獨立審**：ship 前另開乾淨 context 審一次，**兩軸平行、分開報告、不合併排名**：Standards 軸（code 品質，repo 規範優先、Fowler smells 為 baseline）＋ Spec 軸（與票的驗收條件逐條對照）。取代 Flow 的五層對抗。Standards 軸**審查定錨**：範圍鎖定「上輪出貨後的改動」——基準自動取 `HISTORY.md` 最後一次被 commit 的那個 commit（`git log -1 -- .constellation/HISTORY.md`，與 §4 地圖基準同手法、零人工維護；首輪無 HISTORY.md 則全 repo），只審 `git diff <基準>...HEAD`；開審前先在主線驗基準可解析且 diff 非空，不成立先停下處理，不燒獨立審查 context。baseline 用固定 12 條 Fowler smells 清單（全文在 phase-ship.md，隨審查指派原文帶給 Standards 軸）＋三規則：repo 規範壓過 baseline、工具已強制的不重複報、baseline 命中一律 judgement call；每軸報告以 400 字為度、結尾一行「發現數＋該軸最嚴重一條」。
 
 **分級**：逐票跑票內「驗證指令」縮圈清單（weave 寫定；無則 `commands.test` 全量——測試量隨輪增長，票級恆全量會讓驗證時間隨專案越拖越長，縮圈把票級成本鎖在該票影響面）＋該票驗收條件的實跑檢查；`commands.journey`（全量 journey）與 `commands.test` 完整回歸留到 ship 一次跑齊、不受縮圈影響——驗證 runner 以 `--scope ticket|ship` 區分兩級。審查產出固定三段報告（做了什麼／驗了什麼／證據在哪），發現分**阻擋級**（修完才出貨）與**建議級**。阻擋級修復走批次：全軸報告出齊後去重合併同根因、一批修完、一次受影響範圍複驗；複審由原提出軸同回合逐條確認修法成立（不重跑全量審查；修復動到共用契約／schema／權限／全域設定時仍重跑全量驗證）。**涉權限／金流／個資的任務**（訪談收尾標記於 grill-close.md）兩軸自動加開第三軸——**security 紅軍**（獨立 context 以攻擊者視角實測攻擊面）；一般任務不加開，平時速度不變——審查跟著風險走，不跟著流程走。
@@ -194,7 +196,7 @@ zone: src/auth/**, tests/auth/**   # 檔案界線（平行時互斥用）
 
 > 已完成本機實測＋官方文件查證（本機 Codex CLI 0.146.0）。
 
-**核心事實（查證＋紅軍實測確認）**：Codex 官方 skills 系統的 `SKILL.md` 格式與 Claude Code **核心相容**（同樣的 frontmatter `name`/`description` 必填）；Codex 個人全域路徑為 `~/.codex/skills/`；Windows junction 免管理員權限已本機實測成功；Codex hooks 事件名與 Claude Code 幾乎一一對應（SessionStart／PreToolUse／PostToolUse／Stop…），且經紅軍實測**兩邊 hooks schema 同構**（僅存放位置不同：settings.json vs ~/.codex/hooks.json）。Codex custom prompts 已被官方棄用、指名用 skills 取代。
+**核心事實（查證＋紅軍實測確認）**：Codex 官方 skills 系統的 `SKILL.md` 格式與 Claude Code **核心相容**（同樣的 frontmatter `name`/`description` 必填）；Codex 個人全域路徑為 `~/.codex/skills/`；Windows junction 免管理員權限已本機實測成功；Codex hooks 事件名與 Claude Code 幾乎一一對應（SessionStart／PreToolUse／PostToolUse／Stop／SessionEnd…；SessionEnd 兩邊都有，§5 的臨時 server 收尾靠它，故降級表不必為它多一列），且經紅軍實測**兩邊 hooks schema 同構**（僅存放位置不同：settings.json vs ~/.codex/hooks.json）。Codex custom prompts 已被官方棄用、指名用 skills 取代。
 
 **共用架構：單源母本＋junction 雙掛載＋觸發層各自適配**
 
@@ -239,6 +241,7 @@ Desktop\Constellation\
 ├── gates/                 # 閘門五件組 .mjs ＋ hooks.claude.json / hooks.codex.json
 │                          # ＋ precommit-install.mjs（裝 git 原生 pre-commit 兜底）
 │                          # ＋ clean-artifacts.mjs（清驗證產物 CLI，被閘門 2 指路）
+│                          # ＋ serve.mjs（臨時 server 記帳起停 CLI，SessionEnd 自動收尾）
 └── install.ps1            # 一鍵部署：per-skill junction、掛雙邊 hooks、生成簽章 secret、對賬
 ```
 

@@ -22,6 +22,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 // 目錄（gates/）推導出來——避免相對路徑在不同 cwd 下指到錯誤位置（路徑注入/誤觸風險）。
 const GATES_DIR = dirname(fileURLToPath(import.meta.url));
 const VERIFY_RUNNER_ABS_PATH = join(GATES_DIR, 'verify-runner.mjs');
+const SERVE_ABS_PATH = join(GATES_DIR, 'serve.mjs');
 
 const stripBom = s => (s && s.charCodeAt(0) === 0xfeff ? s.slice(1) : s);
 
@@ -529,6 +530,7 @@ function buildSummary(cwd) {
   if (dec) lines.push(dec.text);
   if (ctx) lines.push(ctx.text);
   lines.push(`驗證 runner：node "${VERIFY_RUNNER_ABS_PATH}"`);
+  lines.push(`起停 server：node "${SERVE_ABS_PATH}" start|stop|list`);
 
   let summary = lines.join('\n');
   // failsafe：索引級內容理論上不會超線；萬一撞上（極端怪檔），硬截保「開場可見」優先於完整——

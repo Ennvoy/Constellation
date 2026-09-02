@@ -26,7 +26,7 @@
 - **條件**：這批票兩兩之間 `zone` 沒有交集、也沒有 `blocked-by` 關係 → 可同批 fan-out。有依賴鏈的票本來就不會排進同一批——它要等前置票 `done` 之後，才會在下一批被領走。
 - **委派下限**：幾個 tool calls 就能自己做完的工作不委派 subagent；不用 subagent 覆核自己剛完成的工作（獨立 context 的對抗審查是另一回事，照母本 DESIGN.md §6 規則走）；一個 subagent 能完成就不用多個。
 - **開工前**：正文一句話講清楚這批要平行幾張票（平行是 token 倍增，讓使用者知道成本）。
-- 用 **Workflow 工具** fan-out——這裡指 Claude Code 端內建的臨場編排工具，用來把這批票同時派給多個 worker，不是 repo 裡預先寫好的腳本檔案；worker 用便宜模型，各自跑上面「單票內部循環」的步驟 1～3（領票→測試先行→實作轉綠），外加自行以測試框架跑該票影響面的單點檢查（紅綠與煙霧，**不經 runner、不落證據**）；正式驗證（步驟 4）、關票與 commit 都留到下面「序列整合」統一做——整合前跑 runner 的簽章證明不了整合後的狀態，同一張票會白付兩次全價驗證（決議 012）。**Codex 端沒有 Workflow 工具**，依總控（`skills/constellation/SKILL.md`）的 runtime 降級對照，這批票改序列逐張做，不平行。
+- 用 **Workflow 工具** fan-out——這裡指 Claude Code 端內建的臨場編排工具，用來把這批票同時派給多個 worker，不是 repo 裡預先寫好的腳本檔案；worker 用便宜模型，各自跑上面「單票內部循環」的步驟 1～3（領票→測試先行→實作轉綠），外加自行以測試框架跑該票影響面的單點檢查（紅綠與煙霧，**不經 runner、不落證據**）——這個單點檢查需要 server 時經 `gates/serve.mjs` 起、跑完 `stop`（worker 手動起的 server 不在 runner 的清理範圍內，見本檔同目錄 `verification-playbook.md`「臨時 server 的起與收」）；正式驗證（步驟 4）、關票與 commit 都留到下面「序列整合」統一做——整合前跑 runner 的簽章證明不了整合後的狀態，同一張票會白付兩次全價驗證（決議 012）。**Codex 端沒有 Workflow 工具**，依總控（`skills/constellation/SKILL.md`）的 runtime 降級對照，這批票改序列逐張做，不平行。
   - **每個 `agent()` 都要顯式寫 `model`**：script 裡沒寫 `model` 的 `agent()` 會默默繼承主迴圈模型（也就是最強最貴那個），上面那句「worker 用便宜模型」不會自動成立——每個 `agent()` 都是一次獨立的分派決定，漏一個就漏一個。建議在 script 開頭把 worker 模型寫成常數（例如 `const WORKER_MODEL = 'sonnet'`），讓分派意圖在腳本裡看得見，而不是散在各個 `opts` 裡憑記憶。
 - **序列整合**：一張張來，不要等所有 worker 都跑完才一次合併：
   1. 合併這個 worker 的改動。

@@ -27,8 +27,34 @@
 //
 // 斷路器（R2）：{cwd}/.constellation/.verify-state.json 記 per-target（票相對路徑或 "ship"）連續失敗
 // 計數；成功歸零、失敗 +1；達 5 次時 exit 2，請使用者拍板，不再盲目重試（見 recordFailure）。
+//
+// 殘留 server 清理（S1／S2）：驗證指令起的 server 若沒被收掉，會佔著埠拖垮後續驗證，甚至讓下一輪
+// e2e 沿用舊 build 的 server 跑出假合格（正確性問題，不只效能）。兩層機制，僅 Windows 生效
+// （靠 netstat／taskkill）——非 Windows 平台不只 S2 補刀不生效，S1 逾時殺樹也只殺得到外殼本身
+// （spawn 沒帶 detached，process.kill(-pid) 多半 ESRCH），子孫照跑：
+//   S1 血緣殺——指令改用 spawn（shell:true）起、runner 自管逾時，逾時就 taskkill /PID <外殼> /T /F
+//      殺整棵活樹；spawnSync 的 timeout 只殺 cmd.exe 外殼，npx→node→server 這種孫進程鏈會繼續跑。
+//      指令結束判定改用 'exit'（進程已退出）而非 'close'（stdio 全關）——孫進程繼承 stdio handle 時
+//      close 事件永遠不來，會白等到逾時；exit 後最多再等 2 秒讓管線把剩餘輸出吐完就結算。
+//      taskkill 本身也可能殺不動（子進程提權、taskkill 不在 PATH、防毒攔截），所以殺完再排一道
+//      保險期限，到期就自己 kill 外殼並無論如何結算——逾時一定會回來，runner 不會無限等。
+//   S2 埠差集補刀——每條指令前後各照一次「LISTENING 位址:埠 → pid」快照（前一條的 after 直接當
+//      下一條的 before，N 條指令 N+1 次快照），新增的埠當候選，一次查全機進程表（pid → 父／建立
+//      時間／命令列），**四道豁免全過才殺**：①config.json 的 protectedPorts（陣列）白名單埠；
+//      ②serve.mjs 登記在 .constellation/.servers.json 的 pid／外殼 pid（那些由 serve.mjs 的 stop／
+//      SessionEnd 負責收，兩層機制不互打——驗證指令裡用 serve.mjs start 起的 server 若被補刀殺掉，
+//      後續指令會拿到假紅燈）；③建立時間必須晚於本條指令開始；④血緣：沿 ParentProcessId 鏈往上
+//      走得回本條指令的外殼 pid（見 isOwnDescendant）。第④道是誤殺的主防線，也是整套補刀裡唯一
+//      「這是我起的」正面證明——埠差集與時間窗口都只是旁證，別的專案／session 起的 server 落在
+//      窗口內就會中招。
+//      代價是漏殺「鏈上中間層自己也退出了」的多層孤兒（往上走到不在表裡的 pid 就停手）——補刀
+//      本來就只是補刀，寧漏勿誤殺。
+// 每條指令跑完（含逾時、含失敗）都 reap 一次，所有出口因此都在退出前清乾淨。清理訊息一律印在
+// runner 自己的 stderr，不混進指令輸出，故不進證據 tail、不影響簽章。
+// ⚠ 已知限制：快照靠 netstat 輸出的 "LISTENING" 字串，在狀態字被本地化的 Windows 語系上會抓到空
+//    集合，整套補刀無聲失效（fail-safe 方向：不誤殺，只是不生效）。
 import { readFileSync, writeFileSync, existsSync, readdirSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { resolve, join, basename } from 'node:path';
 import { createHmac } from 'node:crypto';
 import { homedir } from 'node:os';
@@ -272,6 +298,252 @@ function decodeOutput(buf) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// S1 血緣殺：spawn（shell:true）＋自管逾時＋taskkill /T /F 殺整棵活樹（見檔頭說明）。
+// ---------------------------------------------------------------------------
+const MAX_BUF = 20 * 1024 * 1024; // 自行實作截斷：超過就從最舊的 chunk 丟起，保住尾段（證據只取尾 15 行）
+const GRACE_AFTER_EXIT_MS = 2000; // 進程已退出後，最多再等這麼久讓管線把剩餘輸出吐完
+const HARD_STOP_AFTER_KILL_MS = 10000; // 逾時殺完再等這麼久；taskkill 沒殺動就自己收尾，不無限等
+let currentChild = null; // 供 SIGINT 處理器殺掉當下這條指令的進程樹
+
+function killTree(pid) {
+  if (!pid) return;
+  try {
+    if (process.platform === 'win32') spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+    else process.kill(-pid, 'SIGKILL');
+  } catch {}
+}
+
+// runner 自己被 Ctrl+C 時，盡力把當前指令樹一起帶走。子進程帶 windowsHide（沒有 console handle），
+// 收不到父 console 的 Ctrl+C，所以這裡的 taskkill 是**唯一**機制、不是保底；若 runner 是被 taskkill /F
+// 之類粗暴終止，本處理器根本不會執行，那層要靠 serve.mjs 的記帳起停兜底。
+process.on('SIGINT', () => {
+  killTree(currentChild && currentChild.pid);
+  process.exit(130);
+});
+
+function makeSink() {
+  const chunks = [];
+  let total = 0;
+  return {
+    push(c) {
+      chunks.push(c);
+      total += c.length;
+      while (total > MAX_BUF && chunks.length > 1) total -= chunks.shift().length;
+    },
+    buffer: () => {
+      const b = Buffer.concat(chunks);
+      // 丟掉最舊 chunk 後，保留段開頭可能落在多位元組 UTF-8 字元中間，會讓 decodeOutput 的嚴格
+      // 解碼整段失敗、退到 latin1 亂碼。往前跳過續接位元組（0b10xxxxxx）對齊到字元起點。
+      let i = 0;
+      while (i < b.length && i < 3 && (b[i] & 0xc0) === 0x80) i++;
+      return i ? b.subarray(i) : b;
+    },
+  };
+}
+
+// 跑一條指令，回 { stdout, stderr, exitCode, timedOut, error, shellPid }。
+// shellPid 是這條指令的外殼（cmd.exe）pid，S2 補刀的血緣判準要靠它認「這是我起的」。
+function runCommand(cmd, cwd, timeoutMs) {
+  return new Promise(res => {
+    const out = makeSink();
+    const err = makeSink();
+    let done = false, exited = false, endedStreams = 0, timedOut = false, exitCode = 1, spawnError = null;
+    let timeoutTimer = null, graceTimer = null, hardStopTimer = null;
+
+    const child = spawn(cmd, {
+      cwd,
+      shell: true,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'], // stdin 直接關掉，指令不會卡在等輸入
+      env: { ...process.env, PYTHONIOENCODING: 'utf-8', LANG: 'C.UTF-8' },
+    });
+    currentChild = child;
+
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timeoutTimer);
+      clearTimeout(graceTimer);
+      clearTimeout(hardStopTimer);
+      // 放棄等待後主動關掉管線：孤兒若還在輸出，下次寫入會拿到 EPIPE，runner 也不會繼續替它
+      // 收到 MAX_BUF 上限。
+      try { child.stdout.destroy(); child.stderr.destroy(); } catch {}
+      currentChild = null;
+      res({ stdout: out.buffer(), stderr: err.buffer(), exitCode, timedOut, error: spawnError, shellPid: child.pid });
+    };
+
+    timeoutTimer = setTimeout(() => {
+      timedOut = true;
+      killTree(child.pid);
+      // taskkill 殺不動（提權子進程、taskkill 不在 PATH、防毒攔截）時 'exit' 永遠不來。
+      // 排一道保險期限：到期自己 kill 一次外殼並無論如何結算，逾時路徑一定會回來。
+      hardStopTimer = setTimeout(() => {
+        try { child.kill('SIGKILL'); } catch {}
+        finish();
+      }, HARD_STOP_AFTER_KILL_MS);
+    }, timeoutMs);
+
+    child.stdout.on('data', c => out.push(c));
+    child.stderr.on('data', c => err.push(c));
+    const onStreamEnd = () => { endedStreams++; if (exited && endedStreams >= 2) finish(); };
+    child.stdout.on('end', onStreamEnd);
+    child.stderr.on('end', onStreamEnd);
+
+    child.on('error', e => { spawnError = e; exitCode = 1; exited = true; finish(); });
+    child.on('exit', code => {
+      exited = true;
+      // 進程已退出就停掉逾時計時器：後面還有最多 2 秒寬限窗口，計時器留著會誤報「逾時」
+      // （誤導 debug 方向）並對已死的 pid 再打一次 taskkill。
+      clearTimeout(timeoutTimer);
+      exitCode = code == null ? 1 : code; // 被訊號殺掉時 code 為 null，一律當失敗
+      if (endedStreams >= 2) finish();
+      else graceTimer = setTimeout(finish, GRACE_AFTER_EXIT_MS);
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// S2 埠差集補刀：抓外殼已退出、卻把 server 留下的孤兒（見檔頭說明）。
+// ---------------------------------------------------------------------------
+const REAP_ENABLED = process.platform === 'win32';
+const portOf = key => { const i = key.lastIndexOf(':'); return i < 0 ? '' : key.slice(i + 1); };
+
+// 一次 netstat -ano 拿 IPv4＋IPv6 全部 LISTENING，回 Map<"位址:埠", pid>；失敗回 null（該輪跳過補刀）。
+function snapshotListeners() {
+  if (!REAP_ENABLED) return null;
+  try {
+    const r = spawnSync('netstat', ['-ano'], { encoding: 'buffer', maxBuffer: 16 * 1024 * 1024, windowsHide: true });
+    if (r.status !== 0 || !r.stdout) return null;
+    const map = new Map();
+    for (const line of r.stdout.toString('latin1').split(/\r?\n/)) {
+      const p = line.trim().split(/\s+/);
+      if (p.length < 5 || p[0] !== 'TCP' || p[3] !== 'LISTENING') continue;
+      map.set(p[1], p[4]);
+    }
+    return map;
+  } catch {
+    return null;
+  }
+}
+
+// 查全機進程表（只在候選非 0 時才付這次 PowerShell 的成本）。
+// 回 Map<pid, { created: epoch ms, ppid, cmdline }>；查不到的 pid 不會出現在 Map 裡（呼叫端一律不動）。
+// 為什麼是全機而不是只查候選：血緣判準要沿 ParentProcessId 鏈往上走好幾跳，逐跳各查一次要付好
+// 幾次 PowerShell 冷啟。而全機查完全不比只查幾個 pid 貴——本機實測兩種寫法都是 7–15 秒，成本全在
+// 冷啟（單獨起 powershell 什麼都不做就要 2 秒）與 CIM 模組載入，不在掃描量（全機 440 進程約 170KB）。
+function queryProcessTable() {
+  const script =
+    `$r=@(Get-CimInstance Win32_Process | ` +
+    `Select-Object ProcessId,ParentProcessId,@{n='Created';e={$_.CreationDate.ToUniversalTime().ToString('o')}},CommandLine); ` +
+    `ConvertTo-Json -InputObject $r -Compress`;
+  try {
+    const r = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', script], {
+      encoding: 'utf8', windowsHide: true, maxBuffer: 4 * 1024 * 1024,
+    });
+    const txt = String(r.stdout || '').trim();
+    if (!txt) return new Map();
+    const data = JSON.parse(txt);
+    const map = new Map();
+    for (const it of Array.isArray(data) ? data : [data]) {
+      if (!it || it.ProcessId == null) continue;
+      const created = Date.parse(it.Created);
+      map.set(String(it.ProcessId), {
+        created: Number.isNaN(created) ? NaN : created,
+        ppid: Number(it.ParentProcessId),
+        cmdline: it.CommandLine || '',
+      });
+    }
+    return map;
+  } catch {
+    return new Map();
+  }
+}
+
+// serve.mjs 的登記檔（.constellation/.servers.json）裡的 pid／外殼 pid：那些 server 由 serve.mjs 的
+// stop／SessionEnd 負責收，補刀一律不碰，否則兩層機制互打（驗證指令用 serve.mjs start 起的 server 會被
+// 下一次補刀殺掉，後續指令拿到假紅燈，登記檔還留一筆鬼魂）。讀不到／格式壞掉一律當空集合，不擋主流程。
+function registeredPids(cwd) {
+  const pids = new Set();
+  try {
+    const list = JSON.parse(stripBom(readFileSync(join(cwd, '.constellation', '.servers.json'), 'utf8')));
+    if (Array.isArray(list)) {
+      for (const e of list) {
+        if (e && e.pid != null) pids.add(String(e.pid));
+        if (e && e.shellPid != null) pids.add(String(e.shellPid));
+      }
+    }
+  } catch {}
+  return pids;
+}
+
+// 血緣判準：候選進程必須沿 ParentProcessId 鏈往上走得回本條指令的外殼 pid，才算「這是我起的」。
+// Windows 在父進程死後仍保留子進程的 ParentProcessId 欄位值，所以外殼早就退出（`start /b` 的
+// cmd、detached spawn 的中間層）照樣追得回來——這正是埠差集抓得到、而「父進程還活著嗎」判不出來
+// 的那一類孤兒。鏈上每一跳（含候選自己）的建立時間都必須晚於本條指令開始：pid 被系統重新發出後，
+// 新進程的 ParentProcessId 可能剛好等於本條指令的外殼 pid，時間檢查把這種假鏈夾掉。
+// 往上走到「不在表裡的 pid」（中間層自己也退出了）、建立時間對不上、或超過 10 跳，一律判定不是
+// 我起的、不殺——別的專案／session／worktree 的孤兒都停在這裡。
+const MAX_LINEAGE_HOPS = 10;
+
+function isOwnDescendant(pid, shellPid, table, cmdStartMs) {
+  const shell = Number(shellPid);
+  if (!Number.isInteger(shell) || shell <= 0) return false; // 沒有外殼 pid（spawn 就失敗）＝沒起過東西
+  let cur = String(pid);
+  for (let hop = 0; hop < MAX_LINEAGE_HOPS; hop++) {
+    const node = table.get(cur);
+    if (!node) return false;
+    if (!(node.created >= cmdStartMs)) return false; // NaN（建立時間解析不出來）也走這條，不殺
+    if (node.ppid === shell) return true;
+    cur = String(node.ppid);
+  }
+  return false;
+}
+
+// 命令列太長時保留頭尾：開頭看得出是哪個執行檔，結尾才是能辨識身分的 script 名與參數
+// （只印開頭的話，node.exe 絕對路徑加長專案路徑會把 script 名整個吃掉；誤殺時這行是唯一線索）。
+function briefCmd(s) {
+  const t = String(s || '').trim().replace(/\s+/g, ' ');
+  return t.length <= 110 ? t : `${t.slice(0, 30)}…${t.slice(-70)}`;
+}
+
+// 差集比對＋四道豁免（白名單埠／serve.mjs 登記／建立時間／血緣）＋殺＋複驗。
+// before/after 任一為 null（非 Windows／netstat 失敗）就整個跳過。
+function reapOrphanServers(before, after, cmdStartMs, protectedPorts, cwd, shellPid) {
+  if (!before || !after) return;
+  const registered = registeredPids(cwd);
+  const suspects = [];
+  for (const [key, pid] of after) {
+    if (before.get(key) === pid) continue; // key 沒變且 pid 沒變 → 本來就在
+    if (protectedPorts.has(portOf(key))) continue;
+    if (registered.has(pid)) continue; // serve.mjs 記帳管著的，不歸補刀處理
+    suspects.push({ key, pid });
+  }
+  if (!suspects.length) return;
+
+  const info = queryProcessTable();
+  const killed = new Set();
+  for (const { key, pid } of suspects) {
+    if (killed.has(pid)) continue;
+    const p = info.get(pid);
+    if (!p) continue; // 查不到（已消失／查詢失敗）→ 不動
+    if (!(p.created >= cmdStartMs)) continue; // 建立時間早於本條指令開始 → 不是這條起的，不殺
+    if (!isOwnDescendant(pid, shellPid, info, cmdStartMs)) continue; // 血緣追不回本條指令的外殼 → 不是我起的，不殺
+    killed.add(pid);
+    killTree(pid);
+    console.error(`清掉殘留 server：port ${portOf(key)} PID ${pid}（${briefCmd(p.cmdline)}）`);
+  }
+  if (!killed.size) return;
+
+  const verify = snapshotListeners();
+  if (!verify) return;
+  for (const { key, pid } of suspects) {
+    if (killed.has(pid) && verify.get(key) === pid) {
+      console.error(`⚠ 殘留 server 未釋放：port ${portOf(key)} PID ${pid} 仍在 LISTENING`);
+    }
+  }
+}
+
 function ticketTitle(raw) {
   for (const l of String(raw).split(/\r?\n/)) {
     const t = l.trim();
@@ -300,7 +572,7 @@ function appendEvidence(content, entryText) {
   return `${before}${needsNL}${entryText}\n${after}`;
 }
 
-function main() {
+async function main() {
   const { ticket, cwd: cwdArg, scope: scopeArg } = parseArgs(process.argv.slice(2));
   const scope = scopeArg || 'ticket';
   if (scope !== 'ticket' && scope !== 'ship') {
@@ -352,23 +624,24 @@ function main() {
   const timeoutSec = Number(config.timeoutSec);
   const timeoutMs = (Number.isFinite(timeoutSec) && timeoutSec > 0 ? timeoutSec : 600) * 1000;
 
+  // protectedPorts：config 可選的白名單埠（陣列），S2 補刀一律跳過這些埠。
+  const protectedPorts = new Set((Array.isArray(config.protectedPorts) ? config.protectedPorts : []).map(String));
+
   const results = [];
   const scopeStartMs = Date.now();
+  let beforeSnap = snapshotListeners();
   for (const cmd of commands) {
     const cmdStartMs = Date.now();
-    const r = spawnSync(cmd, {
-      cwd,
-      shell: true,
-      encoding: 'buffer',
-      env: { ...process.env, PYTHONIOENCODING: 'utf-8', LANG: 'C.UTF-8' },
-      maxBuffer: 20 * 1024 * 1024,
-      timeout: timeoutMs,
-    });
+    const r = await runCommand(cmd, cwd, timeoutMs);
     const durSec = Math.round((Date.now() - cmdStartMs) / 1000);
+    // 每條指令跑完就 reap（含逾時、含失敗）——下面所有 process.exit 出口因此都已清乾淨。
+    const afterSnap = snapshotListeners();
+    reapOrphanServers(beforeSnap, afterSnap, cmdStartMs, protectedPorts, cwd, r.shellPid);
+    beforeSnap = afterSnap; // 前一條的 after 直接當下一條的 before
     const outDecoded = decodeOutput(r.stdout);
     const errDecoded = decodeOutput(r.stderr);
-    const timedOut = r.error && r.error.code === 'ETIMEDOUT';
-    const exitCode = r.error ? 1 : (r.status ?? 1);
+    const timedOut = r.timedOut;
+    const exitCode = r.error ? 1 : r.exitCode;
     if (exitCode !== 0) {
       console.error(`驗證失敗：\`${cmd}\`（exit ${exitCode}，${durSec}s）`);
       if (timedOut) console.error(`逾時：超過 ${timeoutMs / 1000} 秒未結束，已強制終止該指令。`);
@@ -448,4 +721,8 @@ function main() {
   process.exit(0);
 }
 
-main();
+main().catch(e => {
+  console.error(`Constellation 驗證 runner 內部錯誤：${e && e.stack ? e.stack : e}`);
+  killTree(currentChild && currentChild.pid);
+  process.exit(1);
+});
