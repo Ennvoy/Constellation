@@ -156,7 +156,7 @@ zone: src/auth/**, tests/auth/**   # 檔案界線（平行時互斥用）
 | 2 | commit 守門 | hook ＋ git pre-commit | commit 前掃 secrets／垃圾產物（自 Flow 原封搬入）。**兩條呼叫路徑、同一套判定**：PreToolUse hook 攔 Claude Code 發起的 commit；git 原生 pre-commit（`--precommit` 入口，由 session 開場冪等安裝）兜住使用者手打／子行程／npm script／MCP 發起的 commit——後者是前者攔不到的整批繞法 |
 | 3 | session 開場注入 | hook | 兼任**「定稿有沒有真的落地」的哨兵**（§3 第 5b／7 點）：`grill-close.md` 記著需要 UI、且已有 design 定稿決議時，順手驗 `design-frozen.json` 存在、`frozen` 非空、名單每個路徑都真的在 repo——不成立就在開場印醒目警示。**這是既有閘門加一段讀檔，不是第六個閘門**（不違反本節末「不加新硬閘」）。從 `.constellation/` 重建現況並注入**純導航**——置頂強制讀檔指令（含決議查法）＋票況＋**地圖模組索引與過期警示**＋HISTORY 最近輪次＋決策一行摘要＋詞彙一行摘要（§4）。**只有地圖是清單級，其餘皆摘要級**，故注入量與專案年齡解耦。過期警示只比對檔案增刪改名、不解析內容，故不因專案語言而異 |
 | 4 | 驗證 runner | script | 實跑驗證（`--scope` 分逐票／出貨兩級；逐票優先吃票內「驗證指令」縮圈清單，無則 config 全量——縮圈顯式、fallback 全量），pass 證據附簽章寫入票（ship 級寫入 `.constellation/ship-evidence.md`）；內建**斷路器**——同一目標連續 5 次失敗即強制停下請使用者拍板，不無限重試；證據筆附各指令耗時行（純紀錄，不參與簽章與判定） |
-| 5 | 關票刷卡機 | hook | 票標 done 時機器驗證據簽章與新鮮度（24h）＋驗收條件全勾，不過直接擋下；兼任**定稿 UI 凍結守衛**——編輯 design-frozen.json 名單內的檔案一律擋下，解凍須經使用者同意並留日誌 |
+| 5 | 關票刷卡機 | hook | 票標 done 時機器驗證據簽章與新鮮度（24h）＋驗收條件全勾，不過直接擋下；兼任**定稿 UI 凍結守衛**——編輯 design-frozen.json 名單內的檔案一律擋下，解凍須經使用者同意並留日誌；兼任**現況覆蓋閘門**（2026-08-18 使用者拍板加入，同閘門 3 模式屬既有閘門加職責、非第六閘）——定稿凍結（寫入 design-frozen.json 且 frozen 非空）時驗 `.constellation/design-baseline.json`：每張畫面判過 new/rework、rework 的 sources 非空且路徑存在（fail-closed），防「改造型畫面沒把現況送上設計服務、憑文字畫出相似新頁面」（§3；起因 2026-08-18 實踩） |
 
 驗證證據由 runner 以本機 secret（install 時生成於使用者家目錄，不進 git）簽章（簽章綁定 repo，防跨專案重放）、刷卡機驗簽——手填時間戳無法通過，「機器擋假完成」才真正成立。commit 守門另做一道 **done 票稽核**：commit 時 staged 的 done 票必須含通過驗簽的證據，堵「用 shell 指令繞過刷卡機改檔」的旁門。
 

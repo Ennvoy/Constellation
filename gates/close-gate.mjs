@@ -421,6 +421,90 @@ function checkFrozenApplyPatch(patchText, cwd) {
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// 現況覆蓋閘門（design-baseline，2026-08-18 新增；DESIGN.md §3）：定稿凍結（寫入 design-frozen.json
+// 且 frozen 非空）之前，必須存在 `.constellation/design-baseline.json`，證明本輪每張畫面在生成前
+// 做過「全新 vs 改造」的判別，且改造型畫面的現況結構真的送上去過（推現況元件或從真 code 抽精確
+// 結構，sources 記來源檔）。起因：2026-08-18 實際踩到——條文有寫「改造既有畫面要把現況推上去」
+// 但沒有閘門，執行漏了，Claude Design 憑文字畫出「相似的新頁面」，使用者對照真系統才發現表格
+// 結構全不一樣。**此檢查刻意 fail-closed**（baseline 缺失／壞 JSON／rework 缺 sources 都擋）——
+// 凍結是 design 收尾必經之路，這裡不擋就等於沒有閘門；非 UI 專案不寫 design-frozen.json、不觸發。
+// baseline 格式：{ "screens": [ { "screen": "<畫面名>", "kind": "new"|"rework",
+//   "sources": ["<repo 相對路徑>", ...] } ] }——kind=rework 時 sources 必須非空且每個路徑存在。
+// ---------------------------------------------------------------------------
+const DESIGN_BASELINE_REL = '.constellation/design-baseline.json';
+
+function baselineMessage(reason) {
+  return [
+    `Constellation 現況覆蓋閘門：擋下——要定稿凍結（寫入 design-frozen.json），但 ${DESIGN_BASELINE_REL} ${reason}。`,
+    '  → design 階段動筆寫需求前，須逐張畫面判別「全新（new）vs 改造既有（rework）」並寫入該檔；',
+    '    rework 的 sources 填現況結構的來源檔（推上設計系統的來源、或抽精確結構的 repo 檔案路徑），',
+    '    這是防止設計服務憑文字畫出「相似新頁面」的硬檢查點（phase-design.md 步驟 2 的現況覆蓋檢查）。',
+  ].join('\n');
+}
+
+// 寫入內容是否為「frozen 非空」的定稿凍結動作：Write 看 content、Edit/MultiEdit/apply_patch 因為
+// 只有片段，一律視為可能構成凍結（保守觸發——誤觸發的代價只是提醒補 baseline，漏放行的代價是
+// 整個閘門形同虛設）。content 解析失敗也保守觸發。
+function writeContentFreezes(content) {
+  try {
+    const data = JSON.parse(stripBom(String(content)));
+    return !!(data && Array.isArray(data.frozen) && data.frozen.length);
+  } catch {
+    return true;
+  }
+}
+
+function checkDesignBaseline(cwd) {
+  let rawBaseline;
+  try {
+    rawBaseline = readFileSync(join(resolve(cwd), '.constellation', 'design-baseline.json'), 'utf8');
+  } catch {
+    return BLOCK(baselineMessage('不存在'));
+  }
+  let data;
+  try { data = JSON.parse(stripBom(rawBaseline)); } catch { return BLOCK(baselineMessage('不是合法 JSON')); }
+  const screens = data && Array.isArray(data.screens) ? data.screens : null;
+  if (!screens || !screens.length) return BLOCK(baselineMessage('的 screens 是空的'));
+  for (const s of screens) {
+    const name = s && typeof s.screen === 'string' ? s.screen : '(未命名畫面)';
+    const kind = s && s.kind;
+    if (kind !== 'new' && kind !== 'rework') {
+      return BLOCK(baselineMessage(`裡「${name}」的 kind 不是 new/rework`));
+    }
+    if (kind === 'rework') {
+      const sources = Array.isArray(s.sources) ? s.sources.filter(x => typeof x === 'string' && x.length) : [];
+      if (!sources.length) return BLOCK(baselineMessage(`裡改造型畫面「${name}」的 sources 是空的——現況結構沒送上去`));
+      for (const src of sources) {
+        let ok = false;
+        try { readFileSync(resolve(cwd, src)); ok = true; } catch { ok = false; }
+        if (!ok) return BLOCK(baselineMessage(`裡「${name}」的 sources 路徑不存在於 repo：${src}`));
+      }
+    }
+  }
+  return null;
+}
+
+// 現況覆蓋閘門入口：目標是 design-frozen.json 且此寫入構成凍結 → 驗 baseline。回 BLOCK 或 null。
+function checkBaselineGuard(tool, ti, input) {
+  const cwd = resolveCwd(input);
+
+  if (tool === 'Write' || tool === 'Edit' || tool === 'MultiEdit') {
+    const filePath = String(ti.file_path ?? ti.filePath ?? '');
+    if (!filePath) return null;
+    const isFrozenFile = DESIGN_FROZEN_PATH_RE.test(filePath) || normalizeRepoRelPath(filePath, cwd) === DESIGN_FROZEN_REL;
+    if (!isFrozenFile) return null;
+    if (tool === 'Write' && !writeContentFreezes(ti.content)) return null; // 清空歸檔不觸發
+    return checkDesignBaseline(cwd);
+  }
+
+  const patchText = firstNonEmptyString(ti.patch, ti.command, input.patch, input.command);
+  if (patchText && /(^|[\\/])\.constellation[\\/]design-frozen\.json/i.test(patchText) && /\*\*\* (Update|Add) File:/.test(patchText)) {
+    return checkDesignBaseline(cwd);
+  }
+  return null;
+}
+
 // 統一入口：依工具型態取出目標檔案路徑（Write／Edit／MultiEdit 用 file_path；apply_patch 用 patch
 // 文字裡的 Update File 路徑），交給 checkFrozenPath／checkFrozenApplyPatch 判定。回 BLOCK(...) 或
 // null（沒事，呼叫端繼續往下走既有的 done 票檢查）。
@@ -449,6 +533,10 @@ export function closeGateCheck(input) {
   // 定稿 UI 凍結守衛先檢查——與下面的 done 票檢查各自獨立觸發，不因其中一項 PASS 就跳過另一項。
   const frozenBlock = checkFrozenGuard(tool, ti, input);
   if (frozenBlock) return frozenBlock;
+
+  // 現況覆蓋閘門（design-baseline）——攔「定稿凍結」動作，驗改造型畫面的現況結構已送上去。
+  const baselineBlock = checkBaselineGuard(tool, ti, input);
+  if (baselineBlock) return baselineBlock;
 
   if (tool === 'Write') {
     const filePath = String(ti.file_path ?? ti.filePath ?? '');
