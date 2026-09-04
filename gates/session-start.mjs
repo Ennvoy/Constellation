@@ -399,7 +399,8 @@ function buildDesignSentinel(base, root) {
 
   let names = [];
   try { names = readdirSync(join(base, 'decisions')).filter(f => f.toLowerCase().endsWith('.md')); } catch { return null; }
-  const finalDoc = names.find(f => /design-final/i.test(f));
+  // 取編號最大（最新）那筆——舊寫法 names.find 抓字母序第一筆，會拿舊輪的定稿記錄來驗（2026-09-04 誤報 075 實際已到 284）。
+  const finalDoc = names.filter(f => /design-final/i.test(f)).sort().pop();
   if (!finalDoc) return null; // 還沒定稿——交給 weave 轉交 design，這裡不叫
 
   const problems = [];
