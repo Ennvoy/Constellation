@@ -68,8 +68,8 @@ const STATUSES = ['open', 'in-progress', 'blocked', 'done'];
 
 // 導航模式各段上限（DESIGN.md §4「接續」）。索引級內容成長極慢，這些只是防怪檔的保險。
 const DECISION_LIST_MAX = 20;        // decisions/ ≤ 此數才逐筆列標題；超過只給「總數＋最近編號範圍＋查法」
-const HISTORY_MAX_LINES = 40;        // HISTORY.md（最新在最上，取檔案開頭即最近輪次）
 const MAP_INDEX_MAX_LINES = 55;      // MAP.md 只注入「模組索引」表；其餘章節同樣走導航靠 Read
+const MAP_LINE_MAX_CHARS = 200;      // 模組索引單行字元上限：表格偶有塞了整段機制說明的巨行，一行就能吃光整包額度
 const SUMMARY_MAX_CHARS = 9000;      // 總量 failsafe：runtime 10k 字元門檻的安全線，超線硬截保可見
 
 function readTextSafe(p) {
@@ -253,6 +253,26 @@ function mapSemanticDrift(raw, root, rows, skipFrom, skipTo, deadLines) {
     `——資料表口徑／缺口／地雷是機器讀不懂的，請逐條複驗這幾行還算不算數。`;
 }
 
+// 單行截斷，表格列保留最後一欄：模組索引多半是 markdown 表格（`| 功能 | 是什麼 | 在哪 |`），
+// 「在哪」是最後一欄、也是整段注入的重點（MAP.md 自己寫著「路徑是本段的重點」）——直接照字元數砍到
+// MAP_LINE_MAX_CHARS 會把最後一欄整個切掉，路徑欄消失、那一列等於白注入。trim 後以 `|` 開頭才視為
+// 表格列：找出最後一個與倒數第二個 `|` 之間的區段當作「最後一欄」原樣保留，只把它前面的內容砍到
+// 剩餘的字元預算，砍完接一個刪節號再把最後一欄接回去；表格列判斷不成立、或最後一欄本身就超過整行
+// 上限（找不到倒數第二個 `|`，或留給前段的預算不夠一個字）時，退回原本的整行截斷。非表格行不受影響。
+function truncateMapLine(line, max) {
+  if (line.length <= max) return line;
+  if (/^\s*\|/.test(line)) {
+    const lastPipe = line.lastIndexOf('|');
+    const secondLastPipe = lastPipe > 0 ? line.lastIndexOf('|', lastPipe - 1) : -1;
+    if (secondLastPipe > 0) {
+      const lastCell = line.slice(secondLastPipe); // 含起手的 '|'，即最後一欄原樣保留
+      const headBudget = max - lastCell.length - 1; // 留一個字元給刪節號
+      if (headBudget > 0) return line.slice(0, headBudget) + '…' + lastCell;
+    }
+  }
+  return line.slice(0, max) + '…';
+}
+
 // 專案現況地圖導航：只注入「模組索引」那一章（東西在哪、進哪個檔改），資料表／已知資料缺口／
 // 地雷等章節留在檔案裡靠置頂指令引導 Read——與知識軌同一套導航紀律，不讓地圖把注入額度吃光。
 // 整段 fail-open：地圖是輔助資訊，壞檔／git 異常都只是少這一段，絕不拖垮票況注入。
@@ -275,8 +295,9 @@ function buildMapSection(base, root) {
       body = all.slice(start + 1, end);
       while (body.length && !body[0].trim()) body.shift();
     }
-    const shown = body.length
-      ? capLines(body.join('\n'), MAP_INDEX_MAX_LINES, '.constellation/MAP.md')
+    const truncated = body.map(l => truncateMapLine(l, MAP_LINE_MAX_CHARS));
+    const shown = truncated.length
+      ? capLines(truncated.join('\n'), MAP_INDEX_MAX_LINES, '.constellation/MAP.md')
       : ['  （MAP.md 尚無模組索引章節——請直接 Read 原檔）'];
 
     // 三道過期檢查（DESIGN.md §4），一律放表格前面免得被 55 行模組索引蓋掉。
@@ -380,11 +401,18 @@ function buildDecisionsSection(base) {
   return { text: lines.join('\n'), count: files.length };
 }
 
+// 「（流程外，無票）」的輪次（phase-grill.md「流程外」三條件成立時的簡化記法）不算一輪正式流程，
+// 計「共 N 輪」與「最近一輪」都要排除，不然流程外的一行摘要會被誤算進輪次計數、甚至被當成「最近
+// 一輪」報出來。
 function buildHistorySection(base) {
   const raw = readTextSafe(join(base, 'HISTORY.md'));
   if (!raw || !raw.trim()) return null;
-  return { text: ['【出貨輪次史（.constellation/HISTORY.md，最新在上）】',
-    ...capLines(raw, HISTORY_MAX_LINES, '.constellation/HISTORY.md')].join('\n') };
+  const headings = raw.split(/\r?\n/)
+    .filter(l => /^##\s/.test(l))
+    .filter(l => !l.includes('（流程外，無票）'));
+  const count = headings.length;
+  const latestHeading = headings[0] ? headings[0].replace(/^##\s*/, '').trim() : '（無輪次標題）';
+  return { text: `【輪次史（HISTORY.md）】共 ${count} 輪，最近一輪：${latestHeading}——全文請 Read` };
 }
 
 // 閘門 3 兼任的 design 哨兵（DESIGN.md §5 閘門 3、§3 第 5b／7 點）。純讀檔，不是第六個閘門。
@@ -492,6 +520,13 @@ function buildSummary(cwd) {
   try { hist = buildHistorySection(base); } catch { /* fail-open */ }
   try { designWarn = buildDesignSentinel(base, root); } catch { /* fail-open */ }
 
+  // 操作把手（驗證 runner／server 起停）：緊跟在【開工前必讀】後面、票況之前——
+  // 這兩行是「動手前先怎麼跑」，比票況更前置，不該埋在整串注入的最後才被看到。
+  const toolLines = [
+    `驗證 runner：node "${VERIFY_RUNNER_ABS_PATH}"`,
+    `起停 server：node "${SERVE_ABS_PATH}" start|stop|list`,
+  ];
+
   // 置頂強制讀檔指令：知識本體不在注入裡——放最前面，任何情況下最先被看到。
   if (map || ctx || dec) {
     const reads = [];
@@ -521,7 +556,9 @@ function buildSummary(cwd) {
       parts.push(`決議在 .constellation/decisions/，共 ${dec.count} 筆，編號越大越新；` +
         '要查特定主題請列目錄或用關鍵字搜尋（檔名與內文都搜），不要假設沒看到就不存在。');
     }
-    lines.unshift(parts.join(''));
+    lines.unshift(parts.join(''), ...toolLines);
+  } else {
+    lines.push(...toolLines); // 沒有地圖／脈絡／決議可導航（例如工作流母本自己）時仍要露出這兩行
   }
   // design 哨兵緊跟票況：它講的是「這一輪的 UI 到底定稿了沒」，屬於現況而非知識軌，
   // 且不成立時會擋住 weave，所以要排在地圖與脈絡之前先被看到。
@@ -530,8 +567,6 @@ function buildSummary(cwd) {
   if (hist) lines.push(hist.text);
   if (dec) lines.push(dec.text);
   if (ctx) lines.push(ctx.text);
-  lines.push(`驗證 runner：node "${VERIFY_RUNNER_ABS_PATH}"`);
-  lines.push(`起停 server：node "${SERVE_ABS_PATH}" start|stop|list`);
 
   let summary = lines.join('\n');
   // failsafe：索引級內容理論上不會超線；萬一撞上（極端怪檔），硬截保「開場可見」優先於完整——

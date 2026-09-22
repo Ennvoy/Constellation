@@ -338,7 +338,7 @@ function checkApplyPatch(patchText, input) {
     if (!STATUS_DONE_ADDED_RE.test(segment)) continue;
 
     const absPath = resolve(cwd, marker.path);
-    const r = verifyFromDisk(absPath, cwd);
+    const r = finalizeDoneCheck(verifyFromDisk(absPath, cwd), segment, cwd, absPath);
     if (r.block) return r;
   }
   return PASS;
@@ -402,6 +402,140 @@ function checkFrozenPath(filePath, cwd) {
   const rel = normalizeRepoRelPath(filePath, cwd);
   const hit = frozen.some(f => normalizeRepoRelPath(f, cwd) === rel);
   return hit ? BLOCK(frozenMessage(filePath)) : null;
+}
+
+// ---------------------------------------------------------------------------
+// 解凍回凍檢查（本輪新增）：關票（status: done）驗簽通過後，再核對 design-frozen.json 的 `log`——
+// 若有路徑解凍過（action: unfreeze）但依 log 陣列順序之後沒有同路徑的 refreeze／freeze、且該路徑
+// 目前也不在 `frozen` 陣列內，視為「解凍後還沒回凍」。除非這張票要寫入的新內容裡「## 決議記錄」
+// 段落已含該路徑字串（等同已寫明原因），否則擋下——把 phase-build.md「撞到凍結怎麼辦」那套本來只
+// 在出貨階段靠 Spec 軸人工核對的紀律，提早搬到關票這一步機器擋。design-frozen.json 不存在或解析
+// 失敗一律 fail-open（跳過，不影響沒用到定稿凍結機制的專案）；只在「這次編輯把票的 status 改成
+// done」的情境下觸發，其他編輯不查。
+// 兩處鏡像修復：①「## 決議記錄」的搜尋來源除了這次編輯的片段，另外併入磁碟現檔——Edit 只帶
+// new_string、apply_patch 只帶 diff segment，決議記錄多半已經寫在磁碟其他地方，只看片段必然找不到
+// （見 finalizeDoneCheck）。②未回凍判定以「這次關的票號」為範圍——從票檔路徑（`tickets/T-NNN-*.md`
+// 慣例）取出票號，只比對 log 裡帶同一個 `ticket` 欄的 unfreeze／refreeze 事件；沒有 `ticket` 欄的舊
+// 格式記錄維持不分票的舊行為（見 computeUnrefrozenPaths）。否則同一輪內任何一張票解凍過的路徑，
+// 會讓輪內所有其他票關票都被擋，除非每張票各自重抄一次決議記錄。
+// ---------------------------------------------------------------------------
+const DECISION_HEADING_RE = /^##\s*決議記錄.*$/m;
+// 票檔路徑裡的票號（`tickets/T-NNN-slug.md` 慣例，見 ticket-template.md「命名規則」）。
+const TICKET_ID_RE = /[\\/]tickets[\\/](T-\d+)/i;
+
+function extractTicketId(filePath) {
+  const m = String(filePath).match(TICKET_ID_RE);
+  return m ? m[1].toUpperCase() : null;
+}
+
+function decisionSection(content) {
+  const text = String(content ?? '');
+  const m = text.match(DECISION_HEADING_RE);
+  if (!m) return '';
+  const after = m.index + m[0].length;
+  const rest = text.slice(after);
+  const next = rest.match(/\n##\s/);
+  return next ? rest.slice(0, next.index) : rest;
+}
+
+// 讀 design-frozen.json 的 frozen／log 兩個陣列；檔案不存在、不是合法 JSON、或 frozen 缺欄／不是
+// 陣列，一律回 null（呼叫端 fail-open，跳過此檢查）——與 readFrozenList 同一套 fail-open 判準一致，
+// 不把「frozen 缺欄」誤判成「frozen 是空陣列」照樣往下驗（空陣列＝確實沒東西被凍結，缺欄＝格式本身
+// 不對，不該被此檢查依賴）。
+function readDesignFrozenLog(cwd) {
+  try {
+    const p = join(resolve(cwd), '.constellation', 'design-frozen.json');
+    const data = JSON.parse(stripBom(readFileSync(p, 'utf8')));
+    if (!data || typeof data !== 'object' || !Array.isArray(data.frozen)) return null;
+    const frozen = data.frozen.filter(f => typeof f === 'string' && f.length);
+    const log = Array.isArray(data.log) ? data.log : [];
+    return { frozen, log };
+  } catch {
+    return null;
+  }
+}
+
+// 依 log 陣列順序逐筆推算每個 path 的最終解凍狀態：遇到 unfreeze 記為未回凍、遇到 refreeze／freeze
+// 記為已回凍——最後一筆事件即代表現況，等同「每筆 unfreeze 之後有沒有同 path 的 refreeze/freeze」逐
+// 筆核對。**按票號分流**：entry.ticket 有寫（新格式，見 phase-build.md 的 log 寫法）就併入該票自己
+// 的狀態機，只有 `currentTicket` 自己造成的未回凍才算數，不受同輪其他票的解凍狀態影響；entry.ticket
+// 沒寫（沿用舊格式或手動補的記錄）退回「不分票」的舊行為——任何一張票關票都要擋，不因為新增分流就
+// 放寬既有紀律。**路徑比對正規化**：分組 key 與 frozen 陣列的比對一律先經 normalizeRepoRelPath（與
+// checkFrozenPath 同一套正規化：反斜線轉正斜線、去 repo 根前綴、小寫）再比對，避免 log 與 frozen 兩邊
+// 分隔符或大小寫寫法不同就誤判成「還沒回凍」；輸出仍用原始寫法的 path（供訊息顯示與「## 決議記錄」
+// 內文比對，正規化後的小寫字串不該拿去跟人寫的原文做子字串比對）。action 比對前一律 toLowerCase，
+// 不因大小寫誤判事件種類而整筆被跳過。回傳目前仍「未回凍」且不在 frozen 陣列內、與 currentTicket
+// 有關的 path 清單（原始寫法）。
+function computeUnrefrozenPaths(log, frozen, currentTicket, cwd) {
+  const scoped = new Map();   // key: 正規化 path + ticket，只算與 currentTicket 同號的
+  const unscoped = new Map(); // key: 正規化 path，沒寫 ticket 欄的舊格式記錄，不分票
+  for (const entry of log) {
+    const rawPath = entry && entry.path;
+    if (typeof rawPath !== 'string' || !rawPath) continue;
+    const normPath = normalizeRepoRelPath(rawPath, cwd);
+    const ticket = entry && typeof entry.ticket === 'string' && entry.ticket ? entry.ticket.toUpperCase() : null;
+    const action = entry && typeof entry.action === 'string' ? entry.action.toLowerCase() : '';
+    const isRefrozen = action === 'refreeze' || action === 'freeze';
+    const isUnfreeze = action === 'unfreeze';
+    if (!isRefrozen && !isUnfreeze) continue;
+    if (ticket) scoped.set(`${normPath}\u0001${ticket}`, { path: rawPath, normPath, ticket, isRefrozen });
+    else unscoped.set(normPath, { path: rawPath, isRefrozen });
+  }
+  const frozenSet = new Set(frozen.map(f => normalizeRepoRelPath(f, cwd)));
+  const out = [];
+  for (const { path, normPath, ticket, isRefrozen } of scoped.values()) {
+    if (isRefrozen || frozenSet.has(normPath)) continue;
+    if (currentTicket && ticket === currentTicket) out.push(path);
+  }
+  for (const [normPath, { path, isRefrozen }] of unscoped) {
+    if (!isRefrozen && !frozenSet.has(normPath)) out.push(path);
+  }
+  return [...new Set(out)];
+}
+
+function unfreezeRefreezeMessage(paths) {
+  return [
+    'Constellation 關票刷卡機：擋下——關票前 design-frozen.json 顯示以下路徑解凍後尚未回凍，且這張票的' +
+      '「## 決議記錄」未寫明原因：',
+    ...paths.map(p => `  - ${p}`),
+    '  → 出路擇一：',
+    '    1. 補一筆 refreeze（或 freeze）記錄，把該檔重新納入 frozen 名單；',
+    '    2. 在這張票的「## 決議記錄」段落寫明保留解凍狀態的原因（內文需含該路徑字串）。',
+  ].join('\n');
+}
+
+// newContent：這次編輯要寫入的新內容（Write 的 content／Edit 的 new_string／MultiEdit 各 edit 的
+// new_string 串接／apply_patch 的 diff 片段，外加呼叫端併入的磁碟現檔），用來判斷「## 決議記錄」是否
+// 已寫明未回凍的路徑。currentTicket：這次關的票號（從票檔路徑取出），用來把未回凍判定限縮到這張票
+// 自己造成的部份，見 computeUnrefrozenPaths。
+function checkUnfreezeRefreeze(newContent, cwd, currentTicket) {
+  const data = readDesignFrozenLog(cwd);
+  if (!data) return null; // 檔案不存在或解析失敗 → fail-open，跳過
+
+  const unresolved = computeUnrefrozenPaths(data.log, data.frozen, currentTicket, cwd);
+  if (!unresolved.length) return null;
+
+  const section = decisionSection(newContent);
+  const stillUnresolved = unresolved.filter(p => !section.includes(p));
+  if (!stillUnresolved.length) return null;
+
+  return BLOCK(unfreezeRefreezeMessage(stillUnresolved));
+}
+
+// 關票驗簽放行之後、回 PASS 之前的收尾：驗簽本身已經擋下就直接回傳那個結果，沒擋下才補做解凍回凍
+// 檢查——兩者各自獨立判定，前者擋下不代表後者不用查（順序上驗簽先跑，故這裡先短路）。
+// filePath：這次要關的票檔路徑。①併入磁碟現檔內容一起搜尋「## 決議記錄」——Edit／MultiEdit／
+// apply_patch 只帶變更片段，決議記錄多半已經寫在磁碟其他地方，只看片段找不到（Write 本來就帶完整
+// 內容，併入磁碟版不影響結果，讀不到就只用 newContent，維持 fail-open）。②從路徑取出這次關的票號，
+// 交給 checkUnfreezeRefreeze 把未回凍判定限縮到這張票自己造成的部份（見 computeUnrefrozenPaths）。
+function finalizeDoneCheck(verifyResult, newContent, cwd, filePath) {
+  if (verifyResult.block) return verifyResult;
+  let combined = newContent;
+  if (filePath) {
+    try { combined = newContent + '\n' + stripBom(readFileSync(filePath, 'utf8')); } catch { /* fail-open：讀不到就只用 newContent */ }
+  }
+  const currentTicket = filePath ? extractTicketId(filePath) : null;
+  return checkUnfreezeRefreeze(combined, cwd, currentTicket) || PASS;
 }
 
 // apply_patch：對 patch 內全部 `*** Update File:` 路徑逐一檢查凍結（沿用 checkApplyPatch 同一套
@@ -543,7 +677,8 @@ export function closeGateCheck(input) {
     if (!filePath || !TICKET_PATH_RE.test(filePath)) return PASS;
     const content = ti.content;
     if (typeof content !== 'string' || !STATUS_DONE_RE.test(content)) return PASS;
-    return verifyEvidence(content, filePath, resolveCwd(input));
+    const cwd = resolveCwd(input);
+    return finalizeDoneCheck(verifyEvidence(content, filePath, cwd), content, cwd, filePath);
   }
 
   if (tool === 'Edit') {
@@ -551,7 +686,8 @@ export function closeGateCheck(input) {
     if (!filePath || !TICKET_PATH_RE.test(filePath)) return PASS;
     const newString = ti.new_string ?? ti.newString;
     if (typeof newString !== 'string' || !STATUS_DONE_RE.test(newString)) return PASS;
-    return verifyFromDisk(filePath, resolveCwd(input));
+    const cwd = resolveCwd(input);
+    return finalizeDoneCheck(verifyFromDisk(filePath, cwd), newString, cwd, filePath);
   }
 
   if (tool === 'MultiEdit') {
@@ -563,7 +699,12 @@ export function closeGateCheck(input) {
       return typeof ns === 'string' && STATUS_DONE_RE.test(ns);
     });
     if (!setsDone) return PASS;
-    return verifyFromDisk(filePath, resolveCwd(input));
+    const cwd = resolveCwd(input);
+    const newContent = edits
+      .map(e => e && (e.new_string ?? e.newString))
+      .filter(s => typeof s === 'string')
+      .join('\n\n');
+    return finalizeDoneCheck(verifyFromDisk(filePath, cwd), newContent, cwd, filePath);
   }
 
   // Codex apply_patch：不嚴格卡 tool_name（Codex 端的實際 tool_name 可能是 apply_patch 或其他

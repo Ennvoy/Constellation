@@ -10,8 +10,11 @@
 //   證據寫入 {cwd}/.constellation/ship-evidence.md（沒有這個檔就自動建立）。
 // --ticket 可以給純票號（如 T-003）：先試直接路徑，找不到就在 .constellation/tickets/ 下
 // glob `<票號>*.md`，唯一命中才用；零命中或多重命中一律報錯並列出候選，不猜。
-// 全部指令 exit 0 才落一筆證據（時間戳＋各指令＋exit code＋stdout 尾 15 行）；任一失敗：印該指令
-// 完整輸出、不寫證據、exit 1（或斷路器觸發時 exit 2）——證據不能靠人手填，必須是這支 runner 親自跑出來的。
+// 全部指令 exit 0 才落一筆「## 驗證證據」（時間戳＋各指令＋exit code＋stdout 尾 15 行＋簽章）；任一失敗：
+// 印該指令完整輸出、不落這筆簽章證據、exit 1（或斷路器觸發時 exit 2）——證據不能靠人手填，必須是這支
+// runner 親自跑出來的。--scope ship 的失敗路徑另外會在 ship-evidence.md 檔尾 append 一段未簽章的
+// 「## 失敗紀錄」（指令＋exit code＋耗時＋輸出摘要，僅供追查，不參與關票／出貨判定）；--scope ticket
+// 的失敗路徑不寫任何東西進票檔。
 // 證據筆另附一行各指令耗時（「- 耗時：合計 Ns｜…」，獨立行、不帶反引號、不含「（exit」）——close-gate／
 // commit-gate 的證據行解析（COMMAND_LINE_RE 行尾錨定「（exit N）」）天然忽略本行；儀表用途，不參與簽章。
 //
@@ -230,6 +233,20 @@ function lastNonBlankLine(text) {
     if (lines[i].trim() !== '') return lines[i];
   }
   return '';
+}
+
+// 失敗段落檔前的遮密（verification-playbook.md「證據遮密」：金鑰／token／密碼一律 <REDACTED>）：
+// --scope ship 的失敗紀錄會把「輸出尾行」整段寫進 ship-evidence.md（進 git、永久留底），這段文字
+// 來自被驗證指令自己的原始輸出，runner 管不到它有沒有夾帶密碼——落檔前先掃一遍常見樣式。
+// 涵蓋兩類：①URL 內嵌帳密（postgres://user:pass@host、https://user:pass@host 這類）；
+// ②鍵值對／Bearer 頭（token=／key=／password=／secret=／Authorization: Bearer <值>）。
+// 只遮值不遮鍵名（沿用 verification-playbook「遮值不遮形」），方便看出是哪一類敏感值被遮了。
+function redactSecrets(text) {
+  if (!text) return text;
+  return String(text)
+    .replace(/\b([a-z][a-z0-9+.-]*:\/\/)([^/\s:@]+):([^/\s@]+)@/gi, '$1<REDACTED>@')
+    .replace(/\bbearer\s+\S+/gi, 'Bearer <REDACTED>')
+    .replace(/\b((?:api[_-]?)?(?:token|key|password|secret)[a-z0-9_-]*)\s*[:=]\s*\S+/gi, '$1=<REDACTED>');
 }
 
 // ---------------------------------------------------------------------------
@@ -572,6 +589,24 @@ function appendEvidence(content, entryText) {
   return `${before}${needsNL}${entryText}\n${after}`;
 }
 
+// ship-evidence.md 的預設檔頭（檔案還不存在時才用）——成功路徑與失敗紀錄路徑共用同一份字面字串，
+// 避免兩處各自維護一份、日後改動時兜不起來。
+const SHIP_EVIDENCE_HEADER =
+  '# Constellation 出貨驗證證據\n\n> 由 `verify-runner.mjs --scope ship` 寫入，證據筆格式與票內完全相同（見 DESIGN.md §5）。\n';
+
+function readShipEvidenceOrInit(shipEvidencePath) {
+  return existsSync(shipEvidencePath) ? stripBom(readFileSync(shipEvidencePath, 'utf8')) : SHIP_EVIDENCE_HEADER;
+}
+
+// 失敗路徑專用（僅 --scope ship）：把本輪已跑過的指令（含剛失敗的這條）整理成一段「## 失敗紀錄」，
+// 直接 append 在 ship-evidence.md 檔尾——不進「## 驗證證據」section、不簽章。純追查用途：關票／出貨
+// 判定一律只認上面帶 sig 的「## 驗證證據」筆，這段不參與判定，也不會被 close-gate／commit-gate 的
+// 證據行解析誤讀（那兩支只找「## 驗證證據」section 底下的列項）。
+function appendFailureRecord(content, entryText) {
+  const sep = content.endsWith('\n') ? '' : '\n';
+  return `${content}${sep}\n${entryText}\n`;
+}
+
 async function main() {
   const { ticket, cwd: cwdArg, scope: scopeArg } = parseArgs(process.argv.slice(2));
   const scope = scopeArg || 'ticket';
@@ -653,6 +688,25 @@ async function main() {
       console.error(errDecoded.text);
       if (errDecoded.note) console.error(errDecoded.note);
 
+      if (scope === 'ship') {
+        const failTs = new Date().toISOString();
+        const failLastLine = redactSecrets(lastNonBlankLine(outDecoded.text) || lastNonBlankLine(errDecoded.text));
+        const failLines = [`## 失敗紀錄 ${failTs}`, ''];
+        for (const pr of results) {
+          failLines.push(`- \`${pr.cmd}\`（exit 0，${pr.durSec}s）：${redactSecrets(pr.realLastLine) || '(空)'}`);
+        }
+        failLines.push(`- \`${cmd}\`（exit ${exitCode}，${durSec}s）：${failLastLine || '(空)'}`);
+        failLines.push('');
+        failLines.push('未簽章：此段僅供追查耗時與髒資料來源，不參與關票與出貨判定。');
+        const shipEvidencePath = join(cwd, '.constellation', 'ship-evidence.md');
+        try {
+          const existingShip = readShipEvidenceOrInit(shipEvidencePath);
+          writeFileSync(shipEvidencePath, appendFailureRecord(existingShip, failLines.join('\n')), 'utf8');
+        } catch (e) {
+          console.error(`⚠ 失敗紀錄寫入 ${shipEvidencePath} 失敗，已略過（不影響斷路器計數與退出碼）：${e && e.message ? e.message : e}`);
+        }
+      }
+
       const failCount = recordFailure(cwd, target);
       if (failCount >= BREAKER_LIMIT) {
         console.error(`\nConstellation 驗證斷路器：${breakerTrippedMessage()}`);
@@ -711,9 +765,7 @@ async function main() {
     console.log(`驗證通過（${title}）：${results.length} 項指令全數 exit 0（總耗時 ${totalSec}s），證據已寫入 ${ticketPath}`);
   } else {
     const shipEvidencePath = join(cwd, '.constellation', 'ship-evidence.md');
-    const existing = existsSync(shipEvidencePath)
-      ? stripBom(readFileSync(shipEvidencePath, 'utf8'))
-      : '# Constellation 出貨驗證證據\n\n> 由 `verify-runner.mjs --scope ship` 寫入，證據筆格式與票內完全相同（見 DESIGN.md §5）。\n';
+    const existing = readShipEvidenceOrInit(shipEvidencePath);
     writeFileSync(shipEvidencePath, appendEvidence(existing, entryText), 'utf8');
     console.log(`出貨驗證通過：${results.length} 項指令（test＋journey 全量）全數 exit 0（總耗時 ${totalSec}s），證據已寫入 ${shipEvidencePath}`);
   }
