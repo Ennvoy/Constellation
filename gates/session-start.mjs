@@ -471,8 +471,7 @@ function resolveRepoRoot(cwd) {
   return cwd;
 }
 
-function buildSummary(cwd) {
-  const root = resolveRepoRoot(cwd);
+function buildSummary(root) {
   const base = join(root, '.constellation');
   if (!existsSync(base)) return null; // 非 Constellation 專案，靜默
 
@@ -601,13 +600,14 @@ process.stdin.on('end', async () => {
   // cwd 多鍵名 fallback：Claude Code／Codex 慣用 cwd，防禦性再收兩個常見別名。
   const cwd = input.cwd ?? input.workspace_root ?? input.workingDirectory ?? process.cwd();
 
+  const root = resolveRepoRoot(cwd); // 只解析一次，buildSummary／ensurePrecommit 共用
   let summary = null;
-  try { summary = buildSummary(cwd); } catch { summary = null; }
+  try { summary = buildSummary(root); } catch { summary = null; }
   if (!summary) return process.exit(0); // 非 Constellation 專案：不注入、也不裝 pre-commit
 
   // summary 非 null＝確定是 Constellation 專案，此時才裝兜底。
   let notice = null;
-  try { notice = await ensurePrecommit(resolveRepoRoot(cwd)); } catch { notice = null; }
+  try { notice = await ensurePrecommit(root); } catch { notice = null; }
   if (notice) summary += '\n' + notice;
 
   const out = { hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: summary } };

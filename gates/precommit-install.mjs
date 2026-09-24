@@ -11,13 +11,13 @@
 // 一律回頭呼叫 commit-gate.mjs 本尊，確保兩條呼叫路徑永遠同一套規則、不會漂移。）
 //
 // 紀律：
-//   ① 只裝標準 .git/hooks（core.hooksPath 空時）；被 husky/lefthook 改向 → 醒目回報「兜底沒裝進」
+//   ① 只裝標準 .git/hooks（core.hooksPath 沒被改向別處時）；被 husky/lefthook 改向 → 醒目回報「兜底沒裝進」
 //      而非靜默裝進一個不會執行的地方（比沒裝更糟的假安全感）。
 //   ② 既有 pre-commit 用 marker 區塊 append、絕不 clobber；非 sh 直譯器的 hook 不碰。
 //   ③ 全程 fail-silent／不 throw：安裝失敗回 warn，永不影響 session 開場或 commit。
 import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { join, dirname, isAbsolute } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url)); // gates/ 目錄（commit-gate.mjs 同層）
@@ -42,8 +42,12 @@ function safeRead(p) {
 
 // 回 { installed, alreadyInstalled, skipped, warn, path }。呼叫端據 installed（首裝）告知、據 warn 提醒。
 export function installPrecommit(cwd) {
-  const gitDir = git(cwd, ['rev-parse', '--git-dir']);
-  if (!gitDir) return { skipped: 'not-git' }; // 非 git repo → 不裝
+  // 一支 git 頂原本三支：--git-common-dir 給 worktree 安全的共用 .git 位置（下面 hooksDir 用得到），
+  // --git-path hooks 讓 git 自己算出這個 repo「實際生效」的 hooks 目錄（已經套用 core.hooksPath）；
+  // 非 git repo／git 缺席時整支失敗回空字串，兼作原本 --git-dir 那支的判斷。
+  const out = git(cwd, ['rev-parse', '--git-common-dir', '--git-path', 'hooks']);
+  if (!out) return { skipped: 'not-git' }; // 非 git repo → 不裝
+  const [commonDir, hooksPathOut] = out.split(/\r?\n/);
 
   const scriptPosix = join(here, 'commit-gate.mjs').replace(/\\/g, '/'); // sh 用正斜線（Windows 路徑也轉）
   // 兩道守衛都是關鍵 robustness（fail-open：結構性缺失一律不擋 commit）：
@@ -55,19 +59,20 @@ export function installPrecommit(cwd) {
     END,
   ].join('\n');
 
-  // core.hooksPath 被 husky/lefthook 改向 → 不硬裝（避免與其管理機制打架／裝進不會執行的 wrapper）。
-  const hooksPath = git(cwd, ['config', '--get', 'core.hooksPath']);
-  if (hooksPath) {
+  // worktree 下舊的 --git-dir 會指向 .git/worktrees/<name>，其 hooks/ 不是 commit 實際會執行的位置；
+  // --git-common-dir 才是共用主 .git（hooks 真正所在），非 worktree 兩者相同。
+  // 標準 hooks 目錄（假設沒設 core.hooksPath）跟 --git-path hooks 實際算出來的路徑一比對：
+  // 相同（含「hooksPath 剛好設成同一個絕對路徑」）才代表沒被 husky/lefthook 之類改向；
+  // 不同才補跑一次 core.hooksPath，純粹是為了讓 warn 訊息照舊顯示設定值。
+  const hooksDir = resolve(cwd, commonDir, 'hooks');
+  if (resolve(cwd, hooksPathOut) !== hooksDir) {
+    const hooksPath = git(cwd, ['config', '--get', 'core.hooksPath']);
     return {
       skipped: 'custom-hookspath',
       warn: `偵測到自訂 git hook 路徑（core.hooksPath=${hooksPath}，多半是 husky/lefthook）——Constellation 沒自動裝 pre-commit 兜底以免打架。要兜底：把「node "${scriptPosix}" --precommit」加進你的 pre-commit。`,
     };
   }
 
-  // worktree 下 --git-dir 指向 .git/worktrees/<name>，其 hooks/ 不是 commit 實際會執行的位置；
-  // --git-common-dir 指向共用主 .git（hooks 真正所在）。非 worktree 兩者相同。
-  const commonDir = git(cwd, ['rev-parse', '--git-common-dir']) || gitDir;
-  const hooksDir = isAbsolute(commonDir) ? join(commonDir, 'hooks') : join(cwd, commonDir, 'hooks');
   const target = join(hooksDir, 'pre-commit');
   const cur = existsSync(target) ? safeRead(target) : '';
   const firstTime = !BLOCK_RE.test(cur);

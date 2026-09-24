@@ -22,7 +22,10 @@
 // PowerShell 冷啟——實測冷啟中位 5.5 秒（2.6–7.4）、全機快照中位 8.0 秒（5.7–16.8），netstat 只要
 // 0.24 秒、taskkill 0.7 秒。因此：①所有外部呼叫都併成常數次、不隨台數增加（8 台實測 26 秒→9 秒）；
 // ②本 session 沒有留下登記時（正常收工過的 session）完全不碰 PowerShell，reap 約 0.15 秒收工；
-// ③SessionEnd 的 timeout 開 30 秒是為了容納「真的有 server 要收」時的最差值，不是常態耗時。
+// ③Claude Code 端 SessionEnd timeout 開 60 秒是為了容納「真的有 server 要收」時的最差值，不是
+// 常態耗時；Codex 端 SessionEnd 官方硬性上限只有 3 秒，比全機快照最快的 5.7 秒還短，真的有登記
+// 要收時必定來不及、reap 等於白跑一次——所以 Codex 端實際上收不到，只能靠 worker 收工前自己
+// `serve.mjs stop`，或使用者手動 `stop --all`。
 //
 // 追蹤不到的情況（誠實揭露，不假裝清乾淨）：啟動指令若自己 detached 起背景進程（pm2、自寫 launcher）
 // 且中介進程立刻退出，親子鏈就斷了，本工具追不到那顆孫進程——失敗路徑會照實說「沒清到」並要求人工確認。
@@ -30,6 +33,10 @@
 // 登記檔 <專案根>/.constellation/.servers.json 與 log 目錄 <專案根>/.constellation/.servers/ 都是
 // 「本機執行期狀態」：記的是本機 PID／埠，換一台機器讀到只會是誤導，故比照 .verify-state.json——
 // 不進版控、不進 commit-gate 白名單、不進 clean-artifacts 清單。
+// 這也表示登記是按「專案根」分開的：worker 在自己的 git worktree 裡起的 server，登記檔寫進那個
+// worktree 底下的 .constellation/.servers.json，跟主 session 的登記檔是兩份不同的檔案——主 session
+// 的 SessionEnd reap 收不到它，而且 worktree 一旦被移除，那份登記檔也跟著消失、從此沒有任何 reap
+// 收得到。所以 worker 收工、worktree 被移除之前，必須自己跑一次 `serve.mjs stop`。
 //
 // 用法：
 //   node serve.mjs start --port <p> [--name <n>] [--wait <秒，預設 60>] -- <指令…>
@@ -131,15 +138,17 @@ const powershell = script =>
     { encoding: 'utf8', maxBuffer: 1 << 26, stdio: ['ignore', 'pipe', 'ignore'] },
   );
 
-// 全機進程快照：PID → { ppid, creationDate（原樣字串）, born（毫秒） }。
-// 只取這三個欄位——帶上 CommandLine 會慢好幾倍，而認親只需要親子鏈與出生時間。
+// 全機進程快照：PID → { ppid, creationDate（原樣字串）, born（毫秒）, cmd（命令列） }。
+// 帶 CommandLine 本身不貴（實測與只查三欄的耗時差在雜訊範圍內）；真正貴的是沒有用 -Property
+// 限定屬性、把每個進程的全部屬性都抓回來（約慢兩倍）。這裡一次把 CommandLine 也查回來，要顯示
+// 「陌生佔用者是誰」時直接從這份快照取，不必為此再叫一次 PowerShell。
 // 任何失敗回空 map，由呼叫端當「查不到」處理（＝比對失敗＝不動手）。
 function procSnapshot() {
   const map = new Map();
   const script =
     `[Console]::OutputEncoding=[Text.Encoding]::UTF8; ` +
-    `$r=@(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,CreationDate | ` +
-    `Select-Object ProcessId,ParentProcessId,@{n='C';e={$_.CreationDate.ToString('o')}}); ` +
+    `$r=@(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,CreationDate,CommandLine | ` +
+    `Select-Object ProcessId,ParentProcessId,CommandLine,@{n='C';e={$_.CreationDate.ToString('o')}}); ` +
     `ConvertTo-Json -InputObject $r -Compress -Depth 3`;
   try {
     for (const p of JSON.parse(powershell(script) || '[]')) {
@@ -148,27 +157,6 @@ function procSnapshot() {
         ppid: Number(p.ParentProcessId),
         creationDate,
         born: Date.parse(creationDate) || 0,
-      });
-    }
-  } catch {}
-  return map;
-}
-
-// 一次 PowerShell 查指定幾個 PID 的建立時間與命令列（要顯示「那是什麼進程」時才用）。
-function procInfo(pids) {
-  const map = new Map();
-  const uniq = [...new Set(pids.map(Number).filter(p => Number.isInteger(p) && p > 0))];
-  if (!uniq.length) return map;
-  const filter = uniq.map(p => `ProcessId=${p}`).join(' OR ');
-  const script =
-    `[Console]::OutputEncoding=[Text.Encoding]::UTF8; ` +
-    `$r=@(Get-CimInstance Win32_Process -Filter '${filter}' -ErrorAction SilentlyContinue | ` +
-    `Select-Object ProcessId,@{n='CreationDate';e={$_.CreationDate.ToString('o')}},CommandLine); ` +
-    `ConvertTo-Json -InputObject $r -Compress -Depth 3`;
-  try {
-    for (const p of JSON.parse(powershell(script) || '[]')) {
-      map.set(Number(p.ProcessId), {
-        creationDate: String(p.CreationDate || ''),
         cmd: String(p.CommandLine || '').replace(/\s+/g, ' ').trim(),
       });
     }
@@ -327,8 +315,9 @@ function resolveTargets(e, snap) {
   return ours;
 }
 
-// 收完之後照實回報這一筆的下場。ports 是「殺完後」的埠快照，strangerInfo 是批次一次查好的命令列。
-function reportEntry(e, ours, ports, strangerInfo) {
+// 收完之後照實回報這一筆的下場。ports 是「殺完後」的埠快照，snap 是上面已經查好的全機快照
+// （陌生佔用者的命令列直接從這份取，不必再為了顯示是誰而多叫一次 PowerShell）。
+function reportEntry(e, ours, ports, snap) {
   const label = `${e.name}（port ${e.port}）`;
   if (!ours.size) {
     console.log(`· ${label}：沒有可安全擊殺的進程（登記的 PID 已不存在或已被回收），移除登記。`);
@@ -345,7 +334,7 @@ function reportEntry(e, ours, ports, strangerInfo) {
   console.log(`⚠ ${label}：已擊殺 PID ${killedText}。`);
   if (survived.length) console.log(`    這些 PID 殺不掉（權限不足？）：${survived.join('、')}`);
   for (const p of strangers) {
-    console.log(`    port ${e.port} 目前被 PID ${p}（${brief(strangerInfo.get(Number(p))?.cmd)}）佔用——不在本工具這棵樹上，未擊殺。`);
+    console.log(`    port ${e.port} 目前被 PID ${p}（${brief(snap.get(Number(p))?.cmd)}）佔用——不在本工具這棵樹上，未擊殺。`);
   }
 }
 
@@ -367,11 +356,8 @@ function shutdownBatch(root, targets) {
     ports = listeners();
   }
 
-  // ours 為空的那幾筆，reportEntry 會在 `!ours.size` 就 early return、strangerInfo 根本不會被印出來，
-  // 這裡先排掉可省一次白付的 procInfo（PowerShell 冷啟）。
-  const strangers = plans.flatMap(p => (p.ours.size ? ownersOf(p.e.port, ports).filter(x => !p.ours.has(Number(x))) : []));
-  const strangerInfo = strangers.length ? procInfo(strangers) : new Map();
-  for (const { e, ours } of plans) reportEntry(e, ours, ports, strangerInfo);
+  // 陌生佔用者的命令列直接從上面那份全機快照（snap）取，不再另外查一次。
+  for (const { e, ours } of plans) reportEntry(e, ours, ports, snap);
 
   if (!dropFromRegistry(root, new Set(targets))) {
     console.log(`⚠ 登記檔寫不進去（${registryPath(root)}），下次 list 可能還會看到已關掉的項目。`);
@@ -398,10 +384,10 @@ async function cmdStart(root, opts, rest) {
   // 起前先看埠有沒有殘留：有就只回報、不擊殺（可能是使用者自己開的）。
   const occupied = ownersOf(port);
   if (occupied.length) {
-    const info = procInfo(occupied);
+    const snap = procSnapshot();
     for (const p of occupied) {
       console.error(
-        `埠 ${port} 已被 PID ${p}（${brief(info.get(p)?.cmd)}）佔用；` +
+        `埠 ${port} 已被 PID ${p}（${brief(snap.get(Number(p))?.cmd)}）佔用；` +
           `若是上一輪殘留請先 node "${SELF}" stop --port ${port}`,
       );
     }
@@ -459,9 +445,10 @@ async function cmdStart(root, opts, rest) {
     const stuck = mySurvivors.filter(p => alive(p));
 
     if (bound.length) {
-      const info = procInfo(bound);
+      // snap 上面已經查過（等待迴圈結束後緊接著就查了），陌生佔用者的命令列直接從那份取，
+      // 不必再叫一次 PowerShell。
       console.error(
-        `等待期間 port ${port} 被 PID ${bound.join('、')}（${brief(info.get(Number(bound[0]))?.cmd)}）綁走，` +
+        `等待期間 port ${port} 被 PID ${bound.join('、')}（${brief(snap.get(Number(bound[0]))?.cmd)}）綁走，` +
           `不在本工具這棵樹上（親子鏈對不上），未擊殺它，也不登記。`,
       );
     } else {
