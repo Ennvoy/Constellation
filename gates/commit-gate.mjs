@@ -513,8 +513,16 @@ function expandWrappers(segment) {
 
 // 簡化版 tokenize（鏡像 git-guardrail 的括號拆分＋反引號命令替換整段吞掉），只為了在段內定位
 // commit 子命令，不需要 guardrail 等級的跳脫/引號完整還原。
-function tokenizeSeg(segment) {
-  const re = /"[^"]*"|'[^']*'|`[^`]*`|[()]|[^\s()]+/g;
+// 第四輪對抗複審 must-fix：PowerShell here-string（@'…'@／@"…"@）本身就是一個完整值，改前的樸素
+// 引號規則不認得它，會被拆成一堆散字 token——訊息本文裡的裸 git 字樣、條列用的不成對 `1)`/`a)`、
+// 表情符號 `:)` 都會讓 findGitCallsInSegment 收 rest 提早收工，收尾的 `'@` 進不了 rest，
+// stripMessageValues 的 here-string 規則就對不上訊息本文，PowerShell 運算子（-and/-join/-not…）被
+// 當成 commit 旗標掃描。只在 tool==='PowerShell' 時才認這個語法（bash 沒有 here-string，比照
+// splitChainSegments 對 isPs 的既有區分，避免誤傷 bash 指令裡湊巧出現的 `@'`+換行）。
+function tokenizeSeg(segment, tool) {
+  const re = tool === 'PowerShell'
+    ? /@(['"])\r?\n[\s\S]*?\r?\n\1@|"[^"]*"|'[^']*'|`[^`]*`|[()]|[^\s()]+/g
+    : /"[^"]*"|'[^']*'|`[^`]*`|[()]|[^\s()]+/g;
   const out = [];
   let m;
   while ((m = re.exec(segment)) !== null) out.push({ text: m[0], start: m.index, end: m.index + m[0].length });
@@ -561,8 +569,8 @@ const isGitLikeTok = t => {
 // 病態輸入（如 'git commit '.repeat(n)）每個 git 呼叫都收到段尾會是 O(n²)；外層迴圈本來就會輪到那個
 // git token 自己處理，這裡不需要重複掃過。另加 4KB 上限：正常 commit message 不可能觸頂，只防病態輸入。
 const REST_CAP = 4096;
-function findGitCallsInSegment(segment) {
-  const toks = tokenizeSeg(segment);
+function findGitCallsInSegment(segment, tool) {
+  const toks = tokenizeSeg(segment, tool);
   const calls = [];
   for (let gi = 0; gi < toks.length; gi++) {
     if (!isGitLikeTok(toks[gi].text)) continue;
@@ -646,7 +654,11 @@ export function commitGateCheck(input) {
   // commit-gate.mjs、src/commit-utils.ts、.git/hooks/pre-commit、--grep=commit 這類檔名/樣式裡的
   // "commit" 字樣都會誤觸前置關卡，讓後面「對整條指令字串」的判定（hooksPathBypass、三道檔案閘門）
   // 連坐擋下唯讀指令，還白白多花兩次 git 子行程。
-  const GIT_COMMIT_LOOSE_RE = /\bgit\b[^\n]*(?<![=-])\bcommit\b(?!-)/i;
+  // 第四輪對抗複審 must-fix：拿掉 /i——git 子命令本身區分大小寫（`git COMMIT` 不是合法指令），
+  // 帶 /i 反而比改前更寬：`--format="COMMIT %ad"`（awk 慣用寫法）、`echo "--- LAST COMMIT ---"`、
+  // 註解裡的 `Commit`、標題字串裡的 `Git commit gate: fix` 這類唯讀指令的檔名/樣式/大寫字樣都會
+  // 誤觸前置關卡，讓 staged 有 secrets 的 done 票稽核／驗證垃圾兩道閘門連坐擋下唯讀指令。
+  const GIT_COMMIT_LOOSE_RE = /\bgit\b[^\n]*(?<![=-])\bcommit\b(?!-)/;
   const looseMatch = GIT_COMMIT_LOOSE_RE.exec(cmd);
   if (!looseMatch) return PASS;
 
@@ -663,7 +675,7 @@ export function commitGateCheck(input) {
   const gitCalls = [];
   if (segments) {
     for (const seg of segments) {
-      for (const expanded of expandWrappers(seg)) gitCalls.push(...findGitCallsInSegment(expanded));
+      for (const expanded of expandWrappers(seg)) gitCalls.push(...findGitCallsInSegment(expanded, tool));
     }
   }
   const commitRests = gitCalls.filter((c) => c.sub === 'commit').map((c) => c.rest);
@@ -687,8 +699,13 @@ export function commitGateCheck(input) {
       return /(^|\s)--no-verify(\s|$)/.test(flags) || /(^|\s)-[a-z]*n[a-z]*(\s|$)/.test(flags);
     });
   } else {
+    // 第四輪對抗複審 should-fix：改前這條保底用兩段懶惰匹配（[\s\S]*?…[\s\S]*?）掃整條指令，指令裡
+    // 沒有 --no-verify 時，引擎要對每個 git 起點、每個 commit 位置都掃到字串尾才能判定失敗，耗時
+    // 隨長度成三次方成長，病態輸入（大量 $(git …)／(git …) 反覆出現）會逼近 hook 逾時。改成線性
+    // 判斷：looseMatch 本來就是這條指令裡第一個「git…commit」字樣的位置，直接從那裡切一刀往後找
+    // --no-verify 即可，語意不變（原規則也要求 --no-verify 出現在 git…commit 之後）。
     noVerifyBypass = LOOKS_WRAPPED_RE.test(cmd) &&
-      /\bgit\b[\s\S]*?(?<![=-])\bcommit\b(?!-)[\s\S]*?--no-verify\b/i.test(stripMessageValues(cmd));
+      /(^|\s)--no-verify(\s|$)/.test(stripMessageValues(cmd.slice(looseMatch.index)));
   }
   const hooksPathBypass = gitCalls.some(isHooksPathWrite);
   if (noVerifyBypass || hooksPathBypass) {

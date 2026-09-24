@@ -21,6 +21,15 @@ import { commitGateCheck } from '../commit-gate.mjs';
 let repo;
 
 before(() => {
+  // 第四輪對抗複審 should-fix：本檔多處夾具會 `git add .env`——開發者的全域 excludesFile 只要列了
+  // .env（全域 gitignore 範本的常見內容），git add 就會失敗、before() 拋錯，整組測試被取消。比照
+  // precommit-install.test.mjs／session-start.test.mjs 的既有隔離手法，指到一個空的暫存全域設定檔，
+  // 讓本檔的 git 操作不受開發者機器上的全域設定影響。
+  const emptyGlobalConfig = join(mkdtempSync(join(tmpdir(), 'cg-gitcfg-')), 'gitconfig');
+  writeFileSync(emptyGlobalConfig, '', 'utf8');
+  process.env.GIT_CONFIG_GLOBAL = emptyGlobalConfig;
+  process.env.GIT_CONFIG_NOSYSTEM = '1';
+
   // 一個空的 Constellation 專案（有 .git＋.constellation，沒有任何 staged 檔）——只用來讓
   // resolveRepoRoot／existsSync(.constellation) 判定成立，三道檔案閘門（secrets／垃圾／done 票稽核）
   // 在空 staging 下天然 fail-open，不干擾本檔要測的「-n 旗標範圍」判定。
@@ -182,7 +191,7 @@ describe('第二輪 must-fix——包殼裡的 commit 也要跑三道檔案閘�
     execFileSync('git', ['config', 'user.name', 'test'], { cwd: secretRepo });
     mkdirSync(join(secretRepo, '.constellation'), { recursive: true });
     writeFileSync(join(secretRepo, '.env'), 'SECRET=1\n');
-    execFileSync('git', ['add', '.env'], { cwd: secretRepo });
+    execFileSync('git', ['add', '-f', '.env'], { cwd: secretRepo });
   });
   after(() => rmSync(secretRepo, { recursive: true, force: true }));
   const sbash = command => ({ tool_name: 'Bash', tool_input: { command }, cwd: secretRepo });
@@ -283,7 +292,7 @@ describe('第三輪 must-fix——GIT_COMMIT_LOOSE_RE 邊界收緊：唯讀指�
     execFileSync('git', ['config', 'user.name', 'test'], { cwd: filenameRepo });
     mkdirSync(join(filenameRepo, '.constellation'), { recursive: true });
     writeFileSync(join(filenameRepo, '.env'), 'SECRET=1\n');
-    execFileSync('git', ['add', '.env'], { cwd: filenameRepo });
+    execFileSync('git', ['add', '-f', '.env'], { cwd: filenameRepo });
   });
   after(() => rmSync(filenameRepo, { recursive: true, force: true }));
   const fbash = (command) => ({ tool_name: 'Bash', tool_input: { command }, cwd: filenameRepo });
@@ -322,7 +331,7 @@ describe('第三輪 must-fix——hooksPathBypass 只認寫入形式（staged .e
     execFileSync('git', ['config', 'user.name', 'test'], { cwd: secretRepo2 });
     mkdirSync(join(secretRepo2, '.constellation'), { recursive: true });
     writeFileSync(join(secretRepo2, '.env'), 'SECRET=1\n');
-    execFileSync('git', ['add', '.env'], { cwd: secretRepo2 });
+    execFileSync('git', ['add', '-f', '.env'], { cwd: secretRepo2 });
   });
   after(() => rmSync(secretRepo2, { recursive: true, force: true }));
   const s2bash = (command) => ({ tool_name: 'Bash', tool_input: { command }, cwd: secretRepo2 });
@@ -392,5 +401,75 @@ describe('第二輪 should-fix——病態輸入（同段大量 git commit 字�
     const t0 = Date.now();
     commitGateCheck(bash('git commit '.repeat(8000)));
     assert.ok(Date.now() - t0 < 3000, `耗時 ${Date.now() - t0}ms，疑似退回 O(n²)`);
+  });
+});
+
+// 第四輪對抗複審 must-fix：GIT_COMMIT_LOOSE_RE 帶 /i 比第三輪的邊界收緊還要寬——`--format="COMMIT
+// %ad"`（awk 慣用寫法）、`echo "--- LAST COMMIT ---"`、註解裡的 `Commit`、標題字串裡的
+// `Git commit gate: fix` 這類唯讀指令的大寫/混寫字樣都會誤觸前置關卡，讓 staged 有 secrets 時連坐
+// 擋下。用 staged .env 的夾具才量得到（空 staging 三道閘門天然 fail-open，測不出「連坐擋下」）。
+describe('第四輪 must-fix——GIT_COMMIT_LOOSE_RE 拿掉 /i：大寫/混寫的 COMMIT 字樣不誤觸前置關卡（staged .env）', () => {
+  let looseRepo;
+  before(() => {
+    looseRepo = mkdtempSync(join(tmpdir(), 'cg-loose-'));
+    execFileSync('git', ['init', '-q'], { cwd: looseRepo });
+    execFileSync('git', ['config', 'user.email', 'a@b.c'], { cwd: looseRepo });
+    execFileSync('git', ['config', 'user.name', 'test'], { cwd: looseRepo });
+    mkdirSync(join(looseRepo, '.constellation'), { recursive: true });
+    writeFileSync(join(looseRepo, '.env'), 'SECRET=1\n');
+    execFileSync('git', ['add', '-f', '.env'], { cwd: looseRepo });
+  });
+  after(() => rmSync(looseRepo, { recursive: true, force: true }));
+  const lbash = (command) => ({ tool_name: 'Bash', tool_input: { command }, cwd: looseRepo });
+  const lps = (command) => ({ tool_name: 'PowerShell', tool_input: { command }, cwd: looseRepo });
+
+  test('git log --format="COMMIT %ad" 交給 awk 解析放行', () =>
+    assertPassed(lbash(`git log --diff-filter=A --name-only --format="COMMIT %ad" --date=short -- tests/ | awk '/^COMMIT /{d=$2; next} /\\.ts$/{print d}' | sort | uniq -c`), 'awk COMMIT format'));
+  test('echo "--- LAST COMMIT ---" 放行', () =>
+    assertPassed(lbash('git status --short && echo "--- LAST COMMIT ---" && git log -1 --oneline'), 'echo LAST COMMIT'));
+  test('--pretty=format:"COMMIT %h %s" 放行', () =>
+    assertPassed(lbash('git log -1 --pretty=format:"COMMIT %h %s"'), 'pretty format COMMIT'));
+  test('# 註解裡大寫的 Commit 放行', () =>
+    assertPassed(lbash('git show --stat HEAD  # 看 Commit 內容'), 'comment Commit'));
+  test('gh pr create 標題字串裡的 "Git commit gate: fix" 放行', () =>
+    assertPassed(lbash('gh pr create --title "Git commit gate: fix" --body "x"'), 'gh pr title Git commit'));
+  test('PowerShell：Write-Host "=== LAST COMMIT ===" 放行', () =>
+    assertPassed(lps('git status --short; Write-Host "=== LAST COMMIT ==="; git log -1 --oneline'), 'ps Write-Host LAST COMMIT'));
+  test('對照組：小寫 commit 字面值仍會誤觸前置關卡而被擋（staged .env，非本輪要修的退步，維持現況）', () =>
+    assertBlocked(lbash('git log -1 --format="commit %h"'), 'control lowercase commit'));
+});
+
+// 第四輪對抗複審 must-fix：tokenizeSeg 不認 PowerShell here-string（@'…'@／@"…"@），會被拆成散字
+// token——訊息本文裡的裸 git 字樣、條列用的不成對 `1)`/`a)`、表情符號 `:)` 都會讓
+// findGitCallsInSegment 收 rest 提早收工，收尾的 `'@` 進不了 rest，stripMessageValues 的 here-string
+// 規則對不上訊息本文，PowerShell 運算子（-and/-join/-not…）被當成 --no-verify/-n 的組合旗標掃描。
+describe('第四輪 must-fix——tokenizeSeg 認得 PowerShell here-string，訊息裡的 -and/-join/-not/括號/表情符號不誤擋', () => {
+  test('-and 串接 + 條列 1)/2) 放行', () =>
+    assertPassed(ps(`git add -A; git commit -m @'\nfix(filter): 篩選條件改用 -and 串接\n\n驗過兩種情況：1) 空值 2) 非空值\n'@`), '-and + 條列'));
+  test('-join 欄位 + 條列 a)/b)/c) 放行', () =>
+    assertPassed(ps(`git add -A; git commit -m @'\nfix(export): 匯出前先 -join 欄位\n\n步驟：a) 讀檔 b) 串接 c) 寫回\n'@`), '-join + a)b)c)'));
+  test('find -name + 表情符號 :) 放行', () =>
+    assertPassed(ps(`git commit -m @'\ndocs: 說明 find -name 的用法 :)\n'@`), 'find -name + :)'));
+  test('雙引號 here-string（@"…"@）+ -not 判斷 + 條列 1) 放行', () =>
+    assertPassed(ps(`git commit -m @"\nfix: 條件改成 -not 判斷（1) 空值）\n"@`), '@"…"@ -not + 1)'));
+  test('-join 組路徑，再交給 git 處理（訊息本文裡的裸 git 字樣）放行', () =>
+    assertPassed(ps(`git commit -m @'\nfix(path): 改用 -join 組路徑，再交給 git 處理\n'@`), 'message body has literal git word'));
+  test('sed -n 不再被當成 --no-verify（訊息本文裡的裸 -n 樣式）放行', () =>
+    assertPassed(ps(`git add -A; git commit -m @'\nfix(gates): sed -n 不再被當成 --no-verify\n\n- 只看真正的 git 呼叫\n'@`), 'sed -n in message body'));
+});
+
+// 第四輪對抗複審 should-fix：LOOKS_WRAPPED_RE 命中但定位不到 commit 呼叫時的保底，改前用兩段懶惰
+// 匹配（[\s\S]*?…[\s\S]*?）掃整條指令找 --no-verify，指令裡沒有 --no-verify 時耗時隨長度三次方成長，
+// 病態輸入（大量 $(git …)／(git …) 反覆出現）會逼近 hook 逾時。改後應在幾百毫秒內完成。
+describe('第四輪 should-fix——LOOKS_WRAPPED_RE 保底不能逼近逾時（兩種病態形狀）', () => {
+  test("'echo $(git rev-parse HEAD) `git commit`; '.repeat(1600) 要在 3 秒內判完", () => {
+    const t0 = Date.now();
+    commitGateCheck(bash('echo $(git rev-parse HEAD) `git commit`; '.repeat(1600)));
+    assert.ok(Date.now() - t0 < 3000, `耗時 ${Date.now() - t0}ms，疑似退回三次方成長`);
+  });
+  test("'(git status); 用 git 做 commit; '.repeat(2500) 要在 3 秒內判完", () => {
+    const t0 = Date.now();
+    commitGateCheck(bash('(git status); 用 git 做 commit; '.repeat(2500)));
+    assert.ok(Date.now() - t0 < 3000, `耗時 ${Date.now() - t0}ms，疑似退回三次方成長`);
   });
 });

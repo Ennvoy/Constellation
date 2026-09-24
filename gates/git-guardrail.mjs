@@ -74,9 +74,12 @@ function expandCmdWrapper(segment) {
 }
 
 // GUARD-08：`bash -c "<指令>"` / `sh -c '<指令>'` 包裹——比照 cmd /c，取引號內容遞迴當指令重新拆段
-// 判定。不認 `-lc` 等其他旗標組合、也不展開 powershell -Command（同樣的包殼問題留給 commit-gate 的
-// 檔頭誠實記錄：無對抗完備承諾，只求不因套一層殼就整段漏判）。
-const SH_C_WRAPPER_RE = /^\s*(?:\/[\w.\/-]*\/)?(?:bash|sh)\s+-c\s+(["'])([\s\S]*)\1\s*$/i;
+// 判定。第四輪對抗複審 should-fix：與 commit-gate.mjs 的 SH_C_WRAPPER_RE 依鏡像原則同步擴充——
+// 殼名後面允許夾雜其他旗標（各自可帶值），直到遇到 -c／-Command（含合併短旗標如 -lc、-ec）才算真正
+// 的殼層引數起點，並認得 pwsh／powershell（含 `powershell -NoProfile -Command`、`pwsh -NoLogo -c`、
+// `bash -lc`／`bash -l -c` 這類 Windows 上最常見的實務寫法）；改前只認殼名後面緊接 -c，這些寫法都
+// 展不開，包在殼裡的危險子命令會漏判。
+const SH_C_WRAPPER_RE = /^\s*(?:\/[\w./-]*\/)?(?:bash|sh|pwsh|powershell)(?:\.exe)?(?:\s+-(?!c\b|Command\b)[\w:-]+(?:\s+(?!-)\S+)?)*\s+-(?:[a-z]*c|Command)\s+(["'])([\s\S]*)\1\s*$/i;
 function expandShWrapper(segment) {
   const m = segment.match(SH_C_WRAPPER_RE);
   if (!m) return [segment];

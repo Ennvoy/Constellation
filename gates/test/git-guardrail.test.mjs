@@ -117,6 +117,20 @@ describe('git-guardrail：對抗審查 must-fix——同段內第二個以後的
 // 對抗審查 should-fix：GUARD-09 拆括號後，子殼/命令替換裡的唯讀 `git branch`（列分支）會把外層子殼的
 // 收尾括號黏進 rest，誤判成「git branch <名稱>＝建分支」而擋下。改法：rest 只收在「這個 git 呼叫出現
 // 時的括號深度」或更深處新增的內容，遇到收攏到這個深度以下的 `)` 就停手（見 ambientDepthAt）。
+// 第四輪對抗複審 should-fix：SH_C_WRAPPER_RE 依鏡像原則同步 commit-gate.mjs 的擴充版——改前只認殼名
+// 後面緊接 -c，`powershell -NoProfile -Command`（Windows 上呼叫工具幾乎都這樣寫）、`pwsh -NoLogo -c`、
+// `bash -lc`／`bash -l -c` 這些包殼寫法都展不開，包在殼裡的危險子命令會漏判。
+describe('git-guardrail：第四輪 should-fix——SH_C_WRAPPER_RE 同步擴充：更多殼層寫法要能精準展開', () => {
+  test('powershell -NoProfile -Command "git reset --hard" 要擋', () =>
+    assertBlocked(bash('powershell -NoProfile -Command "git reset --hard"'), 'powershell -NoProfile -Command'));
+  test('pwsh -NoLogo -c "git reset --hard" 要擋', () =>
+    assertBlocked(bash('pwsh -NoLogo -c "git reset --hard"'), 'pwsh -NoLogo -c'));
+  test('bash -lc "git reset --hard" 要擋（合寫短旗標）', () =>
+    assertBlocked(bash('bash -lc "git reset --hard"'), 'bash -lc'));
+  test('bash -l -c "git reset --hard" 要擋（分寫旗標）', () =>
+    assertBlocked(bash('bash -l -c "git reset --hard"'), 'bash -l -c'));
+});
+
 describe('git-guardrail：對抗審查 should-fix——子殼裡唯讀的 git branch 不該被外層括號誤傷', () => {
   test('for b in $(git branch); do … 要放行（純列分支）', () =>
     assertPassed(bash('for b in $(git branch); do echo $b; done'), '$(git branch) in for'));
