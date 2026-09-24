@@ -6,8 +6,7 @@
           {
             "type": "command",
             "command": "node \"{{ROOT}}\\gates\\session-start.mjs\"",
-            "timeout": 60,
-            "_constellation": true
+            "timeout": 60
           }
         ]
       }
@@ -18,8 +17,7 @@
           {
             "type": "command",
             "command": "node \"{{ROOT}}\\gates\\serve.mjs\" reap",
-            "timeout": 60,
-            "_constellation": true
+            "timeout": 3
           }
         ]
       }
@@ -31,8 +29,7 @@
           {
             "type": "command",
             "command": "node \"{{ROOT}}\\gates\\close-gate.mjs\"",
-            "timeout": 60,
-            "_constellation": true
+            "timeout": 60
           }
         ]
       },
@@ -42,8 +39,7 @@
           {
             "type": "command",
             "command": "node \"{{ROOT}}\\gates\\pre-tool-use.mjs\"",
-            "timeout": 60,
-            "_constellation": true
+            "timeout": 60
           }
         ]
       }

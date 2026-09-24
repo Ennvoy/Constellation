@@ -9,8 +9,7 @@
       2. 把 gates/hooks.claude.json、gates/hooks.codex.json（先把 {{ROOT}} 換成本機絕對路徑）
          合併進 ~/.claude/settings.json 與 ~/.codex/hooks.json 的 hooks 設定，保留使用者原有的
          其他項目，只汰換 Constellation 自家掛的那幾條（冪等，重跑安全）。
-      3. 印出對賬報告：三組 junction 的結果、兩邊 hooks 自家項數量、gates/*.mjs 逐支語法檢查、
-         Codex hooks feature 開啟狀態。
+      3. 印出對賬報告：三組 junction 的結果、兩邊 hooks 自家項數量、gates/*.mjs 逐支語法檢查。
 
     用法：
       ./install.ps1              安裝／重新對賬
@@ -33,16 +32,7 @@ $ErrorActionPreference = 'Stop'
 # ---------------------------------------------------------------------------
 # 母本根路徑
 # ---------------------------------------------------------------------------
-$Root = $PSScriptRoot
-if ([string]::IsNullOrWhiteSpace($Root)) {
-    if ($MyInvocation.MyCommand.Path) {
-        $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
-    } else {
-        Write-Warning '無法自動判斷母本根路徑（$PSScriptRoot 為空），改用目前工作目錄。'
-        $Root = (Get-Location).Path
-    }
-}
-$Root = $Root.TrimEnd('\')
+$Root = $PSScriptRoot.TrimEnd('\')
 
 # ---------------------------------------------------------------------------
 # 共用小工具
@@ -71,7 +61,6 @@ function Get-JunctionInfo {
     }
     return [PSCustomObject]@{
         IsJunction = $isJunction
-        IsContainer = $item.PSIsContainer
         Target = $target
     }
 }
@@ -96,136 +85,14 @@ function Remove-JunctionSafe {
 $script:NodeAvailable = [bool](Get-Command node -ErrorAction SilentlyContinue)
 
 # ---------------------------------------------------------------------------
-# hooks 合併用的 node 腳本（執行期寫成暫存 .cjs 檔案，跑完即刪）。
-# 契約：gates/hooks.claude.json、gates/hooks.codex.json 都是 { "hooks": { <事件名>: [...] } }
+# hooks 合併／拆除實作見 gates/install-hooks.mjs（merge-hooks 子指令）：契約是
+# gates/hooks.claude.json、gates/hooks.codex.json 都是 { "hooks": { <事件名>: [...] } }
 # 形狀；分別合併進 ~/.claude/settings.json 與 ~/.codex/hooks.json 的同名 "hooks" 屬性。
-# 自家項判斷：遞迴走訪條目內每個字串葉節點，看是否含本機 gates 目錄路徑（正反斜線都認）。
-# mode=uninstall 時忽略 fragment，改成把 target 現有 hooks 內含自家標記的條目全部拔掉。
+# 自家項判斷雙條件擇一：指令形狀（node ...\gates\<六支已知腳本之一>.mjs）或本機 gates 目錄
+# 路徑子字串；不看 _constellation 旗標（打在內層 hook 物件、entry 是外層 matcher 群組，
+# 兩層對不上，從未真正發揮作用）。mode=uninstall 時忽略 fragment，只把 target 現有 hooks
+# 裡的自家項全部拔掉——同一條路徑同時處理安裝、repo 搬家重裝、撤事件三種情境。
 # ---------------------------------------------------------------------------
-$script:MergeNodeScript = @'
-"use strict";
-var fs = require("fs");
-
-function stripBOM(text) {
-  if (text.length > 0 && text.charCodeAt(0) === 0xFEFF) {
-    return text.slice(1);
-  }
-  return text;
-}
-
-function readJson(filePath, fallback) {
-  if (!filePath || filePath === "NONE" || !fs.existsSync(filePath)) {
-    return fallback;
-  }
-  var raw = fs.readFileSync(filePath, "utf8");
-  var trimmed = stripBOM(raw).trim();
-  if (trimmed === "") {
-    return fallback;
-  }
-  return JSON.parse(trimmed);
-}
-
-function isPlainObject(v) {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
-}
-
-var targetPath = process.argv[2];
-var fragmentPath = process.argv[3];
-var mode = process.argv[4];
-var rootPath = process.argv[5];
-
-var marker1 = rootPath + "\\gates";
-var marker2 = rootPath.split("\\").join("/") + "/gates";
-
-// 直接走訪原始值的字串葉節點比對（不經 JSON.stringify），因為 JSON.stringify 會把
-// 反斜線跳脫成雙反斜線，拿單反斜線的路徑 marker 去比對會永遠比不中。
-function containsMarker(value) {
-  if (typeof value === "string") {
-    return value.indexOf(marker1) !== -1 || value.indexOf(marker2) !== -1;
-  }
-  if (Array.isArray(value)) {
-    for (var vi = 0; vi < value.length; vi++) {
-      if (containsMarker(value[vi])) { return true; }
-    }
-    return false;
-  }
-  if (value !== null && typeof value === "object") {
-    var vKeys = Object.keys(value);
-    for (var vk = 0; vk < vKeys.length; vk++) {
-      if (containsMarker(value[vKeys[vk]])) { return true; }
-    }
-    return false;
-  }
-  return false;
-}
-
-function isOwnEntry(entry) {
-  // 優先認 hook entry 自帶的 "_constellation": true 標記（BY7b：新版 fragment 直接
-  // 在條目物件上打旗標，判斷穩定不受路徑搬家影響）；沒有標記的舊裝（搬家前裝的）
-  // 才退回路徑子字串比對，確保舊裝也能被 uninstall／merge 正確辨識並汰換。
-  if (entry !== null && typeof entry === "object" && !Array.isArray(entry) && entry._constellation === true) {
-    return true;
-  }
-  return containsMarker(entry);
-}
-
-var target = readJson(targetPath, {});
-if (!isPlainObject(target)) {
-  target = {};
-}
-if (!isPlainObject(target.hooks)) {
-  target.hooks = {};
-}
-var hooksRoot = target.hooks;
-
-var ownCount = 0;
-var removedCount = 0;
-
-if (mode === "uninstall") {
-  var existingKeys = Object.keys(hooksRoot);
-  for (var i = 0; i < existingKeys.length; i++) {
-    var eventKeyU = existingKeys[i];
-    var arrU = Array.isArray(hooksRoot[eventKeyU]) ? hooksRoot[eventKeyU] : [];
-    var keptU = [];
-    for (var j = 0; j < arrU.length; j++) {
-      if (isOwnEntry(arrU[j])) {
-        removedCount++;
-      } else {
-        keptU.push(arrU[j]);
-      }
-    }
-    if (keptU.length === 0) {
-      delete hooksRoot[eventKeyU];
-    } else {
-      hooksRoot[eventKeyU] = keptU;
-    }
-  }
-} else {
-  var fragmentRaw = readJson(fragmentPath, {});
-  var fragmentHooks = isPlainObject(fragmentRaw) && isPlainObject(fragmentRaw.hooks) ? fragmentRaw.hooks : fragmentRaw;
-  if (!isPlainObject(fragmentHooks)) {
-    fragmentHooks = {};
-  }
-  var fragKeys = Object.keys(fragmentHooks);
-  for (var k = 0; k < fragKeys.length; k++) {
-    var eventKey = fragKeys[k];
-    var fragArr = Array.isArray(fragmentHooks[eventKey]) ? fragmentHooks[eventKey] : [];
-    var existingArr = Array.isArray(hooksRoot[eventKey]) ? hooksRoot[eventKey] : [];
-    var kept = [];
-    for (var m = 0; m < existingArr.length; m++) {
-      if (!isOwnEntry(existingArr[m])) {
-        kept.push(existingArr[m]);
-      }
-    }
-    hooksRoot[eventKey] = kept.concat(fragArr);
-    ownCount += fragArr.length;
-  }
-}
-
-fs.writeFileSync(targetPath, JSON.stringify(target, null, 2) + "\n", "utf8");
-process.stdout.write(JSON.stringify({ ownCount: ownCount, removedCount: removedCount }));
-'@
-
 function Invoke-HooksMerge {
     param(
         [Parameter(Mandatory = $true)][string]$Label,
@@ -277,8 +144,7 @@ function Invoke-HooksMerge {
             [System.IO.File]::WriteAllText($fragmentArgPath, $resolvedFragment, (New-Object System.Text.UTF8Encoding($false)))
         }
 
-        $mergeScriptPath = Join-Path $env:TEMP ("constellation-merge-{0}-{1}.cjs" -f $Label, $PID)
-        [System.IO.File]::WriteAllText($mergeScriptPath, $script:MergeNodeScript, (New-Object System.Text.UTF8Encoding($false)))
+        $installHooksScript = Join-Path $Root 'gates\install-hooks.mjs'
 
         # 注意（Y3）：不可直接對 node 用 PowerShell 的 `2>&1` 合併重導——PS 5.1 在
         # $ErrorActionPreference='Stop' 下，只要 native command 寫過 stderr（哪怕 exit
@@ -288,11 +154,10 @@ function Invoke-HooksMerge {
         # 被包成 ErrorRecord），可安全合併 stdout+stderr 供診斷、且完全依 $LASTEXITCODE
         # 判成敗（實測見 install 修復自測：exit 0 + stderr warning 不誤判失敗；exit 非 0
         # 仍完整保留錯誤堆疊供 Detail 顯示）。
-        $mergeCmdLine = 'node "' + $mergeScriptPath + '" "' + $TargetPath + '" "' + $fragmentArgPath + '" ' + $mode + ' "' + $RootPath + '" 2>&1'
+        $mergeCmdLine = 'node "' + $installHooksScript + '" merge-hooks "' + $TargetPath + '" "' + $fragmentArgPath + '" ' + $mode + ' "' + $RootPath + '" 2>&1'
         $output = & cmd.exe /c $mergeCmdLine
         $exitCode = $LASTEXITCODE
 
-        Remove-Item -LiteralPath $mergeScriptPath -Force -ErrorAction SilentlyContinue
         if ($fragmentArgPath -ne 'NONE') {
             Remove-Item -LiteralPath $fragmentArgPath -Force -ErrorAction SilentlyContinue
         }
@@ -486,46 +351,6 @@ if ($Uninstall) {
 }
 
 # ---------------------------------------------------------------------------
-# Codex hooks feature 狀態確認（BY7a；非致命——抓不到 codex 指令或執行失敗都只降級
-# 為提示，不影響本次安裝／對賬結果）。除了抓到那一行原文，另外解析行內 enabled 值
-# （true/false）：false 印警告要求去 config.toml 開啟；解析不到就印「無法確認」。
-# ---------------------------------------------------------------------------
-$codexFeatureFound = $false
-$codexFeatureLine = ''
-$codexFeatureNote = ''
-$codexFeatureEnabled = $null   # $null=無法解析, $true=已開啟, $false=未開啟
-try {
-    $codexCmd = Get-Command codex -ErrorAction SilentlyContinue
-    if (-not $codexCmd) {
-        $codexFeatureNote = '找不到 codex 指令'
-    } else {
-        $codexCmdLine = 'codex features list 2>&1'
-        $codexOutput = & cmd.exe /c $codexCmdLine
-        $codexExitCode = $LASTEXITCODE
-        if ($codexExitCode -ne 0 -or -not $codexOutput) {
-            $codexFeatureNote = ("執行失敗或無輸出(exit {0})" -f $codexExitCode)
-        } else {
-            $hooksLine = $codexOutput | Where-Object { $_ -match 'hooks' } | Select-Object -First 1
-            if ($hooksLine) {
-                $codexFeatureFound = $true
-                $codexFeatureLine = $hooksLine.Trim()
-                if ($codexFeatureLine -match '(?i)\btrue\b') {
-                    $codexFeatureEnabled = $true
-                } elseif ($codexFeatureLine -match '(?i)\bfalse\b') {
-                    $codexFeatureEnabled = $false
-                } else {
-                    $codexFeatureNote = '無法從輸出解析 enabled 值(true/false)'
-                }
-            } else {
-                $codexFeatureNote = '輸出中找不到 hooks 相關字樣'
-            }
-        }
-    }
-} catch {
-    $codexFeatureNote = $_.Exception.Message
-}
-
-# ---------------------------------------------------------------------------
 # gates/*.mjs 語法檢查（安裝模式才跑，卸載不需要）
 # ---------------------------------------------------------------------------
 if (-not $Uninstall) {
@@ -603,19 +428,6 @@ if (-not $Uninstall) {
         Write-Host ("  [{0}] {1}" -f $mark, $m.File)
         if (-not $m.Ok -and $m.Detail) { Write-Host ("      {0}" -f $m.Detail) }
     }
-}
-
-Write-Host ''
-Write-Host '-- Codex Hooks Feature 狀態 (codex features list) --'
-if ($codexFeatureFound) {
-    Write-Host ("  {0}" -f $codexFeatureLine)
-    if ($codexFeatureEnabled -eq $false) {
-        Write-Host '  警告：Codex hooks 功能未開啟，請在 config.toml [features] 開啟。'
-    } elseif ($null -eq $codexFeatureEnabled) {
-        Write-Host '  無法確認。'
-    }
-} else {
-    Write-Host ("  無法確認 Codex hooks feature 狀態，請自行確認。({0})" -f $codexFeatureNote)
 }
 
 $errorCount = 0
