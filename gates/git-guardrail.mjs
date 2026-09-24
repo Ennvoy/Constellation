@@ -83,6 +83,12 @@ function expandShWrapper(segment) {
   return splitSegments(m[2]);
 }
 
+// 對抗審查 should-fix：切段前先把續行拿掉——bash 的 `\`+換行、PowerShell 的反引號+換行都是續行
+// 語法，樸素的換行切段會把續行後半段（常常就是 --force/--hard 這些旗標）切成不相干的下一段而漏判。
+function stripContinuations(cmd, tool) {
+  return tool === 'PowerShell' ? cmd.replace(/`\r?\n/g, ' ') : cmd.replace(/\\\r?\n/g, ' ');
+}
+
 function splitSegments(cmd) {
   const rough = cmd.split(/&&|\|\||;|\||\r?\n/);
   const out = [];
@@ -98,10 +104,15 @@ function splitSegments(cmd) {
 // GUARD-09：`(`/`)` 各自獨立成一個 token（不併入一般 bareword）——`(cd sub && git clean -fdx)` 這種
 // 括號子殼、`echo $(git stash drop)` 這種命令替換，樸素切段會把左右括號黏在鄰接字詞上（如 `-fdx)`），
 // 讓子命令/旗標判斷失準；拆開後括號變成無害的孤立 token，git 呼叫本身照常被找到、旗標照常被判到。
+// 對抗審查 must-fix：只有「真的獨立出現」的 `(`/`)` 才拆成孤立 token——被引號包住（`wt")"`）或跳脫
+// （bash `wt\)`、PowerShell `` wt`) ``）的括號字面上是普通字元，不該被拆開變成假的子殼收尾括號，
+// 否則 `git worktree add wt")" -b feat` 這種值裡剛好帶括號的路徑，會讓 -b/--force 等後續旗標整個
+// 漏判。bareword 一律把「跳脫字元＋下一字」「引號段」「反引號段」當成連續內容吃掉，只有落單的
+// `(`/`)` 才切開。
 // P22-fix：額外記每個 token 在原字串裡的起訖位置（start/end）——判斷「這個 token 跟上一個 token 中間
 // 有沒有空白」要靠位置，光看 token 陣列本身分不出來（見 skipFlagValue）。
 function tokenize(segment) {
-  const re = /"[^"]*"|'[^']*'|[()]|[^\s()]+/g;
+  const re = /(?:\\.|`.|"[^"]*"|'[^']*'|[^\s()\\`"'])+|[()]/g;
   const out = [];
   let m;
   while ((m = re.exec(segment)) !== null) out.push({ text: m[0], start: m.index, end: m.index + m[0].length });
@@ -113,35 +124,62 @@ const stripQuotes = t => t.replace(/^["']|["']$/g, '');
 // 等 = 連寫形式是單一 token、走一般旗標跳過即可）。
 const VALUE_FLAGS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--config-env']);
 
-// P22-fix：算「某個 token 之前」的括號巢狀深度（只數獨立的 `(`/`)` token，不含引號內或黏在別的字裡的
-// 括號——tokenize 已經把它們拆成獨立 token）。用來判斷後面收 rest 時，遇到的 `)` 是不是收攏「包住這個
+// P22-fix：算每個 token 之前的括號巢狀深度，一次掃過整段預先算好（前綴陣列，O(n)）——舊寫法每個
+// git token 各自從頭重算一次（O(n) × git token 數＝O(n²)），病態輸入（同一段裡塞幾萬個 git 字樣）
+// 會逼近 hook 逾時（對抗審查 should-fix）。只數獨立的 `(`/`)` token（不含引號內或跳脫的括號——
+// tokenize 已經不會把它們拆成獨立 token）。用來判斷後面收 rest 時，遇到的 `)` 是不是收攏「包住這個
 // git 呼叫本身」的外層子殼／命令替換，而不是這個 git 呼叫自己參數裡開的括號。
-function ambientDepthAt(toks, idx) {
+function depthPrefix(toks) {
+  const prefix = new Array(toks.length);
   let depth = 0;
-  for (let k = 0; k < idx; k++) {
+  for (let k = 0; k < toks.length; k++) {
+    prefix[k] = depth;
     if (toks[k].text === '(') depth++;
     else if (toks[k].text === ')') depth = Math.max(0, depth - 1);
   }
-  return depth;
+  return prefix;
 }
 
-// P22-fix：`-C`/`--git-dir` 這類帶值旗標的值，可能橫跨多個 token——`$(pwd)`、`$(pwd)/sub`、
-// `sub/$(date)`、`(Get-Location).Path`、`@(pwd)` 都是「一個值」，但 tokenize 會把 `$`、`(`、內容、
-// `)`、緊跟的殘留字都拆成獨立 token。判準是「token 之間有沒有空白」：只要後一個 token 緊貼著前一個
-// （start === 前一個的 end，中間沒有空白字元）就算同一個值的延續，一路吃到出現空白或段尾為止——
-// 不用管裡面有沒有括號、括號有沒有配對，反正只看「有沒有黏在一起」。回傳吃完之後、下一個 token 的
-// index（呼叫端接手從這裡繼續找子命令）。
-function skipFlagValue(toks, i) {
+// P22-fix，對抗審查 must-fix 擴充：`-C`/`--git-dir` 這類帶值旗標的值，可能橫跨多個 token 且中間帶
+// 空白——`$(pwd)`、`$(git rev-parse --show-toplevel)`、`(Split-Path $PWD)`、`(Get-Location).Path`
+// 都是「一個值」，但 tokenize 會把 `$`、`(`、內容、`)`、緊跟的殘留字拆成獨立 token，命令替換/子殼
+// 內部還常常帶空白（旗標、多個字）。判準改成：值裡一旦開了 `(`（不論是不是緊貼著），就依括號深度
+// 一路吃到配對的 `)` 為止（可跨空白，因為這整段本來就是一個值）；深度歸零後再吃緊貼在後面的殘留字
+// （沿用「token 之間沒有空白就算延續」判準）。mustGlue＝true 時，只有下一個 token緊貼著旗標本身
+// （中間沒有空白）才當作延續值起頭，用於 `=` 連寫的全域旗標（`--git-dir=$(pwd)/.git`）：碰到 `(`
+// 沒有 VALUE_FLAGS 那種「一定有值」的保證，只在確定黏在一起時才吃，不誤吃後面空白分隔的真子命令
+// （如 `--no-pager push` 不該把 push 吃掉）。回傳吃完之後、下一個 token 的 index。
+function skipFlagValue(toks, i, mustGlue) {
   let j = i + 1;
   if (j >= toks.length) return j;
+  if (mustGlue && toks[j].start !== toks[i].end) return j; // 沒有黏在旗標本身後面，不是延續值
   let end = toks[j].end;
+  let depth = toks[j].text === '(' ? 1 : 0;
   j++;
-  while (j < toks.length && toks[j].start === end) {
+  while (j < toks.length) {
+    if (depth > 0) {
+      // 值裡開了括號：不管有沒有空白，一路吃到配對的右括號為止。
+      if (toks[j].text === '(') depth++;
+      else if (toks[j].text === ')') depth--;
+      end = toks[j].end;
+      j++;
+      continue;
+    }
+    if (toks[j].start !== end) break; // 深度歸零後，只吃緊貼著的殘留字
+    if (toks[j].text === '(') { depth++; end = toks[j].end; j++; continue; }
     end = toks[j].end;
     j++;
   }
   return j;
 }
+
+// 有判斷規則的子命令集合——不在這個集合裡的（如 status／log／commit…）judgeSubcommand 一律回 null，
+// 收 rest 對結果沒有任何影響，找到 sub 後可以直接收工，不必再把 rest 掃到段尾（對抗審查 should-fix：
+// 病態輸入如 `'git '.repeat(25000)` 每個 git token 都會把 rest 收到段尾，O(n²)）。
+const RULED_SUBCOMMANDS = new Set([
+  'checkout', 'switch', 'branch', 'push', 'reset', 'clean',
+  'restore', 'rebase', 'worktree', 'reflog', 'gc', 'stash',
+]);
 
 // 從一段命令找出**所有**git 呼叫（不只第一個——`GIT_DIR=$(git rev-parse --git-dir) git push --force`
 // 這種前面子殼先取值、後面才是真正危險呼叫的寫法，只看第一個 git token 會漏掉後面那個）。每個 git
@@ -158,11 +196,12 @@ function extractGitCalls(segment) {
   const leadTrimmed = segment.replace(/^\s+/, '');
   const seg = leadTrimmed.startsWith('&') ? leadTrimmed.slice(1) : segment;
   const toks = tokenize(seg);
+  const ambientOf = depthPrefix(toks); // 每個 token 之前的括號深度，一次算好（見 depthPrefix）
   const isGitTok = t => /^git(\.exe)?$/i.test(stripQuotes(t.text)) || /[\\/]git(\.exe)?$/i.test(stripQuotes(t.text));
   const calls = [];
   for (let gi = 0; gi < toks.length; gi++) {
     if (!isGitTok(toks[gi])) continue;
-    const ambient = ambientDepthAt(toks, gi);
+    const ambient = ambientOf[gi];
     let depth = ambient;
     let sub = null;
     const restToks = [];
@@ -179,13 +218,24 @@ function extractGitCalls(segment) {
         if (sub !== null) restToks.push(raw.text);
         continue;
       }
+      // 對抗審查 should-fix：PowerShell script block／雜湊表收尾的落單 `}`，比照收攏外層子殼的
+      // `)` 直接停手——`ForEach-Object { git branch }` 這種唯讀列分支，`}` 不是 git 的參數。
+      if (raw.text === '}') break;
       if (sub === null) {
         const t = stripQuotes(raw.text);
         if (t.startsWith('-')) {
-          if (VALUE_FLAGS.has(t)) i = skipFlagValue(toks, i) - 1; // 整段值一起跳過（見 skipFlagValue）
+          // 對抗審查 must-fix：不再只認 VALUE_FLAGS 裡「空白分隔」的旗標——`=` 連寫的全域旗標
+          // （--git-dir=$(pwd)/.git）值黏在旗標本身後面，也要用同一套括號深度規則跳過，否則
+          // `(`/`pwd`/`)` 會被誤判成子命令與其參數。VALUE_FLAGS 是「一定有值」（空白分隔），
+          // 其餘旗標只在值緊貼著旗標本身時才當作延續（mustGlue），不誤吃空白分隔的下一個真子命令
+          // （如 `--no-pager push` 的 push 不該被吞）。
+          i = skipFlagValue(toks, i, !VALUE_FLAGS.has(t)) - 1;
           continue;
         }
         sub = t;
+        // 對抗審查 should-fix：不在判斷規則裡的子命令（status/log/commit…）收不收 rest 都不影響
+        // 結果，直接收工，不必把 rest 一路掃到段尾（避免病態輸入 O(n²)，見 RULED_SUBCOMMANDS）。
+        if (!RULED_SUBCOMMANDS.has(sub)) break;
         continue;
       }
       restToks.push(stripQuotes(raw.text));
@@ -219,7 +269,9 @@ function judgeSubcommand(sub, rest) {
 
     case 'branch': {
       if (!rest) return null;                                // 裸 `git branch`（列表）→ 放行
-      const first = rest.match(/^(\S+)/)[1];
+      // 對抗審查 should-fix：rest 以空字串 token 開頭時（例如 `git branch "" -D main`）match 回傳
+      // null，直接取 [1] 會拋例外——PreToolUse 依約定 fail-open，反而把這個破壞性操作放行。
+      const first = (rest.trim().match(/^(\S+)/) || [, ''])[1];
       if (!first.startsWith('-')) {
         // 第一個參數不是旗標 → `git branch <名稱>`，正在建分支。
         return deny('`git branch <名稱>` —— 這是建立新分支。');
@@ -342,7 +394,9 @@ export function gitGuardrailCheck(input) {
   const GIT_OK_PS_RE = /\$env:CONSTELLATION_GIT_OK\s*=\s*(['"]?)1\1(?!\d)/i;
   if (GIT_OK_BASH_RE.test(cmd) || GIT_OK_PS_RE.test(cmd)) return PASS;
 
-  for (const segment of splitSegments(cmd)) {
+  // 對抗審查 should-fix：續行先拿掉再切段（見 stripContinuations）——bash `\`+換行、PowerShell
+  // 反引號+換行都是續行語法，續行後半段常常就是 --force/--hard 這些旗標，樸素換行切段會漏判。
+  for (const segment of splitSegments(stripContinuations(cmd, tool))) {
     for (const call of extractGitCalls(segment)) {
       const verdict = judgeSubcommand(call.sub, call.rest);
       if (verdict) return verdict;

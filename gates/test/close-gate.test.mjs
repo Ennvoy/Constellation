@@ -192,6 +192,33 @@ describe('close-gate：P3——根目錄推導不能被 cwd 帶偏（子目錄�
     assertBlock({ tool_name: 'Edit', cwd: projRootNoConfig, tool_input: { file_path: PAGE_nc, old_string: '1', new_string: '2' } }, 'frozen@no-config', /凍結守衛/));
 });
 
+// 第二輪對抗複審 should-fix：巢狀 .constellation（monorepo 子套件另外初始化過、但沒有
+// design-frozen.json）時，findProjectRoot 認到的最近一層不是凍結名單真正所在的根，會靜默 fail-open。
+describe('close-gate：第二輪 should-fix——巢狀 .constellation 不能讓凍結守衛靜默 fail-open', () => {
+  let nestedRoot, nestedPage;
+  before(() => {
+    nestedRoot = mkdtempSync(join(tmpdir(), 'cgate-nested-'));
+    mkdirSync(join(nestedRoot, '.constellation'), { recursive: true });
+    mkdirSync(join(nestedRoot, 'web', '.constellation'), { recursive: true }); // 子套件的空殼 .constellation
+    mkdirSync(join(nestedRoot, 'web', 'src'), { recursive: true });
+    nestedPage = join(nestedRoot, 'web', 'src', 'Y.tsx');
+    writeFileSync(nestedPage, '<div>1</div>', 'utf8');
+    writeFileSync(
+      join(nestedRoot, '.constellation', 'design-frozen.json'),
+      JSON.stringify({ frozen: ['web/src/Y.tsx'], source: 'test', log: [] }),
+      'utf8',
+    );
+  });
+  after(() => { try { rmSync(nestedRoot, { recursive: true, force: true }); } catch {} });
+
+  test('編輯凍結檔（凍結名單在更上層的 .constellation，中間隔了一層空殼）→ 仍要擋下', () =>
+    assertBlock(
+      { tool_name: 'Edit', cwd: nestedRoot, tool_input: { file_path: nestedPage, old_string: '1', new_string: '2' } },
+      'nested-.constellation-frozen',
+      /凍結守衛/,
+    ));
+});
+
 describe('close-gate：P24——Write／Edit／apply_patch × 凍結／baseline／done 矩陣（拿掉 MultiEdit 死分支後行為不變）', () => {
   test('Write：done 票（合法證據）→ 放行', () => {
     const content = ticketWithEvidence({ repoRoot: projRoot, filePath: T1 });

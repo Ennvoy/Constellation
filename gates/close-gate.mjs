@@ -410,10 +410,27 @@ function frozenMessage(filePath) {
 // 刻意不用 PASS 物件，因為 PASS 本身是 truthy，呼叫端要能用 `if (result)` 分辨「有擋下」與「沒事」。
 // root 從目標檔所在目錄往上找（見 findProjectRoot），不用 hook 給的 cwd——cwd 可能是子目錄或另一個
 // worktree，會讀錯 .constellation/design-frozen.json 的位置（見 P3）。
+// 對抗審查 should-fix：巢狀 .constellation（例如 monorepo 子套件另外初始化過、但沒有
+// design-frozen.json）時，findProjectRoot 認到的最近一層未必是凍結名單真正所在的根——逐層往上找
+// 「真的有 design-frozen.json」的那一層，找不到才退回最近一層（維持原本 fail-open 行為，不誤擋
+// 沒用到定稿凍結機制的專案）。
+function findFrozenRoot(from) {
+  const home = resolve(homedir()).toLowerCase();
+  const fallback = findProjectRoot(from);
+  let dir = resolve(from);
+  for (;;) {
+    if (dir.toLowerCase() === home) return fallback;
+    if (existsSync(join(dir, '.constellation', 'design-frozen.json'))) return dir;
+    const up = dirname(dir);
+    if (up === dir) return fallback;
+    dir = up;
+  }
+}
+
 function checkFrozenPath(filePath) {
   // 例外：目標本身就是 design-frozen.json → 不受凍結檢查限制，否則永遠無法解凍。
   if (DESIGN_FROZEN_PATH_RE.test(String(filePath))) return null;
-  const root = findProjectRoot(dirname(String(filePath)));
+  const root = findFrozenRoot(dirname(String(filePath)));
   if (normalizeRepoRelPath(filePath, root) === DESIGN_FROZEN_REL) return null;
 
   const frozen = readFrozenList(root);

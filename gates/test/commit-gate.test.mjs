@@ -11,7 +11,7 @@
 // core.hooksPath）維持擋下，見下方「必須仍擋下」區塊。
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -156,4 +156,113 @@ describe('commit-gate：邊界案例（放行）', () => {
     assertPassed(bash('git commit -F msg.txt'), '-F msgfile'));
   test('非 commit 的唯讀 git 指令放行', () => assertPassed(bash('git log -n 5'), 'git log -n'));
   test('非 git 指令直接放行（tool 判定）', () => assertPassed(bash('sed -n 1,5p a.md'), 'non-git'));
+});
+
+// 第二輪對抗複審 must-fix：續行寫法（bash `\`+換行、PowerShell 反引號+換行）不能把 --no-verify/-n
+// 切到認不出來的下一段（C1／C2／C3）。
+describe('第二輪 must-fix——續行寫法不能漏擋', () => {
+  test('C1：bash \\+換行接 --no-verify 要擋', () =>
+    assertBlockedNoVerify(bash('git commit -m "msg" \\\n  --no-verify'), 'C1'));
+  test('C2：同一寫法改成結尾 -n 要擋', () =>
+    assertBlockedNoVerify(bash('git commit -m "msg" \\\n  -n'), 'C2'));
+  test('C3：PowerShell 反引號+換行接 --no-verify 要擋', () =>
+    assertBlockedNoVerify(ps('git commit -m "msg" `\n  --no-verify'), 'C3'));
+});
+
+// 第二輪對抗複審 must-fix：包在殼裡／子殼／命令替換的 commit（isCommitSegment 認不出來）不能讓三道
+// 檔案閘門跟著 fail-open——staged 的 secrets 要能被擋下，不管 commit 包得多深。獨立開一個帶 staged
+// .env 的 repo，避免污染其他測試假設的「空 staging」前提。
+describe('第二輪 must-fix——包殼裡的 commit 也要跑三道檔案閘門（staged .env）', () => {
+  let secretRepo;
+  before(() => {
+    secretRepo = mkdtempSync(join(tmpdir(), 'cg-secret-'));
+    execFileSync('git', ['init', '-q'], { cwd: secretRepo });
+    execFileSync('git', ['config', 'user.email', 'a@b.c'], { cwd: secretRepo });
+    execFileSync('git', ['config', 'user.name', 'test'], { cwd: secretRepo });
+    mkdirSync(join(secretRepo, '.constellation'), { recursive: true });
+    writeFileSync(join(secretRepo, '.env'), 'SECRET=1\n');
+    execFileSync('git', ['add', '.env'], { cwd: secretRepo });
+  });
+  after(() => rmSync(secretRepo, { recursive: true, force: true }));
+  const sbash = command => ({ tool_name: 'Bash', tool_input: { command }, cwd: secretRepo });
+  const sps = command => ({ tool_name: 'PowerShell', tool_input: { command }, cwd: secretRepo });
+
+  test('(git commit -m x) 要擋（staged .env）', () =>
+    assertBlocked(sbash('(git commit -m x)'), 'paren commit, staged .env'));
+  test('git -C $(git rev-parse --show-toplevel) commit -m x 要擋（staged .env）', () =>
+    assertBlocked(sbash('git -C $(git rev-parse --show-toplevel) commit -m x'), '-C $(...) commit, staged .env'));
+  test('bash -c "git commit -m x" 要擋（staged .env）', () =>
+    assertBlocked(sbash('bash -c "git commit -m x"'), 'bash -c commit, staged .env'));
+  test('echo $(git commit -m x) 要擋（staged .env）', () =>
+    assertBlocked(sbash('echo $(git commit -m x)'), 'command substitution commit, staged .env'));
+  test('PowerShell：git -C (Split-Path $PWD) commit -m x 要擋（staged .env）', () =>
+    assertBlocked(sps('git -C (Split-Path $PWD) commit -m x'), 'ps -C (Split-Path) commit, staged .env'));
+});
+
+// 第二輪對抗複審 must-fix：短式 -n 包在殼裡也要精準擋下（空 staging，只測旗標判斷本身）。
+describe('第二輪 must-fix——短式 -n 包在殼裡也要精準擋下', () => {
+  test('bash -c "git commit -n -m x" 要擋', () => assertBlockedNoVerify(bash('bash -c "git commit -n -m x"'), 'bash -c -n'));
+  test("sh -c 'git commit -an -m x' 要擋", () => assertBlockedNoVerify(bash("sh -c 'git commit -an -m x'"), 'sh -c -an'));
+  test('(git commit -n -m x) 要擋', () => assertBlockedNoVerify(bash('(git commit -n -m x)'), 'paren -n'));
+  test('echo x && (git commit -n -m x) 要擋', () =>
+    assertBlockedNoVerify(bash('echo x && (git commit -n -m x)'), 'chain paren -n'));
+  test('$(git commit -n -m x) 要擋', () => assertBlockedNoVerify(bash('$(git commit -n -m x)'), 'command substitution -n'));
+  test('git -C $(git rev-parse --show-toplevel) commit -n -m x 要擋', () =>
+    assertBlockedNoVerify(bash('git -C $(git rev-parse --show-toplevel) commit -n -m x'), '-C $(...) -n'));
+  test('反引號命令替換：git -C `git rev-parse --show-toplevel` commit -n -m x 要擋', () =>
+    assertBlockedNoVerify(bash('git -C `git rev-parse --show-toplevel` commit -n -m x'), 'backtick -C -n'));
+  test('PowerShell：cmd /c "git commit -n -m x" 要擋', () =>
+    assertBlockedNoVerify(bash('cmd /c "git commit -n -m x"'), 'cmd /c -n'));
+  test('PowerShell：powershell -Command "git commit -n -m x" 要擋', () =>
+    assertBlockedNoVerify(bash('powershell -Command "git commit -n -m x"'), 'powershell -Command -n'));
+});
+
+// 第二輪對抗複審 must-fix：引號模型與真實 shell 對不上時，commit 段被切斷或併段，旗標漏看
+// （C9／C12／C14／C15／C23／C24，逐字取自複審報告）。
+describe('第二輪 must-fix——引號／跳脫模型要對齊真實 shell', () => {
+  test("C9：bash 單引號字串裡插字面撇號（'\\''）後接 --no-verify 要擋", () =>
+    assertBlocked(bash("git commit -m 'it'\\''s; done' --no-verify"), 'C9'));
+  test('C12：訊息含跳脫分號（無引號）後接 -n 要擋', () =>
+    assertBlocked(bash('git commit -m wip\\; -n'), 'C12'));
+  test('C14：PowerShell 雙引號內反斜線是字面字元（以 \\ 收尾的路徑）不能併段漏看 -n', () =>
+    assertBlocked(ps('git -C "C:\\repo\\" add -A; git commit -n -m x'), 'C14'));
+  test('C15：bash 非 here-string 的 @"..."（沒接換行）不能整段吞到底', () =>
+    assertBlocked(bash('echo a@"b"; git add -A; git commit -n -m y'), 'C15'));
+  test('C23：bash 引號外的跳脫雙引號（\\"）不能誤判成未收尾字串', () =>
+    assertBlocked(bash('git status \\"; git commit -n -m x; echo \\"'), 'C23'));
+  test('C24：PowerShell 反引號跳脫的引號（`"）不能誤判成未收尾字串', () =>
+    assertBlocked(ps('git status `"; git commit -n -m x; echo `"'), 'C24'));
+});
+
+// 第二輪對抗複審 must-fix（heredoc 用來寫 commit message 再 add && commit，FIELD_38 最常見的形狀）。
+describe('第二輪 must-fix——heredoc 寫 commit message 再 add && commit 不能漏擋', () => {
+  test('git commit -F - <<EOF 訊息含撇號後 add && commit -n 要擋', () =>
+    assertBlocked(bash(`git commit -F - <<'EOF'\nfix: don't crash\nEOF\ngit add b && git commit -n -m y`), 'heredoc + add && commit -n'));
+  test('cat > msg.txt <<EOF 訊息含撇號後 add -A && commit -n -q -F 要擋', () =>
+    assertBlocked(bash(`cat > /tmp/msg.txt <<'EOF'\nfix: don't crash on empty input\nEOF\ngit add -A && git commit -n -q -F /tmp/msg.txt`), 'heredoc + add -A && commit -n -q -F'));
+});
+
+// 第二輪對抗複審 must-fix：多個 git 呼叫時（含包殼），第一個不是 commit 不能讓後面真正的
+// --amend --no-verify 漏看（C13）。
+describe('第二輪 must-fix——同指令內第二個以後的 commit 呼叫也要判', () => {
+  test('C13：git commit -m a && bash -c "git commit --amend --no-verify -m b" 要擋', () =>
+    assertBlocked(bash('git commit -m a && bash -c "git commit --amend --no-verify -m b"'), 'C13'));
+});
+
+// 第二輪對抗複審 must-fix：GIT_COMMIT_LOOSE_RE 保底原本沒有「看起來像包了殼層」的門檻，導致同一行
+// 剛好同時出現 git…commit 字樣（如檔名 commit-gate.mjs）與 --no-verify 字面值（如 grep 查詢樣式）的
+// 唯讀指令被誤判成想繞過 pre-commit。
+describe('第二輪 must-fix——GIT_COMMIT_LOOSE_RE 保底不能誤攔唯讀指令', () => {
+  test('git diff -- commit-gate.mjs | grep -n -- --no-verify 放行', () =>
+    assertPassed(bash("git diff HEAD -- gates/commit-gate.mjs | grep -n -- '--no-verify'"), 'diff | grep -n --no-verify'));
+  test('git log -S --no-verify --oneline -- commit-gate.mjs 放行', () =>
+    assertPassed(bash('git log -S "--no-verify" --oneline -- gates/commit-gate.mjs'), 'log -S --no-verify'));
+  test('git show HEAD:commit-gate.mjs | grep --no-verify 放行', () =>
+    assertPassed(bash('git show HEAD:gates/commit-gate.mjs | grep -n -- "--no-verify"'), 'show | grep --no-verify'));
+  test('git grep -e --no-verify -- commit-gate.mjs 放行', () =>
+    assertPassed(bash('git grep -n -e --no-verify -- gates/commit-gate.mjs'), 'git grep -e --no-verify'));
+  test('git commit-tree ... --no-verify 放行（commit-tree 不是 commit）', () =>
+    assertPassed(bash('git commit-tree HEAD^{tree} -m x --no-verify'), 'commit-tree --no-verify'));
+  test('PowerShell：git diff | Select-String --no-verify 放行', () =>
+    assertPassed(ps("git diff -- gates/commit-gate.mjs | Select-String -Pattern '--no-verify'"), 'ps diff | Select-String'));
 });

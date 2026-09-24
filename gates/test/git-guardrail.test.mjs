@@ -127,3 +127,90 @@ describe('git-guardrail：對抗審查 should-fix——子殼裡唯讀的 git br
   test('(git branch --show-current) 要放行（既有案例，改法不能破壞）', () =>
     assertPassed(bash('(git branch --show-current)'), '(git branch --show-current)'));
 });
+
+// 第二輪對抗複審 must-fix：引號／跳脫包住的字面括號（不是真的子殼收尾）被拆成孤立 `)` token，
+// ambient 深度歸零時遇到就誤判成「收攏外層子殼」而提早收工，後面的 -b/--force 等旗標整個漏看。
+describe('第二輪 must-fix——引號／跳脫包住的字面括號不能被當成子殼收尾', () => {
+  test('git worktree add wt")" -b feat 要擋（雙引號包住的字面右括號）', () =>
+    assertBlocked(bash('git worktree add wt")" -b feat'), 'wt")" -b feat'));
+  test('git worktree add wt\\) -b feat 要擋（反斜線跳脫的字面右括號）', () =>
+    assertBlocked(bash('git worktree add wt\\) -b feat'), 'wt\\) -b feat'));
+  test('git clean \\) -fdx 要擋（跳脫括號後仍要看到 -fdx）', () =>
+    assertBlocked(bash('git clean \\) -fdx'), 'clean \\) -fdx'));
+  test('git push origin main\\) --force 要擋（跳脫括號後仍要看到 --force）', () =>
+    assertBlocked(bash('git push origin main\\) --force'), 'push main\\) --force'));
+  test('git restore --staged \\) --worktree . 要擋（--worktree 不能被跳脫括號擋住視線）', () =>
+    assertBlocked(bash('git restore --staged \\) --worktree .'), 'restore \\) --worktree'));
+  test('PowerShell：git worktree add wt`) -b feat 要擋（反引號跳脫的字面右括號）', () =>
+    assertBlocked(ps('git worktree add wt`) -b feat'), 'ps wt`) -b feat'));
+});
+
+// 第二輪對抗複審 must-fix：`=` 連寫的全域旗標（--git-dir=、--work-tree=…）碰到 $(...) 只把深度加一，
+// 下一個字被誤判成子命令，真正的危險子命令（reset/push/clean…）反而落到 default 放行。
+describe('第二輪 must-fix——`=` 連寫全域旗標的 $(...) 值不能漏擋', () => {
+  test('git --work-tree=$(pwd) push --force 要擋', () =>
+    assertBlocked(bash('git --work-tree=$(pwd) push --force'), '--work-tree=$(pwd) push --force'));
+  test('git --git-dir=$(pwd)/.git reset --hard 要擋', () =>
+    assertBlocked(bash('git --git-dir=$(pwd)/.git reset --hard'), '--git-dir=$(pwd)/.git reset --hard'));
+  test('git --namespace=$(whoami) push --force 要擋', () =>
+    assertBlocked(bash('git --namespace=$(whoami) push --force'), '--namespace=$(whoami) push --force'));
+  test('git --work-tree="$(pwd)" push --force 要擋（值本身加了引號）', () =>
+    assertBlocked(bash('git --work-tree="$(pwd)" push --force'), '--work-tree="$(pwd)" push --force'));
+  test('PowerShell：git --git-dir=$(Get-Location)\\.git branch -D old 要擋', () =>
+    assertBlocked(ps('git --git-dir=$(Get-Location)\\.git branch -D old'), 'ps --git-dir=$(Get-Location)'));
+  test('git --work-tree=x")" push --force origin main 要擋（值裡引號包住的括號）', () =>
+    assertBlocked(bash('git --work-tree=x")" push --force origin main'), '--work-tree=x")" push --force'));
+});
+
+// 第二輪對抗複審 must-fix（skipFlagValue 空白值）＋ should-fix（同一缺口的更多寫法）：
+// -C/--git-dir 的值若是「含空白的命令替換／子殼」（$(git rev-parse --show-toplevel)、
+// (Split-Path $PWD) 這類最常見的慣用寫法），舊版只吃到第一個空白就停，值的殘餘字被誤判成子命令。
+describe('第二輪 must-fix／should-fix——`-C`/`--git-dir` 值含空白的命令替換不能漏擋', () => {
+  test('git -C $(git rev-parse --show-toplevel) push --force 要擋', () =>
+    assertBlocked(bash('git -C $(git rev-parse --show-toplevel) push --force'), '-C $(git rev-parse --show-toplevel)'));
+  test('git -C $(dirname "$f") push --force 要擋', () =>
+    assertBlocked(bash('git -C $(dirname "$f") push --force'), '-C $(dirname "$f")'));
+  test('git --git-dir=$(git rev-parse --git-dir) push --force 要擋', () =>
+    assertBlocked(bash('git --git-dir=$(git rev-parse --git-dir) push --force'), '--git-dir=$(git rev-parse --git-dir)'));
+  test('PowerShell：git -C (Split-Path $f -Parent) push --force 要擋', () =>
+    assertBlocked(ps('git -C (Split-Path $f -Parent) push --force'), 'ps -C (Split-Path $f -Parent)'));
+  test('PowerShell：git -C (Resolve-Path .) push --force 要擋', () =>
+    assertBlocked(ps('git -C (Resolve-Path .) push --force'), 'ps -C (Resolve-Path .)'));
+});
+
+// 第二輪對抗複審 should-fix：續行寫法（bash `\`+換行、PowerShell 反引號+換行）不能把危險旗標切到
+// 認不出來的下一段。
+describe('第二輪 should-fix——續行寫法不能漏擋', () => {
+  test('bash：push --force 用 \\ 續行要擋', () =>
+    assertBlocked(bash('git push origin main \\\n  --force'), 'bash continuation push --force'));
+  test('PowerShell：reset --hard 用反引號續行要擋', () =>
+    assertBlocked(ps('git reset `\n  --hard'), 'ps continuation reset --hard'));
+});
+
+// 第二輪對抗複審 should-fix：PowerShell script block／雜湊表收尾的落單 `}` 不該被當成 git branch
+// 的第一個參數而誤判成「建分支」。
+describe('第二輪 should-fix——PowerShell script block 收尾的 } 不誤傷唯讀 git branch', () => {
+  test('ForEach-Object { git -C $_.FullName branch } 要放行', () =>
+    assertPassed(ps('Get-ChildItem -Directory | ForEach-Object { git -C $_.FullName branch }'), 'ForEach-Object { git branch }'));
+  test('if (Test-Path .git) { git branch } 要放行', () =>
+    assertPassed(ps('if (Test-Path .git) { git branch }'), 'if { git branch }'));
+  test('& { git branch } 要放行', () => assertPassed(ps('& { git branch }'), '& { git branch }'));
+});
+
+// 第二輪對抗複審 should-fix：rest 以空字串 token 開頭時 `.match(...)[1]` 會拋例外，
+// PreToolUse fail-open 反而放行破壞性操作。
+describe('第二輪 should-fix——git branch 空字串 token 不能讓判斷式拋例外而放行', () => {
+  test('git branch "" -D main 要擋（-D 強制刪除，不能因為前面有空字串就放行）', () =>
+    assertBlocked(bash('git branch "" -D main'), 'branch "" -D main'));
+});
+
+// 第二輪對抗複審 should-fix：段內 git 字樣越多，舊寫法（每個 git token 重算括號深度＋收 rest 到段尾）
+// 耗時呈平方成長，病態輸入會逼近 hook 逾時。這裡不用精確計時斷言（機器快慢會飄），只給一個寬鬆上限
+// （3 秒）——舊版對這個輸入量級要 40 秒以上，新版應在幾十毫秒內完成，差距夠大不會誤判。
+describe('第二輪 should-fix——病態輸入（同段大量 git 字樣）不能逼近逾時', () => {
+  test("'git '.repeat(25000) 要在 3 秒內判完", () => {
+    const t0 = Date.now();
+    gitGuardrailCheck(bash('git '.repeat(25000)));
+    assert.ok(Date.now() - t0 < 3000, `耗時 ${Date.now() - t0}ms，疑似退回 O(n²)`);
+  });
+});
