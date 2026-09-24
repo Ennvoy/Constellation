@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 // Constellation 閘門 3 —— session 開場注入（SessionStart hook）。
 // 純讀檔：掃 {root}/.constellation/ 重建現況組成繁中摘要，供 runtime 注入開場。DESIGN.md §4／§5 閘門 3。
-// 注入走「純導航模式」（單一形狀，與專案規模解耦）：置頂「開工前必讀」強制讀檔指令＋
-// ①票況（tickets/*.md 的 status／blocked-by／票名／「## 驗收條件」勾選進度）②HISTORY.md 最近輪次
-// ③decisions/ 一行摘要（總筆數＋最近編號範圍＋查法，不逐筆列標題）④CONTEXT.md 一行摘要（行數＋詞條數）。
-// ③④刻意不列清單：清單會隨決議數量單調成長吃光額度，且截斷方向是「越舊越先丟」，而越舊的往往
-// 越根本（早期那批地基決議），丟掉比長度撞線更傷；改為只給座標與查法，內文一律引導 Read／搜尋——
-// 不注全文是因為 runtime 對 hook 注入有 10,000 字元硬門檻，超線整包被持久化、開場只剩 2KB 預覽（比索引更糟）；
-// 知識軌單調成長，任何活躍專案遲早撞線，故一律導航（見 .constellation/decisions/002）。
+// 注入走「純導航模式」（單一形狀，與專案規模解耦）：置頂「開工前必讀」強制讀檔指令（兩檔約多少字、
+// 地圖缺口／地雷區條數、CONTEXT 詞條數、決議筆數與查法全併在這一句，不另立段落）＋
+// ①票況（tickets/*.md 的 status／blocked-by／票名／「## 驗收條件」勾選進度）②MAP.md 模組索引與過期警示
+// ③HISTORY.md 最近輪次。決議與詞彙刻意不另列清單：清單會隨決議數量單調成長吃光額度，且截斷方向是
+// 「越舊越先丟」，而越舊的往往越根本（早期那批地基決議），丟掉比長度撞線更傷；改為只給座標與查法，
+// 內文一律引導 Read／搜尋——不注全文是因為 runtime 對 hook 注入有 10,000 字元硬門檻，超線整包被持久化、
+// 開場只剩 2KB 預覽（比索引更糟）；知識軌單調成長，任何活躍專案遲早撞線，故一律導航（見 .constellation/decisions/002）。
 // 知識軌每段獨立 fail-open——單段壞檔只少那一段，不拖垮票況。
 // root 解析：git rev-parse --show-toplevel（在 cwd 下跑），失敗 fallback cwd（與 gates/commit-gate.mjs
 // 的 resolveRepoRoot 同一套規則）——在子目錄下開 session 也掃得到專案根的 .constellation。
@@ -67,10 +67,17 @@ function parseTicket(raw) {
 const STATUSES = ['open', 'in-progress', 'blocked', 'done'];
 
 // 導航模式各段上限（DESIGN.md §4「接續」）。索引級內容成長極慢，這些只是防怪檔的保險。
-const DECISION_LIST_MAX = 20;        // decisions/ ≤ 此數才逐筆列標題；超過只給「總數＋最近編號範圍＋查法」
 const MAP_INDEX_MAX_LINES = 55;      // MAP.md 只注入「模組索引」表；其餘章節同樣走導航靠 Read
 const MAP_LINE_MAX_CHARS = 200;      // 模組索引單行字元上限：表格偶有塞了整段機制說明的巨行，一行就能吃光整包額度
 const SUMMARY_MAX_CHARS = 9000;      // 總量 failsafe：runtime 10k 字元門檻的安全線，超線硬截保可見
+// 知識檔字數預算（決議 023 P11）：超過時必讀句同句加註提醒，下次 ship 校對地圖時壓回，不在這裡截斷內容本身。
+const MAP_BUDGET_CHARS = 40000;      // 約 4 萬字元
+const CONTEXT_BUDGET_CHARS = 15000;  // 約 1.5 萬字元
+// 必讀句顯示用的字數敘述：對抗複審 S6——不到一萬字元的檔案原本一律顯示「約 0.0 萬字」，看起來
+// 像空檔，跟「約多少字」的本意（讓人一眼估出這份要讀多久）不符；改成不到一萬字元時用「千字」
+// 為單位（取整數），滿一萬才切回「萬字」（取一位小數）。回傳含單位的完整片語，呼叫端不再自己
+// 補「萬字」字樣。
+const describeSize = chars => (chars < 10000 ? `約 ${Math.round(chars / 1000)} 千字` : `約 ${(chars / 10000).toFixed(1)} 萬字`);
 
 function readTextSafe(p) {
   try { return stripBom(readFileSync(p, 'utf8')); } catch { return null; }
@@ -281,7 +288,6 @@ function buildMapSection(base, root) {
     const raw = readTextSafe(join(base, 'MAP.md'));
     if (!raw || !raw.trim()) return null;
     const all = raw.split(/\r?\n/);
-    const lineCount = all.length;
 
     // 章節標題可能帶編號與括號補述（「## 一、模組索引（開場注入用…）」），故只認關鍵字不認整串。
     const start = all.findIndex(l => /^##\s.*模組索引/.test(l.trim()));
@@ -322,17 +328,16 @@ function buildMapSection(base, root) {
     const lines = ['【專案現況地圖（.constellation/MAP.md，完整內容含資料表、已知資料缺口與地雷請 Read 原檔）】'];
     lines.push(...notes);
     lines.push(...shown);
-    return { text: lines.join('\n'), lineCount, hazardCount: countMapHazards(all) };
+    return { text: lines.join('\n'), charCount: raw.length, hazardCount: countMapHazards(all) };
   } catch { return null; } // fail-open
 }
 
 // 地圖「缺口／地雷」區的**條數**（不是內容）。只回一個數字，永遠一行——注入量與專案規模解耦
 // 那條原則（決議 002）因此不受影響，而讀的人知道自己還有多少沒看過的坑。
 //
-// 為什麼值得多這一個數字（2026-08-17，實際踩過）：那兩區記的多半是**動手方式**的坑
-// （測試怎麼跑、腳本怎麼下、查詢怎麼寫），光看模組索引不會意識到需要它；而它們正好不在注入
-// 內容裡。當時的判斷是「只是回答問題、不是開工」而略過全文，結果撞上區裡早就寫著的那條
-// （測試的還原機制會把剛匯入的資料日倒退回去）。
+// 為什麼值得多這一個數字：那兩區記的多半是**動手方式**的坑（測試怎麼跑、腳本怎麼下、查詢
+// 怎麼寫），光看模組索引不會意識到需要它，而它們正好不在注入內容裡——純查詢型開場容易被
+// 誤判成「不算開工」而略過全文，卻查到一半就跑測試、連正式庫（案例見決議 019）。
 //
 // 判準刻意寬鬆：標題含「地雷／缺口／未竟」的二級章節即算，`~~劃掉~~` 的條目是已解決不計。
 // 專案沒有這種章節時回 0，呼叫端就不印那句——不同專案的地圖結構本來就不必一致。
@@ -351,54 +356,29 @@ function countMapHazards(allLines) {
   return n;
 }
 
-// CONTEXT.md 導航：只給「多少行、多少詞條」，詞條名與內文一律由置頂指令引導 Read 全文。
-// 詞條數兩種寫法都算，取較大者：專案可能用 `- **詞**：` 條列，也可能用 `## 詞` 分節；
-// 只認一種會誤判——條列式檔案常有 `##` 分組標題，分節式檔案內文也常有偶然的 `- **粗體**`。
+// CONTEXT.md 導航：只給「多少字、多少詞條」，併進置頂必讀句（DESIGN.md §4「接續」），不另立段落；
+// 詞條名與內文一律由必讀指令引導 Read 全文。詞條數兩種寫法都算，取較大者：專案可能用
+// `- **詞**：` 條列，也可能用 `## 詞` 分節；只認一種會誤判——條列式檔案常有 `##` 分組標題，
+// 分節式檔案內文也常有偶然的 `- **粗體**`。
 function buildContextSection(base) {
   const raw = readTextSafe(join(base, 'CONTEXT.md'));
   if (!raw || !raw.trim()) return null;
-  const lineCount = raw.split(/\r?\n/).length;
   const bulletTerms = [...raw.matchAll(/^\s*-\s*\*\*(.+?)\*\*/gm)].length;
   const headingTerms = [...raw.matchAll(/^##\s+(.+)$/gm)].length;
   const termCount = Math.max(bulletTerms, headingTerms);
-  const scale = termCount ? `共 ${lineCount} 行、${termCount} 個詞條` : `共 ${lineCount} 行`;
-  return {
-    text: `【專案詞彙（.constellation/CONTEXT.md）】${scale}，動手前請 Read 全文。`,
-    lineCount,
-  };
+  return { charCount: raw.length, termCount };
 }
 
+// 只回總筆數：併進置頂必讀句的「決議筆數與查法」（DESIGN.md §4「接續」），不再逐筆列標題或
+// 列編號範圍——逐筆列標題會隨決議數量單調成長吃光額度，且截斷方向是「越舊越先丟」，越舊的
+// 往往越根本（早期那批地基決議），丟掉比長度撞線更傷。
 function buildDecisionsSection(base) {
-  const dir = join(base, 'decisions');
   let files = [];
   // 只收數字開頭的正式決策（slug 可缺，落檔時少打 slug 也不無聲消失）；grill-close.md 是流程標記不在此列。
   try {
-    files = readdirSync(dir)
-      .filter(f => /^\d+([-_].*)?\.md$/i.test(f))
-      .sort((a, b) => parseInt(a, 10) - parseInt(b, 10));
+    files = readdirSync(join(base, 'decisions')).filter(f => /^\d+([-_].*)?\.md$/i.test(f));
   } catch { return null; }
-  if (!files.length) return null;
-
-  // 每檔的索引行：首個一級標題「# 」優先（(?!#) 擋掉 ## 二級標題誤中），讀不到退回檔名。
-  const titleOf = f => {
-    const raw = readTextSafe(join(dir, f));
-    const m = raw && raw.match(/^#(?!#)\s*(.+)$/m);
-    return m ? `${f.replace(/\.md$/i, '')}：${m[1].trim()}` : f.replace(/\.md$/i, '');
-  };
-
-  const lines = [`【決策記錄（.constellation/decisions/）】共 ${files.length} 筆，編號越大越新，內文請 Read 原檔。`];
-  if (files.length <= DECISION_LIST_MAX) {
-    // 小專案：全部列得完就照舊逐筆列標題，沒有截斷問題，也省一趟查目錄。
-    for (const f of files) lines.push(`  - ${titleOf(f)}`);
-  } else {
-    // 大專案：只給座標。刻意不試圖解析「第幾輪」——決議檔沒有可靠的機讀輪次邊界，
-    // 硬猜會給出假精確；用固定的「最近 N 筆」當範圍即可，反正真要看還是得列目錄。
-    const numOf = f => (f.match(/^\d+/) || [f])[0];
-    const recent = files.slice(-DECISION_LIST_MAX);
-    lines.push(`  最近 ${recent.length} 筆：${numOf(recent[0])}~${numOf(recent[recent.length - 1])}`);
-    lines.push('  查法：列目錄 `ls .constellation/decisions/` ／ 找特定主題用關鍵字搜檔名與內文');
-  }
-  return { text: lines.join('\n'), count: files.length };
+  return files.length ? { count: files.length } : null;
 }
 
 // 「（流程外，無票）」的輪次（phase-grill.md「流程外」三條件成立時的簡化記法）不算一輪正式流程，
@@ -416,20 +396,35 @@ function buildHistorySection(base) {
 }
 
 // 閘門 3 兼任的 design 哨兵（DESIGN.md §5 閘門 3、§3 第 5b／7 點）。純讀檔，不是第六個閘門。
-// 要抓的病：**「定稿記錄寫好了、畫面根本沒落地」曾經整輪放行過**——某輪 `_v2/` 只留一個空資料夾、
-// 該輪連 design-frozen.json 都沒有，而 weave 舊條文只驗「有沒有定稿決議這筆檔」就放行，於是四個
-// 子分頁改由 build 照決議散文重畫，與談好的稿差了 12 個區塊，八天後才被使用者走查抓到。
-// 只在「grill-close 記著需要 UI」且「已經有定稿記錄」時才驗——還沒定稿的情況 weave 本來就會轉交 design，
-// 在這裡叫只是重複。fail-open：任何解析異常一律不叫，不拖垮開場。
+// 要抓的病：定稿沒有真的落地卻整輪放行過（案例見決議 017）。
+// 觸發條件：「grill-close 記著需要 UI」且「tickets/ 已有票（代表本輪已過 weave）」——不靠
+// decisions 檔名判斷輪次：定稿記錄的命名慣例因專案而異（例如某專案一律叫 design-freeze，
+// 從不叫 design-final），且決議跨輪不歸檔，靠檔名找「最新一筆」在多輪專案會抓到別輪的記錄
+// 而誤報；票與 grill-close 隨輪歸檔，天然只看本輪，也不必為此多叫一次 git。還沒過 weave（tickets/
+// 還沒有票）時交給 weave 進場三驗處理，這裡不重複叫。逐區塊元件清單的檢查同樣交給那三驗
+// （見 phase-weave.md），不在此搜尋 decisions 內文。fail-open：任何解析異常一律不叫，不拖垮開場。
+// 對抗複審 S3：phase-build.md 的預授權解凍是「從 frozen 移除、log 補一筆 unfreeze，回凍才補
+// refreeze」——凍結名單很短時，正在解凍中途開新 session，frozen 會暫時變成空陣列，這是合法
+// 的本輪在途狀態，不是「UI 沒真的落地」。逐路徑比對 log 裡最後一筆 unfreeze／refreeze，還有
+// 路徑停在 unfreeze（沒被後續 refreeze 蓋掉）就算「目前有在途解凍」。
+function hasOutstandingUnfreeze(log) {
+  if (!Array.isArray(log)) return false;
+  const state = new Map(); // path → 最後一筆動作
+  for (const entry of log) {
+    if (!entry || typeof entry.path !== 'string') continue;
+    if (entry.action === 'unfreeze' || entry.action === 'refreeze') state.set(entry.path, entry.action);
+  }
+  for (const action of state.values()) if (action === 'unfreeze') return true;
+  return false;
+}
+
 function buildDesignSentinel(base, root) {
   const close = readTextSafe(join(base, 'decisions', 'grill-close.md'));
   if (!close || !/是否需要\s*UI[^\n]*是（/.test(close)) return null; // 不需要 UI／沒有這個標記 → 不適用
 
-  let names = [];
-  try { names = readdirSync(join(base, 'decisions')).filter(f => f.toLowerCase().endsWith('.md')); } catch { return null; }
-  // 取編號最大（最新）那筆——舊寫法 names.find 抓字母序第一筆，會拿舊輪的定稿記錄來驗（2026-09-04 誤報 075 實際已到 284）。
-  const finalDoc = names.filter(f => /design-final/i.test(f)).sort().pop();
-  if (!finalDoc) return null; // 還沒定稿——交給 weave 轉交 design，這裡不叫
+  let tickets = [];
+  try { tickets = readdirSync(join(base, 'tickets')).filter(f => f.toLowerCase().endsWith('.md')); } catch { tickets = []; }
+  if (!tickets.length) return null; // 還沒過 weave——交給 weave 進場三驗，這裡不叫
 
   const problems = [];
   const frozenPath = join(base, 'design-frozen.json');
@@ -439,25 +434,29 @@ function buildDesignSentinel(base, root) {
     try {
       const parsed = JSON.parse(readTextSafe(frozenPath) || '{}');
       const frozen = Array.isArray(parsed.frozen) ? parsed.frozen : [];
-      if (frozen.length === 0) problems.push('design-frozen.json 的 frozen 是空陣列 → 沒有任何定稿檔案被鎖住');
-      else {
+      if (frozen.length === 0) {
+        // 有在途解凍（log 停在 unfreeze、還沒 refreeze）就不算問題——本輪解凍完成後回凍即可，
+        // 不是「定稿沒落地」；沒有在途解凍時，空陣列才真的代表定稿沒被鎖住。
+        if (!hasOutstandingUnfreeze(parsed.log)) {
+          problems.push('design-frozen.json 的 frozen 是空陣列 → 沒有任何定稿檔案被鎖住');
+        }
+      } else {
         const missing = frozen.filter(p => typeof p === 'string' && !existsSync(join(root, p)));
         if (missing.length) {
           problems.push(`凍結名單有 ${missing.length} 個路徑在 repo 找不到：` +
             `${missing.slice(0, 3).join('、')}${missing.length > 3 ? '…' : ''}`);
         }
       }
+      // 對抗複審 S7：跟觸發條件（decisions 檔名 vs tickets/ 有票）無關的獨立檢查，換觸發條件時
+      // 不該被一併拿掉——只讀 design-frozen.json 本身，沿用舊版檢查（決議 017 的證據欄也實測過它）。
       if (!parsed.source) problems.push('design-frozen.json 缺 source 欄（取稿座標）→ 日後走查會憑記憶找設計稿專案，曾因此找錯而誤判「稿不見了」');
     } catch { problems.push('design-frozen.json 解析失敗（JSON 壞了）'); }
   }
-  if (!/逐區塊元件清單/.test(readTextSafe(join(base, 'decisions', finalDoc)) || '')) {
-    problems.push(`定稿記錄 ${finalDoc} 沒有「逐區塊元件清單」→ 下游拆票只看得到區塊名字，區塊內部會整段蒸發且看不出來`);
-  }
   if (!problems.length) return null;
 
-  return ['⚠【design 定稿哨兵】這一輪記著需要 UI、也已經有定稿記錄，但下列項目不成立——依 DESIGN.md §3 第 5b／7 點，這代表 UI 其實還沒定稿完成（weave 進場的機器三驗會擋下）：',
+  return ['⚠【design 定稿哨兵】這一輪 grill-close 記著需要 UI、tickets/ 也已經有票（代表本輪已過 weave），但下列項目不成立——依 DESIGN.md §3 第 5b／7 點，這代表 UI 其實還沒定稿完成（weave 進場的機器三驗會擋下並退回本階段）：',
     ...problems.map(p => `  · ${p}`),
-    '  處置：Read skills/constellation/references/phase-design.md，補做步驟 5（直接改專案正式頁面 code）→ 5b（開本地 dev server 請使用者親自點過拍板）→ 7（定稿記錄附逐區塊清單、寫凍結名單與 source 欄）。'].join('\n');
+    '  處置：Read skills/constellation/references/phase-design.md，補做步驟 5（直接改專案正式頁面 code）→ 5b（執行端在本地逐一點過每個互動、截圖發私人 Artifact 給使用者看圖拍板；瀏覽器工具或 Artifact 任一缺，退回使用者本地點）→ 7（定稿記錄附逐區塊元件清單、凍結名單與 source 欄）。'].join('\n');
 }
 
 // repo root 解析：git rev-parse --show-toplevel，失敗 fallback cwd（與 commit-gate.mjs 鏡像）。
@@ -527,16 +526,22 @@ function buildSummary(root) {
   ];
 
   // 置頂強制讀檔指令：知識本體不在注入裡——放最前面，任何情況下最先被看到。
+  // 決議筆數／查法、CONTEXT 詞條數都併在這一句裡（DESIGN.md §4「接續」），不再另立
+  // 【決策記錄】【專案詞彙】段——那兩段各自和這裡重複一次筆數／行數，講兩次不會多給
+  // 任何新資訊，只有隨專案長大單調變長的代價。
   if (map || ctx || dec) {
     const reads = [];
     // 地圖排第一：動手前最先要知道的是「東西在哪」，其次才是詞彙。
-    if (map) reads.push(`.constellation/MAP.md（專案現況地圖，全文 ${map.lineCount} 行）`);
-    if (ctx) reads.push(`.constellation/CONTEXT.md（專案詞彙與業務規則，全文 ${ctx.lineCount} 行）`);
+    if (map) reads.push(`.constellation/MAP.md（專案現況地圖，${describeSize(map.charCount)}）`);
+    if (ctx) {
+      const terms = ctx.termCount ? `、${ctx.termCount} 個詞條` : '';
+      reads.push(`.constellation/CONTEXT.md（專案詞彙，${describeSize(ctx.charCount)}${terms}）`);
+    }
     const parts = ['【開工前必讀】本專案知識軌不隨開場注入內文，下方只是座標。'];
     if (reads.length) {
-      // 「只是查一下」那句是 2026-08-17 補的：原本只寫「動手任何工作前」，而純查詢型的開場
-      // （使用者問「為什麼會這樣」）會被判定成不算動手而略過全文——但查問題查到一半就跑測試、
-      // 連正式庫是常態，地圖的缺口／地雷區記的正是那些動作上的坑，且那一區不在注入內容裡。
+      // 「只是查一下」同樣要讀：純查詢型開場容易被誤判成不算動手而略過全文，但查到一半
+      // 就跑測試、連正式庫是常態，地圖的缺口／地雷區記的正是那些動作上的坑，且那一區
+      // 不在注入內容裡（案例見決議 019）。
       let sentence = `動手任何工作前先 Read：${reads.join('＋')}。` +
         '「只是回答問題／只是查一下」同樣要讀——查到一半就跑測試、連正式庫是常態';
       // 後半句只在真的有地圖時才講：沒有 MAP.md 的專案（例如工作流母本自己）提「地圖的地雷區」
@@ -547,9 +552,15 @@ function buildSummary(root) {
       } else {
         sentence += '。';
       }
+      // 字數預算（決議 023 P11）：超過的檔案在同一句加註，不另列清單——超標期間每次開場
+      // 常亮，直到下次 ship 壓回；phase-ship.md 步驟 3 依這句「已超出預算」的措辭觸發壓縮。
+      const overBudget = [];
+      if (map && map.charCount > MAP_BUDGET_CHARS) overBudget.push('MAP.md');
+      if (ctx && ctx.charCount > CONTEXT_BUDGET_CHARS) overBudget.push('CONTEXT.md');
+      if (overBudget.length) sentence += `${overBudget.join('、')}已超出預算，下次 ship 先壓縮。`;
       parts.push(sentence);
     }
-    // 決議改成「講查法」而不是列清單：開場看不到清單≠沒有那筆決議，這句是防止模型
+    // 決議只講「查法」不列清單：開場看不到清單≠沒有那筆決議，這句是防止模型
     // 因為索引消失就自行推論「本專案沒相關決議」而繞過既有拍板。
     if (dec) {
       parts.push(`決議在 .constellation/decisions/，共 ${dec.count} 筆，編號越大越新；` +
@@ -564,8 +575,6 @@ function buildSummary(root) {
   if (designWarn) lines.push(designWarn);
   if (map) lines.push(map.text); // 票況之後、知識軌之前：先知道東西在哪，再談脈絡
   if (hist) lines.push(hist.text);
-  if (dec) lines.push(dec.text);
-  if (ctx) lines.push(ctx.text);
 
   let summary = lines.join('\n');
   // failsafe：索引級內容理論上不會超線；萬一撞上（極端怪檔），硬截保「開場可見」優先於完整——

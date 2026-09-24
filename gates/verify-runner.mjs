@@ -31,6 +31,14 @@
 //
 // 斷路器（R2）：{cwd}/.constellation/.verify-state.json 記 per-target（票相對路徑或 "ship"）連續失敗
 // 計數；成功歸零、失敗 +1；達 5 次時 exit 2，請使用者拍板，不再盲目重試（見 recordFailure）。
+// ship 目標另有一條歸零路徑（P15）：--scope ship 開跑前若 ship-evidence.md 不存在（代表新一輪，
+// 例如剛歸檔完），一律先歸零——手動刪掉這個檔等同刪計數檔硬闖，不是合法繞過（phase-build.md 已
+// 明文禁止）。
+//
+// 逾時判定（P9）：timeoutSec 是「連續多久沒有任何輸出」的上限，不是從開跑算起的總時長——每收到一段
+// stdout／stderr 就重設這顆計時器（只在還沒結束、還沒判定逾時時重設；結束後的 2 秒寬限期、以及已判定
+// 逾時後才到的資料，都不重設），健康但越跑越久的套件不會被腰斬。另加一條不必設定的 6 小時總上限
+// （ABSOLUTE_MAX_MS，不受重設影響，從指令開跑起算），防「一直印卻永遠不結束」的失控指令。
 //
 // 殘留 server 清理（S1／S2）：驗證指令起的 server 若沒被收掉，會佔著埠拖垮後續驗證，甚至讓下一輪
 // e2e 沿用舊 build 的 server 跑出假合格（正確性問題，不只效能）。兩層機制，僅 Windows 生效
@@ -337,8 +345,11 @@ function recordSuccess(cwd, target) {
   }
 }
 
+// 對抗複審 S9：舊訊息教人刪 .verify-state.json 重置計數，直接牴觸 phase-build.md「不得刪掉 runner
+// 的失敗計數檔硬闖」——那等於把斷路器繞過。合法重置只有兩條路：這個目標後來驗證通過（自然歸零），
+// 或 ship 目標由出貨歸檔移除 ship-evidence.md（新一輪判定，見上方 P15 說明），訊息改成講這兩條路。
 function breakerTrippedMessage() {
-  return '同一目標連續驗證失敗已達 5 次——停下來，把狀況整理給使用者拍板，不要再盲目重試（要重置計數請刪 .constellation/.verify-state.json 或修好後重跑）';
+  return '同一目標連續驗證失敗已達 5 次——停下來，把狀況整理給使用者拍板（換排查方向、或這張票標 blocked），不要再盲目重試；不得刪除 .constellation/.verify-state.json 硬闖，驗證通過後計數會自然歸零，ship 目標另以出貨歸檔移除 ship-evidence.md 重置';
 }
 
 // ---------------------------------------------------------------------------
@@ -372,6 +383,13 @@ function decodeOutput(buf) {
 const MAX_BUF = 20 * 1024 * 1024; // 自行實作截斷：超過就從最舊的 chunk 丟起，保住尾段（證據只取尾 15 行）
 const GRACE_AFTER_EXIT_MS = 2000; // 進程已退出後，最多再等這麼久讓管線把剩餘輸出吐完
 const HARD_STOP_AFTER_KILL_MS = 10000; // 逾時殺完再等這麼久；taskkill 沒殺動就自己收尾，不無限等
+// 6 小時總上限：不必設定，從指令開跑起算、不受資料重設影響，防「一直印卻永遠不結束」的失控指令。
+// 測試逃生窗：CONSTELLATION_VERIFY_TEST_ABS_MAX_MS 環境變數可覆寫成更短的值——只給本檔的測試用，
+// 不是使用者可設定的選項，不進 config.json、不進文件。
+const ABSOLUTE_MAX_MS = (() => {
+  const override = Number(process.env.CONSTELLATION_VERIFY_TEST_ABS_MAX_MS);
+  return Number.isFinite(override) && override > 0 ? override : 6 * 60 * 60 * 1000;
+})();
 let currentChild = null; // 供 SIGINT 處理器殺掉當下這條指令的進程樹
 
 function killTree(pid) {
@@ -416,8 +434,8 @@ function runCommand(cmd, cwd, timeoutMs) {
   return new Promise(res => {
     const out = makeSink();
     const err = makeSink();
-    let done = false, exited = false, endedStreams = 0, timedOut = false, exitCode = 1, spawnError = null;
-    let timeoutTimer = null, graceTimer = null, hardStopTimer = null;
+    let done = false, exited = false, endedStreams = 0, timedOut = false, hitAbsoluteMax = false, exitCode = 1, spawnError = null;
+    let idleTimer = null, absoluteTimer = null, graceTimer = null, hardStopTimer = null;
 
     const child = spawn(cmd, {
       cwd,
@@ -431,29 +449,51 @@ function runCommand(cmd, cwd, timeoutMs) {
     const finish = () => {
       if (done) return;
       done = true;
-      clearTimeout(timeoutTimer);
+      clearTimeout(idleTimer);
+      clearTimeout(absoluteTimer);
       clearTimeout(graceTimer);
       clearTimeout(hardStopTimer);
       // 放棄等待後主動關掉管線：孤兒若還在輸出，下次寫入會拿到 EPIPE，runner 也不會繼續替它
       // 收到 MAX_BUF 上限。
       try { child.stdout.destroy(); child.stderr.destroy(); } catch {}
       currentChild = null;
-      res({ stdout: out.buffer(), stderr: err.buffer(), exitCode, timedOut, error: spawnError, shellPid: child.pid });
+      res({ stdout: out.buffer(), stderr: err.buffer(), exitCode, timedOut, hitAbsoluteMax, error: spawnError, shellPid: child.pid });
     };
 
-    timeoutTimer = setTimeout(() => {
+    // 逾時的共用收尾：殺整棵活樹；taskkill 殺不動（提權子進程、taskkill 不在 PATH、防毒攔截）時
+    // 'exit' 永遠不來，排一道保險期限到期自己結算，逾時路徑一定會回來。absolute=true 代表撞到的是
+    // 6 小時總上限，不是無輸出逾時——兩者共用同一套殺樹與結算邏輯，只差 hitAbsoluteMax 這個旗標。
+    // 對抗複審 S5：無輸出計時器與總上限計時器互斥——已經判定過逾時就直接返回，不重複殺樹／改判
+    // 逾時原因；並在判定的同一刻清掉另一顆還沒觸發的計時器，不讓它晚點又補一刀。
+    const onTimeout = absolute => {
+      if (timedOut) return;
       timedOut = true;
+      hitAbsoluteMax = absolute;
+      clearTimeout(idleTimer);
+      clearTimeout(absoluteTimer);
       killTree(child.pid);
-      // taskkill 殺不動（提權子進程、taskkill 不在 PATH、防毒攔截）時 'exit' 永遠不來。
-      // 排一道保險期限：到期自己 kill 一次外殼並無論如何結算，逾時路徑一定會回來。
       hardStopTimer = setTimeout(() => {
         try { child.kill('SIGKILL'); } catch {}
         finish();
       }, HARD_STOP_AFTER_KILL_MS);
-    }, timeoutMs);
+    };
 
-    child.stdout.on('data', c => out.push(c));
-    child.stderr.on('data', c => err.push(c));
+    // 無輸出逾時計時器：每收到一段 stdout／stderr 就重設（見下方 onData）；timeoutMs 即 config 的
+    // timeoutSec，語意是「連續多久沒有輸出」，不是從開跑算起的總時長。
+    const armIdleTimer = () => {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => onTimeout(false), timeoutMs);
+    };
+    armIdleTimer();
+    // 6 小時總上限：不受資料重設影響，從指令開跑起算，只是防呆，正常情況不指望會撞到。
+    absoluteTimer = setTimeout(() => onTimeout(true), ABSOLUTE_MAX_MS);
+
+    const onData = sink => c => {
+      sink.push(c);
+      if (!exited && !timedOut) armIdleTimer(); // 已結束或已判定逾時後才到的資料，不重新上膛
+    };
+    child.stdout.on('data', onData(out));
+    child.stderr.on('data', onData(err));
     const onStreamEnd = () => { endedStreams++; if (exited && endedStreams >= 2) finish(); };
     child.stdout.on('end', onStreamEnd);
     child.stderr.on('end', onStreamEnd);
@@ -461,9 +501,10 @@ function runCommand(cmd, cwd, timeoutMs) {
     child.on('error', e => { spawnError = e; exitCode = 1; exited = true; finish(); });
     child.on('exit', code => {
       exited = true;
-      // 進程已退出就停掉逾時計時器：後面還有最多 2 秒寬限窗口，計時器留著會誤報「逾時」
+      // 進程已退出就停掉兩顆逾時計時器：後面還有最多 2 秒寬限窗口，計時器留著會誤報「逾時」
       // （誤導 debug 方向）並對已死的 pid 再打一次 taskkill。
-      clearTimeout(timeoutTimer);
+      clearTimeout(idleTimer);
+      clearTimeout(absoluteTimer);
       exitCode = code == null ? 1 : code; // 被訊號殺掉時 code 為 null，一律當失敗
       if (endedStreams >= 2) finish();
       else graceTimer = setTimeout(finish, GRACE_AFTER_EXIT_MS);
@@ -678,6 +719,9 @@ async function main() {
     target = ticketRelPath(ticketPath);
   } else {
     target = 'ship';
+    // ship 斷路器新一輪判定：ship-evidence.md 不存在（剛歸檔完或第一次跑）就先把計數歸零——
+    // 手動刪掉這個檔等同刪計數檔硬闖，不是合法繞過（見上方 R2 說明、phase-build.md）。
+    if (!existsSync(join(cwd, '.constellation', 'ship-evidence.md'))) recordSuccess(cwd, target);
   }
 
   const configPath = join(cwd, '.constellation', 'config.json');
@@ -716,7 +760,8 @@ async function main() {
   const results = [];
   const scopeStartMs = Date.now();
   let beforeSnap = snapshotListeners();
-  for (const cmd of commands) {
+  for (let cmdIndex = 0; cmdIndex < commands.length; cmdIndex++) {
+    const cmd = commands[cmdIndex];
     const cmdStartMs = Date.now();
     const r = await runCommand(cmd, cwd, timeoutMs);
     const durSec = Math.round((Date.now() - cmdStartMs) / 1000);
@@ -730,8 +775,21 @@ async function main() {
     const exitCode = r.error ? 1 : r.exitCode;
     if (exitCode !== 0) {
       console.error(`驗證失敗：\`${cmd}\`（exit ${exitCode}，${durSec}s）`);
-      if (timedOut) console.error(`逾時：超過 ${timeoutMs / 1000} 秒未結束，已強制終止該指令。`);
+      if (timedOut) {
+        console.error(
+          r.hitAbsoluteMax
+            ? `逾時：已達 6 小時總執行時間上限（${Math.round(ABSOLUTE_MAX_MS / 1000)} 秒），已強制終止該指令。`
+            : `逾時：超過 ${timeoutMs / 1000} 秒沒有任何輸出，已強制終止該指令。`,
+        );
+      }
       if (r.error) console.error(`spawn 錯誤：${r.error.message}`);
+
+      // 遇到第一條紅燈即停：後面排隊的指令不會執行，清單只涵蓋這一條（phase-ship.md／
+      // phase-build.md 同款措辭）——不是「一次紅燈跑完就等於拿到所有壞掉項目的完整清單」。
+      const notRun = commands.slice(cmdIndex + 1);
+      if (notRun.length) {
+        console.error(`以下指令因前一條紅燈未執行：${notRun.map(c => `\`${c}\``).join('、')}`);
+      }
 
       // 完整輸出先試著存檔（同一 repo＋target 覆寫，不累積）；主控台只印最後 40 行，避免長輸出把
       // harness 的預覽塞滿、逼模型自己接 `| tail` 把退出碼吃掉。寫檔失敗（暫存目錄不可寫等）就
@@ -788,7 +846,7 @@ async function main() {
         console.error(`\nConstellation 驗證斷路器：${breakerTrippedMessage()}`);
         process.exit(2);
       }
-      console.error('未寫入驗證證據，這張票不能標 done。');
+      console.error(scope === 'ship' ? '未寫入驗證證據，這一輪不能出貨。' : '未寫入驗證證據，這張票不能標 done。');
       process.exit(1);
     }
     const realTailText = escapeEvidenceText(lastNonBlankLines(outDecoded.text, 8));

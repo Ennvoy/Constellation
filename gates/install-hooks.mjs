@@ -5,6 +5,7 @@
 //
 // 用法：
 //   node install-hooks.mjs merge-hooks <targetPath> <fragmentPath> merge|uninstall <rootPath>
+//   node install-hooks.mjs worktree-baseref <targetPath> merge|uninstall
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
@@ -101,6 +102,63 @@ export function mergeHooks(targetPath, fragmentPath, mode, rootPath) {
 }
 
 // ---------------------------------------------------------------------------
+// worktree-baseref：P1（DESIGN §7）——官方預設從遠端預設分支開 worktree，worker 看不到
+// 本輪未推送的票與凍結名單，凍結守衛在 worker 端因此放行。使用者沒設過 worktree.baseRef
+// 這個鍵才寫成 "head"；已設過任何值都不動。
+//
+// 標記放哪裡：官方 schema 對 worktree 物件是 additionalProperties:false（多塞一個
+// _constellation 旗標進去，會被判成不認得的欄位），所以旗標改打在 target 頂層的
+// _constellation 物件（頂層 additionalProperties:true，安全）——沿用既有的 _constellation
+// 標記慣例（同一個鍵名，標「這是 Constellation 寫的」），只是換到不會撞官方 schema 的位置。
+// mode=uninstall 時只憑這個旗標判斷要不要刪：旗標不在就什麼都不動（表示這個值不是我們寫的，
+// 可能是使用者自己設的），旗標在才刪掉 baseRef（以及旗標本身），刪完各自的容器物件變空就
+// 一併拿掉，不留 "worktree": {} 或 "_constellation": {} 空殼。
+// 對抗複審 M1：旗標只證明「我們裝過」，不證明「現在這個值還是我們寫的那個」——使用者裝完後
+// 自己把 baseRef 改成別的值，卸載不能連使用者改過的值也一起刪掉。所以卸載只在值仍是我們寫入
+// 的字面 "head" 時才刪值，旗標永遠都刪（旗標本身就是我們的東西）。反過來，使用者裝完後把
+// baseRef 整個刪掉、只留下旗標（想退回官方預設），重裝時鍵不在但旗標在，代表這是使用者主動
+// 退出，不是「從未裝過」，一律 skip、不重新寫回；旗標留著，不然下次又會被誤判成全新安裝。
+// ---------------------------------------------------------------------------
+export function setWorktreeBaseRef(targetPath, mode) {
+  let target = readJson(targetPath, {});
+  if (!isPlainObject(target)) target = {};
+
+  let action;
+
+  if (mode === 'uninstall') {
+    const owned = isPlainObject(target._constellation) && target._constellation.worktreeBaseRef === true;
+    if (owned) {
+      if (isPlainObject(target.worktree) && target.worktree.baseRef === 'head') {
+        delete target.worktree.baseRef;
+        if (Object.keys(target.worktree).length === 0) delete target.worktree;
+      }
+      delete target._constellation.worktreeBaseRef;
+      if (Object.keys(target._constellation).length === 0) delete target._constellation;
+      action = 'removed';
+    } else {
+      action = 'skip';
+    }
+  } else {
+    const hasBaseRef = isPlainObject(target.worktree) && typeof target.worktree.baseRef !== 'undefined';
+    const previouslyOwned = isPlainObject(target._constellation) && target._constellation.worktreeBaseRef === true;
+    if (hasBaseRef) {
+      action = 'already-set';
+    } else if (previouslyOwned) {
+      action = 'skip';
+    } else {
+      if (!isPlainObject(target.worktree)) target.worktree = {};
+      target.worktree.baseRef = 'head';
+      if (!isPlainObject(target._constellation)) target._constellation = {};
+      target._constellation.worktreeBaseRef = true;
+      action = 'written';
+    }
+  }
+
+  writeFileSync(targetPath, JSON.stringify(target, null, 2) + '\n', 'utf8');
+  return { action };
+}
+
+// ---------------------------------------------------------------------------
 // CLI（用 import.meta.url 守衛：測試檔要 import mergeHooks 直接呼叫，不能讓 import 動作本身
 // 就跑進這段 CLI 分派、對著測試跑者自己的 process.argv 誤判成用法錯誤而 process.exit(1)）。
 // ---------------------------------------------------------------------------
@@ -109,8 +167,12 @@ if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
   if (sub === 'merge-hooks') {
     const [targetPath, fragmentPath, mode, rootPath] = rest;
     process.stdout.write(JSON.stringify(mergeHooks(targetPath, fragmentPath, mode, rootPath)));
+  } else if (sub === 'worktree-baseref') {
+    const [targetPath, mode] = rest;
+    process.stdout.write(JSON.stringify(setWorktreeBaseRef(targetPath, mode)));
   } else {
     console.error('用法：node install-hooks.mjs merge-hooks <target> <fragment> merge|uninstall <root>');
+    console.error('      node install-hooks.mjs worktree-baseref <target> merge|uninstall');
     process.exit(1);
   }
 }

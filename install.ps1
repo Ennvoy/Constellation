@@ -9,11 +9,18 @@
       2. 把 gates/hooks.claude.json、gates/hooks.codex.json（先把 {{ROOT}} 換成本機絕對路徑）
          合併進 ~/.claude/settings.json 與 ~/.codex/hooks.json 的 hooks 設定，保留使用者原有的
          其他項目，只汰換 Constellation 自家掛的那幾條（冪等，重跑安全）。
-      3. 印出對賬報告：三組 junction 的結果、兩邊 hooks 自家項數量、gates/*.mjs 逐支語法檢查。
+      3. 使用者沒設過 ~/.claude/settings.json 的 worktree.baseRef 時寫成 "head"（P1；讓
+         worker 開的 worktree 帶本機未推送的票與凍結名單），已設過任何值都不動；卸載時只
+         移除自己寫入的那一筆。
+      4. 產生本機簽章 secret（`~/.constellation/secret`，不存在才寫，跨專案共用同一把）——
+         verify-runner 的驗證證據靠它簽章，close-gate／commit-gate 靠它驗簽（R1）。
+      5. 印出對賬報告：三組 junction 的結果、兩邊 hooks 自家項數量、worktree.baseRef 動作、
+         gates/*.mjs 逐支語法檢查。
 
     用法：
       ./install.ps1              安裝／重新對賬
-      ./install.ps1 -Uninstall   拆自家 junction、移除兩邊 hooks 自家項
+      ./install.ps1 -Uninstall   拆自家 junction、移除兩邊 hooks 自家項、移除自己寫入的
+                                  worktree.baseRef（使用者事後改過的值不動，見 P1）
 
     目標環境：Windows PowerShell 5.1。
 #>
@@ -181,6 +188,64 @@ function Invoke-HooksMerge {
 }
 
 # ---------------------------------------------------------------------------
+# worktree.baseRef 使用者層設定（P1；DESIGN.md §7）：官方預設從遠端預設分支開
+# worktree，worker 端看不到本輪未推送的票與凍結名單，凍結守衛因此在 worker 端放行。
+# 使用者沒設過這個鍵才寫成 "head"；已設過任何值都不動，卸載時只憑自己寫入時打的
+# 旗標移除那一筆。判斷邏輯見 gates/install-hooks.mjs（worktree-baseref 子指令），
+# 只影響 Claude Code 使用者層設定——Codex 端不讀這項設定，不需要處理。
+# 對抗複審 S4：這裡不自己備份——上面 hooks 合併那一段對同一個 $claudeSettingsPath 已經先備份過
+# 一次（見下方主流程呼叫順序：Invoke-HooksMerge 先跑），那份才是使用者的原始檔；這裡若也備份
+# 同一個檔名，會把「hooks 已合併後」的中間狀態蓋掉本來的原始備份，使用者真正的原始設定就救不回來了。
+# ---------------------------------------------------------------------------
+function Invoke-WorktreeBaseRef {
+    param(
+        [Parameter(Mandatory = $true)][string]$TargetPath,
+        [switch]$UninstallMode
+    )
+
+    $report = [PSCustomObject]@{ TargetPath = $TargetPath; Status = ''; Action = ''; Detail = '' }
+
+    if (-not $script:NodeAvailable) {
+        $report.Status = '中止(找不到 node)'
+        return $report
+    }
+    if ($UninstallMode -and -not (Test-Path -LiteralPath $TargetPath)) {
+        $report.Status = '略過(目標檔不存在)'
+        return $report
+    }
+
+    try {
+        $targetDir = Split-Path -Parent $TargetPath
+        if ($targetDir -and -not (Test-Path -LiteralPath $targetDir)) {
+            New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+        }
+
+        $mode = if ($UninstallMode) { 'uninstall' } else { 'merge' }
+        $installHooksScript = Join-Path $Root 'gates\install-hooks.mjs'
+
+        # 同 Y2/Y3：不可用 PowerShell 原生 2>&1 重導 node，改走 cmd.exe /c（理由同上）。
+        $cmdLine = 'node "' + $installHooksScript + '" worktree-baseref "' + $TargetPath + '" ' + $mode + ' 2>&1'
+        $output = & cmd.exe /c $cmdLine
+        $exitCode = $LASTEXITCODE
+
+        if ($exitCode -ne 0) {
+            $report.Status = '失敗'
+            $report.Detail = ($output -join ' | ')
+        } else {
+            $lastLine = $output | Select-Object -Last 1
+            $parsed = $lastLine | ConvertFrom-Json
+            $report.Status = '成功'
+            $report.Action = $parsed.action
+        }
+    } catch {
+        $report.Status = '失敗'
+        $report.Detail = $_.Exception.Message
+    }
+
+    return $report
+}
+
+# ---------------------------------------------------------------------------
 # 部署對象定義
 # ---------------------------------------------------------------------------
 $skillsToLink = @('constellation', 'grill')
@@ -307,6 +372,16 @@ foreach ($rt in $hooksTargets) {
 }
 
 # ---------------------------------------------------------------------------
+# worktree.baseRef（只動 Claude Code 使用者層設定，沿用上面同一個 TargetPath）
+# ---------------------------------------------------------------------------
+$claudeSettingsPath = ($hooksTargets | Where-Object { $_.Runtime -eq 'claude' }).HooksTarget
+if ($Uninstall) {
+    $worktreeReport = Invoke-WorktreeBaseRef -TargetPath $claudeSettingsPath -UninstallMode
+} else {
+    $worktreeReport = Invoke-WorktreeBaseRef -TargetPath $claudeSettingsPath
+}
+
+# ---------------------------------------------------------------------------
 # 本機簽章 secret（R1；DESIGN.md §5：驗證證據由 runner 以本機 secret 簽章、刷卡機
 # 驗簽，手填時間戳無法通過）。存放於使用者家目錄，不進 git，跨專案共用同一把。
 # 冪等：secret 檔已存在就不動，保證重跑安裝不會讓舊簽章失效。
@@ -413,6 +488,11 @@ foreach ($r in $hooksResults) {
 }
 
 Write-Host ''
+Write-Host '-- worktree.baseRef --'
+Write-Host ("  {0} -> 狀態：{1}，動作：{2}" -f $worktreeReport.TargetPath, $worktreeReport.Status, $worktreeReport.Action)
+if ($worktreeReport.Detail) { Write-Host ("      {0}" -f $worktreeReport.Detail) }
+
+Write-Host ''
 Write-Host '-- 簽章 Secret --'
 Write-Host ("  {0} -> 狀態：{1}" -f $secretReport.Path, $secretReport.Status)
 if ($secretReport.Detail) { Write-Host ("      {0}" -f $secretReport.Detail) }
@@ -435,6 +515,7 @@ foreach ($r in $junctionResults) { if ($r.Action -match '錯誤') { $errorCount+
 foreach ($r in $hooksResults) { if ($r.Status -match '失敗|中止') { $errorCount++ } }
 foreach ($m in $mjsResults) { if (-not $m.Ok) { $errorCount++ } }
 if ($secretReport.Status -match '失敗') { $errorCount++ }
+if ($worktreeReport.Status -match '失敗|中止') { $errorCount++ }
 
 Write-Host ''
 if ($errorCount -eq 0) {
