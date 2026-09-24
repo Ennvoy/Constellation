@@ -31,12 +31,16 @@
 1. **測試資料必須可識別**：測試建立的資料一律帶明顯記號（固定前綴如 `test-`／專用測試帳號／專用網域的 email），肉眼與查詢都能一眼跟正式資料區分，不混淆。
 2. **清理只清自己產生的資料**：測試收尾只刪「本次測試建立、帶測試記號」的資料（能用交易回滾就用回滾）；不得順手清別的測試或來路不明的資料。
 3. **禁止全庫／全表清除當清理手段**：DROP／TRUNCATE／無條件 DELETE 不得出現在測試的 setup／teardown／清理程式碼——與正式資料同庫時，這等於拿正式資料賭測試不會跑錯環境。專用隔離測試庫（與正式資料完全分離，如本機測試實例）內的 reset 不在此限。
+4. **平行 worker 版**：多個 worker 同時打同一顆測試庫時規則不變，只是「自己的」範圍要更精確——用**票專屬前綴**（例如 `test-T012-`）而不是共用的 `test-` 前綴，清理與核對都只比對自己前綴的範圍，**禁止整表前後快照比對**（快照會被別的 worker 同時寫入的資料污染，比對不出誰改了什麼）；平行時跑出的紅先單獨重跑一次，再判定是不是真的產品回歸（先假設是撞車，不是真的壞）。本質上沒辦法這樣隔離的操作（套 migration／改 schema、整庫快照型資料保險、量級壓測）在票頭標 `exclusive:`，改走「單獨時段」（機制見本檔同目錄 `phase-build.md`「保護二」）。
+5. **起站埠要真的傳進測試框架**：weave 逐票指定的埠號不是寫在票裡就自動生效——指令帶環境變數（例如 `PORT=<埠> pnpm test:e2e`）或框架設定檔讀同一個環境變數；用 Playwright 之類有內建 `webServer` 的框架時，順手把 `reuseExistingServer` 設 `false`（平行時才不會誤用別的 worker 剛好占著的那個埠上的舊 server，蓋出一份跑在別人 build 上的假證據）。**票省略「驗證指令」段時，runner fallback 跑 `config.json` 的固定指令、固定埠**——這種票不能跟其他也用固定埠的票同批平行，抓不準 zone／指令時就把這張票放進下一批單獨跑，不要賭「應該不會撞」。
 
 ## 臨時 server 的起與收
 
-驗證指令或除錯要用到「自己起的 server」（dev server、預覽 server、測試用後端）時，**一律經 `gates/serve.mjs` 起**（絕對路徑跟驗證 runner 同一個目錄——把開場注入印出的 runner 路徑檔名換成 `serve.mjs` 就是它），收工 `stop`、確認那個埠真的空出來。**這不是整潔問題，是正確性問題**：殘留的舊 server 會被測試框架的「既有 server 就沿用」設定當成自己人——它只探測那個網址通不通、不驗是誰起的——於是整輪 e2e 跑在舊 build 上，蓋出一份看起來完全正常的合格證據。
+驗證指令或除錯要用到「自己起的 server」（dev server、預覽 server、測試用後端）時，**一律經 `gates/serve.mjs` 起**（開場注入已直接印出它的絕對路徑；沒有注入時，例如 worker，與驗證 runner 同目錄），收工 `stop`、確認那個埠真的空出來。**這不是整潔問題，是正確性問題**：殘留的舊 server 會被測試框架的「既有 server 就沿用」設定當成自己人——它只探測那個網址通不通、不驗是誰起的——於是整輪 e2e 跑在舊 build 上，蓋出一份看起來完全正常的合格證據。
 
-runner 自己起的那棵進程樹它會收乾淨（殺 shell 連坐子孫，外殼已退出的孤兒再用埠差集補刀），但 **agent 手動起的 server 完全在它視野外**——那正是殘留的主因，只有記帳管得到。記帳的意思是 `start` 當下就把 PID／埠／啟動時間登記起來，`stop` 與 session 結束時**只殺登記過的那幾個、殺之前比對啟動時間**；不去掃全機的埠猜哪個該死（那會殺掉使用者自己正開著看的畫面，也會誤傷平行 session）。
+runner 自己起的那棵進程樹它會收乾淨（殺 shell 連坐子孫，外殼已退出的孤兒再用埠差集補刀），但 **agent 手動起的 server 完全在它視野外**——那正是殘留的主因，只有記帳管得到。記帳的意思是 `start` 當下就把 PID／埠／啟動時間登記起來，`stop` 與 SessionEnd **只殺登記過的那幾個、殺之前比對啟動時間**；不去掃全機的埠猜哪個該死（那會殺掉使用者自己正開著看的畫面，也會誤傷平行 session）。
+
+**只有 Claude Code 端的 SessionEnd 真的收得到**：Codex 端 SessionEnd 上限 3 秒，登記真有得收時常跑不完（失效方向安全——不殺也不刪），得靠手動 `serve.mjs stop --port <p>` 收（見母本 DESIGN.md §9 降級表）。**worker 在 worktree 裡起的 server，登記寫進 worktree 自己的 `.servers.json`**——worktree 一移除，登記就跟著消失，主 session 的 SessionEnd 收不到，所以 worker 收工前、移除 worktree 前必須自己 `stop`。
 
 ## 反模式清單（出現任一項＝這張票不算驗證通過）
 
@@ -81,7 +85,7 @@ TDD 過程中，「測試先行」（步驟 2）常常會為了把實作往前�
 
 驗證 runner（絕對路徑取得方式見本檔同目錄的 `phase-build.md`／`phase-ship.md`）用 `--scope ticket|ship` 區分兩級，各自讀 `.constellation/config.json` 對應的指令陣列：
 
-- **逐票（build 階段）**：`node <runner 絕對路徑> --ticket <票號> --scope ticket`——票內有「## 驗證指令」縮圈清單（weave 寫定，見 `ticket-template.md`）就跑該清單，省略則跑 `commands.test`（快速套件）全量；外加**這張票驗收條件對應的實跑檢查**（驗收條件列了哪些操作，就跑哪些操作，例如對應的 Playwright 點擊、真打 API），**不跑** `commands.journey`；不必每次都跑全量回歸。
+- **逐票（build 階段）**：`node <runner 絕對路徑> --ticket <票號> --scope ticket`——票內有「## 驗證指令」縮圈清單（weave 寫定，見 `ticket-template.md`）就跑該清單，省略則跑 `commands.test`（快速套件）全量；外加**這張票驗收條件對應的實跑檢查**（驗收條件列了哪些操作，就跑哪些操作，例如對應的 Playwright 點擊、真打 API），**不跑** `commands.journey`；不必每次都跑全量回歸。跑完後 runner 把指令、結果摘要、時間戳與簽章寫進票的「驗證證據」欄，這欄人不手填（格式見本檔同目錄 `ticket-template.md`「驗證證據」）。
 - **出貨（ship 階段）**：`node <runner 絕對路徑> --scope ship`——`commands.test` 完整回歸 ＋ `commands.journey` 全量一次跑齊，涵蓋所有已關票的驗收條件加總，抓票與票之間可能互相打壞的地方。這是（出處：母本 DESIGN.md §6，部署後 runtime 不需讀取）兩軸獨立審查之外、屬於「有沒有真的動起來」的那一半驗證，兩者互補、缺一不可。這一輪的全量證據由 runner 簽章寫入 `.constellation/ship-evidence.md`（見本檔同目錄的 `phase-ship.md` 步驟 1），是 ship 級「證據在哪」的唯一落點，不是散落在各票檔裡自己拼湊。
 
 ## 真依賴沒 ready 時怎麼辦
