@@ -111,8 +111,16 @@ function splitSegments(cmd) {
 // `(`/`)` 才切開。
 // P22-fix：額外記每個 token 在原字串裡的起訖位置（start/end）——判斷「這個 token 跟上一個 token 中間
 // 有沒有空白」要靠位置，光看 token 陣列本身分不出來（見 skipFlagValue）。
-function tokenize(segment) {
-  const re = /(?:\\.|`.|"[^"]*"|'[^']*'|[^\s()\\`"'])+|[()]/g;
+// 第三輪對抗複審 must-fix：bareword 不能不分 shell 套同一套跳脫規則——反斜線跳脫是 bash 語意，
+// 反引號跳脫是 PowerShell 語意，兩套混用時，PowerShell 路徑結尾的反斜線（`..\`、`C:\work\repo\`，
+// Tab 補完常見）會被誤判成「反斜線跳脫下一個字元」，把結尾反斜線後面的空白吃掉，跟下一個字併成一個
+// token（子命令被當成旗標值吞掉）；bash 的反引號命令替換同理會被誤判成跳脫字元而不是定界符。
+// tool==='PowerShell' 時反斜線是一般字元（不跳脫，不吃空白）；否則（Bash）反引號是命令替換的定界符
+// （`[^`]*` 整段當一個 token），反斜線才是跳脫字元，雙引號內另外允許 \" 跳脫（不提前收尾）。
+function tokenize(segment, tool) {
+  const re = tool === 'PowerShell'
+    ? /(?:`.|"[^"]*"|'[^']*'|[^\s()`"'])+|[()]/g
+    : /(?:\\.|"(?:\\.|[^"\\])*"|'[^']*'|`[^`]*`|[^\s()\\`"'])+|[()]/g;
   const out = [];
   let m;
   while ((m = re.exec(segment)) !== null) out.push({ text: m[0], start: m.index, end: m.index + m[0].length });
@@ -149,9 +157,15 @@ function depthPrefix(toks) {
 // （中間沒有空白）才當作延續值起頭，用於 `=` 連寫的全域旗標（`--git-dir=$(pwd)/.git`）：碰到 `(`
 // 沒有 VALUE_FLAGS 那種「一定有值」的保證，只在確定黏在一起時才吃，不誤吃後面空白分隔的真子命令
 // （如 `--no-pager push` 不該把 push 吃掉）。回傳吃完之後、下一個 token 的 index。
+const isGitLikeText = text => /^git(\.exe)?$/i.test(stripQuotes(text)) || /[\\/]git(\.exe)?$/i.test(stripQuotes(text));
+
 function skipFlagValue(toks, i, mustGlue) {
   let j = i + 1;
   if (j >= toks.length) return j;
+  // 第三輪對抗複審 should-fix：值的第一個 token 若本身就是另一個 git 呼叫（病態輸入如
+  // `'git -C '.repeat(n)` 反覆出現），不要吞成這個旗標的值——當這個旗標沒有值，讓外層迴圈之後輪到
+  // 那個 git token 時自己處理，避免每個 git token 都把值掃到段尾造成 O(n²)。
+  if (isGitLikeText(toks[j].text)) return j;
   if (mustGlue && toks[j].start !== toks[i].end) return j; // 沒有黏在旗標本身後面，不是延續值
   let end = toks[j].end;
   let depth = toks[j].text === '(' ? 1 : 0;
@@ -190,14 +204,14 @@ const RULED_SUBCOMMANDS = new Set([
 // 新出現的內容，遇到會把深度收回底線以下的 `)`（代表收攏包住這個 git 呼叫本身的外層子殼／命令替換）
 // 就停手不收——不這樣做，`(git branch) -match 'x'`、`for b in $(git branch); do …` 這種唯讀列分支
 // 會把子殼的收尾括號當成 `git branch` 的第一個參數，誤判成「建立新分支」而擋下。
-function extractGitCalls(segment) {
+function extractGitCalls(segment, tool) {
   // 切出的段若以 & 開頭（前面可能有空白），視為 PowerShell call operator 殘留——去掉開頭的 &
   // 後照常判該段，不讓它干擾 git token 的定位。
   const leadTrimmed = segment.replace(/^\s+/, '');
   const seg = leadTrimmed.startsWith('&') ? leadTrimmed.slice(1) : segment;
-  const toks = tokenize(seg);
+  const toks = tokenize(seg, tool);
   const ambientOf = depthPrefix(toks); // 每個 token 之前的括號深度，一次算好（見 depthPrefix）
-  const isGitTok = t => /^git(\.exe)?$/i.test(stripQuotes(t.text)) || /[\\/]git(\.exe)?$/i.test(stripQuotes(t.text));
+  const isGitTok = t => isGitLikeText(t.text);
   const calls = [];
   for (let gi = 0; gi < toks.length; gi++) {
     if (!isGitTok(toks[gi])) continue;
@@ -207,6 +221,10 @@ function extractGitCalls(segment) {
     const restToks = [];
     for (let i = gi + 1; i < toks.length; i++) {
       const raw = toks[i];
+      // 第三輪對抗複審 should-fix：不論是在找子命令、還是在收 rest，遇到下一個 git 呼叫就收工——
+      // 病態輸入（如 `'git branch ( '.repeat(n)`）每個 git 呼叫都把 rest 收到段尾會是 O(n²)；外層
+      // 迴圈本來就會輪到那個 git token 自己處理，這裡不需要重複掃過。
+      if (isGitTok(raw)) break;
       if (raw.text === '(') {
         depth++;
         if (sub !== null) restToks.push(raw.text);
@@ -397,7 +415,7 @@ export function gitGuardrailCheck(input) {
   // 對抗審查 should-fix：續行先拿掉再切段（見 stripContinuations）——bash `\`+換行、PowerShell
   // 反引號+換行都是續行語法，續行後半段常常就是 --force/--hard 這些旗標，樸素換行切段會漏判。
   for (const segment of splitSegments(stripContinuations(cmd, tool))) {
-    for (const call of extractGitCalls(segment)) {
+    for (const call of extractGitCalls(segment, tool)) {
       const verdict = judgeSubcommand(call.sub, call.rest);
       if (verdict) return verdict;
     }

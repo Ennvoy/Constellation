@@ -207,10 +207,45 @@ describe('第二輪 should-fix——git branch 空字串 token 不能讓判斷�
 // 第二輪對抗複審 should-fix：段內 git 字樣越多，舊寫法（每個 git token 重算括號深度＋收 rest 到段尾）
 // 耗時呈平方成長，病態輸入會逼近 hook 逾時。這裡不用精確計時斷言（機器快慢會飄），只給一個寬鬆上限
 // （3 秒）——舊版對這個輸入量級要 40 秒以上，新版應在幾十毫秒內完成，差距夠大不會誤判。
+// 第三輪對抗複審 must-fix：tokenize 不分 shell 套同一套跳脫規則——PowerShell 裡反斜線是一般字元，
+// 結尾反斜線＋空白（`..\`、`C:\work\repo\`，Tab 補完常見）會被誤判成「反斜線跳脫下一個字元」而把
+// 空白吃掉，跟下一個子命令併成一個 token（子命令被當成 -C 的值吞掉）；bash 的反引號命令替換同理
+// 被誤判成跳脫字元而不是定界符，收尾反引號＋空白也會把下一個字併進來。
+describe('第三輪 must-fix——tokenize 的跳脫規則要分 shell：反斜線（PowerShell）／反引號（bash）不能誤判成跳脫字元', () => {
+  test('PowerShell：git -C ..\\ push --force 要擋（結尾反斜線不能吃掉後面的空白）', () =>
+    assertBlocked(ps('git -C ..\\ push --force'), 'ps -C ..\\ push --force'));
+  test('PowerShell：git -C C:\\work\\repo\\ reset --hard 要擋', () =>
+    assertBlocked(ps('git -C C:\\work\\repo\\ reset --hard'), 'ps -C C:\\work\\repo\\ reset --hard'));
+  test('PowerShell：git -C .\\ clean -fdx 要擋', () =>
+    assertBlocked(ps('git -C .\\ clean -fdx'), 'ps -C .\\ clean -fdx'));
+  test('PowerShell：git -C ..\\other\\ branch -D old 要擋', () =>
+    assertBlocked(ps('git -C ..\\other\\ branch -D old'), 'ps -C ..\\other\\ branch -D old'));
+  test('對照組：PowerShell 加引號的 "C:\\work\\repo\\" 本來就擋，改法不能讓它變放行', () =>
+    assertBlocked(ps('git -C "C:\\work\\repo\\" push --force'), 'ps quoted -C push --force'));
+  test('Bash：git -C `pwd` push --force 要擋（反引號命令替換不是跳脫字元，收尾反引號不能吃掉空白）', () =>
+    assertBlocked(bash('git -C `pwd` push --force'), 'bash -C `pwd` push --force'));
+});
+
 describe('第二輪 should-fix——病態輸入（同段大量 git 字樣）不能逼近逾時', () => {
   test("'git '.repeat(25000) 要在 3 秒內判完", () => {
     const t0 = Date.now();
     gitGuardrailCheck(bash('git '.repeat(25000)));
+    assert.ok(Date.now() - t0 < 3000, `耗時 ${Date.now() - t0}ms，疑似退回 O(n²)`);
+  });
+});
+
+// 第二輪對抗複審 should-fix：上面那條病態輸入測試只量到「'git '.repeat()」這一種形狀，還有兩種形狀
+// 仍是平方級（旗標階段反覆出現 `-C git`、有規則的子命令反覆出現 `git branch (`）——8000 次重複在改前
+// 分別要 3.7 秒／11 秒，改後應在幾十毫秒內完成，差距夠大不會誤判。
+describe('第二輪 should-fix——病態輸入的另外兩種形狀（-C git／有規則子命令反覆開括號）不能逼近逾時', () => {
+  test("'git -C '.repeat(8000)（旗標階段反覆出現 git）要在 3 秒內判完", () => {
+    const t0 = Date.now();
+    gitGuardrailCheck(bash('git -C '.repeat(8000)));
+    assert.ok(Date.now() - t0 < 3000, `耗時 ${Date.now() - t0}ms，疑似退回 O(n²)`);
+  });
+  test("'git branch ( '.repeat(8000)（有規則子命令反覆把 rest 收到段尾）要在 3 秒內判完", () => {
+    const t0 = Date.now();
+    gitGuardrailCheck(bash('git branch ( '.repeat(8000)));
     assert.ok(Date.now() - t0 < 3000, `耗時 ${Date.now() - t0}ms，疑似退回 O(n²)`);
   });
 });

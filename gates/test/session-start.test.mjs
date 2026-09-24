@@ -3,6 +3,11 @@
 // 共用同一個 root，這個改動完全沒有回歸網。session-start.mjs 檔尾無條件掛 stdin（沒有
 // import.meta.url 守衛），只能黑箱 spawn 驗證最基本的兩個情境：非 Constellation 專案靜默放行、
 // Constellation 專案正常注入且 pre-commit 只裝一次。
+//
+// 第二輪對抗複審 should-fix：測試會讀開發者本機的全域 git 設定——本機若設了全域 core.hooksPath，
+// installPrecommit 會照正確邏輯回報 skipped=custom-hookspath，導致這裡的斷言失敗（產品程式碼本身沒
+// 有錯，是測試依賴本機狀態）。用環境變數把子行程的全域/系統設定都指向空檔案隔離掉，user.name／
+// user.email 仍在 repo 層級設定，不受影響。
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
@@ -16,6 +21,11 @@ const GATE = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'session-sta
 let nonProj, proj;
 
 before(() => {
+  const emptyGlobalConfig = join(mkdtempSync(join(tmpdir(), 'ss-gitcfg-')), 'gitconfig');
+  writeFileSync(emptyGlobalConfig, '', 'utf8');
+  process.env.GIT_CONFIG_GLOBAL = emptyGlobalConfig;
+  process.env.GIT_CONFIG_NOSYSTEM = '1';
+
   nonProj = mkdtempSync(join(tmpdir(), 'ss-nonproj-'));
 
   proj = mkdtempSync(join(tmpdir(), 'ss-proj-'));

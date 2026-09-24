@@ -2,13 +2,14 @@
 // 無關的 -n 短旗標當成「想跳過檢查」。commitGateCheck 是純函式（檔案頂部有 import.meta.url 守衛，
 // 被 import 時不會自動掛 stdin），直接 import 呼叫。
 //
-// 38 條「現場誤擋指令」逐字取自對 3,440 份 transcript 的唯讀掃描結果（tool_result 以 hook error
+// 38 條「現場誤擋指令」取自對 3,440 份 transcript 的唯讀掃描結果（tool_result 以 hook error
 // 開頭、訊息含 --no-verify/-n 字樣的真擋下），對應 report.md ### P4「現場 5 筆真實擋下」統計裡的
-// 完整 38 筆（不是取樣）——使用者名稱、私人專案路徑已改成中性佔位字（C:/Users/u/proj-*），指令的
-// 形狀（sed -n、heredoc、-F、PowerShell 多行等決定判定結果的部分）維持原樣。逐條已用現行
-// commit-gate 重播過：38 筆全數命中「命令帶了 --no-verify/-n」擋下訊息，且逐一核對後真的帶
-// --no-verify/-n 的 0 筆——這 38 筆改後全部應該放行。真繞過寫法（--no-verify、-n、-anm、
-// core.hooksPath）維持擋下，見下方「必須仍擋下」區塊。
+// 完整 38 筆（不是取樣）——形狀取自現場，內容已合成：使用者名稱、私人專案路徑、票號、內部路徑、
+// commit hash、業務訊息內文與共同作者行都已換成中性佔位字，但決定判定結果的形狀（sed -n、heredoc、
+// -F、PowerShell 多行、here-string、管線與分號的位置）維持原樣。逐條已用現行 commit-gate 重播過：
+// 38 筆全數命中「命令帶了 --no-verify/-n」擋下訊息，且逐一核對後真的帶 --no-verify/-n 的 0 筆——
+// 這 38 筆改後全部應該放行。真繞過寫法（--no-verify、-n、-anm、core.hooksPath）維持擋下，見下方
+// 「必須仍擋下」區塊。
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
@@ -51,28 +52,28 @@ function assertBlocked(input, label) {
   assert.equal(r.block, true, `${label}：應擋下，實際 ${JSON.stringify(r).slice(0, 200)}`);
 }
 
-// ── 38 條現場誤擋指令（逐字，未改寫）：改後全部應該放行 ──
+// ── 38 條現場誤擋指令（形狀取自現場，內容已合成）：改後全部應該放行 ──
 const FIELD_38 = [
   `cd /c/Users/u/Desktop/proj-a && sed -n '60,72p' specs/architecture.md; echo "--- exists? ---"; ls system/project-aliases.json 2>&1 | head -2; ls system/promotion-queue.json 2>&1 | head -2; ls system/.state/promotion-queue.json 2>&1 | head -2; echo "--- git last commit of specs/architecture.md ---"; git log -1 --format='%ad %h' -- specs/architecture.md`,
   `git status --porcelain | grep -v "^?? .constellation/decisions/" | head -30; grep -n -i "worktree\\|commit" /c/Users/u/.claude/skills/constellation/references/phase-build.md | head -30`,
-  `cd "C:/Users/u/Documents/proj-b"; git add .constellation/tickets/T-510-unify-version-conflict-error-code.md .constellation/tickets/T-511-parent-unavailable-modal-regression.md && git commit -q -F - <<'EOF'\ndocs(tickets): 開兩張整合缺陷補票 T-510、T-511\n\nCo-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>\nEOF\necho "已 commit"`,
+  `cd "C:/Users/u/Documents/proj-b"; git add .constellation/tickets/T-201-sync-conflict-code.md .constellation/tickets/T-202-parent-modal-regression.md && git commit -q -F - <<'EOF'\ndocs(tickets): 開兩張整合缺陷補票 T-201、T-202\n\nCo-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>\nEOF\necho "已 commit"`,
   `$roots = @("$env:USERPROFILE\\Desktop") | Where-Object { Test-Path $_ }; foreach ($r in $roots) { Get-ChildItem -Path $r -Recurse -File -ErrorAction SilentlyContinue -Include *.txt,*.md,*.json | Where-Object { $_.Name -match 'git|逐字|旁白|字幕|腳本|稿|transcript|開場|commit|branch|worktree|merge' } | Select-Object @{n='Path';e={$_.FullName}}, @{n='KB';e={[math]::Round($_.Length/1KB,1)}}, LastWriteTime | Sort-Object LastWriteTime -Descending | Select-Object -First 60 | Format-Table -AutoSize | Out-String -Width 260 }`,
   `cd /c/Users/u/Desktop && echo "--- top-level:" && ls && find . -type f \\( -iname '*.txt' -o -iname '*.md' \\) 2>/dev/null | grep -v -E 'node_modules|/\\.git/' | grep -i -E 'git|commit|branch|worktree|merge' | head -60`,
-  `cd "C:/Users/u/Documents/proj-b" && sed -i '2s/^status: .*/status: done/' .constellation/tickets/T-418-training-data-foundation.md && sed -n '1,3p' .constellation/tickets/T-418-training-data-foundation.md && git add supabase/migrations/0122.sql .constellation/tickets/T-418-training-data-foundation.md && git -c core.safecrlf=false commit -q -F "msg.txt" 2>&1 | grep -v "^warning:" ; git log --oneline -1`,
-  `cd "C:/Users/u/Documents/proj-b" && sed -i '2s/^status: .*/status: done/' .constellation/tickets/T-418-training-data-foundation.md && sed -n '2p' .constellation/tickets/T-418-training-data-foundation.md && git add supabase/migrations/0122.sql 2>&1 | grep -v "^warning:"; git commit -q -F "msg.txt" 2>&1 | grep -v "^warning:"; git log --oneline -1`,
-  `cd "C:/Users/u/Documents/proj-b" && sed -i '2s/^status: .*/status: done/' .constellation/tickets/T-421-training-hard-delete-cron.md && git add .constellation/tickets/T-421-training-hard-delete-cron.md 2>&1 | grep -v "^warning:"; git commit -q -F "msg.txt" 2>&1 | grep -v "^warning:"; git log --oneline -1`,
-  `cd "C:/Users/u/Documents/proj-b" && SC="/tmp/sc" && cat > "$SC/commit-msg.txt" <<'EOF'\nfeat(weekly+line): 138 LINE 週報不列停滯\nEOF\ngit add lib/line/report-message.ts && git commit -q -F "$SC/commit-msg.txt" 2>&1 | grep -v "^warning:"; git log --oneline -1`,
+  `cd "C:/Users/u/Documents/proj-b" && sed -i '2s/^status: .*/status: done/' .constellation/tickets/T-301-batch-data-foundation.md && sed -n '1,3p' .constellation/tickets/T-301-batch-data-foundation.md && git add db/migrations/0042.sql .constellation/tickets/T-301-batch-data-foundation.md && git -c core.safecrlf=false commit -q -F "msg.txt" 2>&1 | grep -v "^warning:" ; git log --oneline -1`,
+  `cd "C:/Users/u/Documents/proj-b" && sed -i '2s/^status: .*/status: done/' .constellation/tickets/T-301-batch-data-foundation.md && sed -n '2p' .constellation/tickets/T-301-batch-data-foundation.md && git add db/migrations/0042.sql 2>&1 | grep -v "^warning:"; git commit -q -F "msg.txt" 2>&1 | grep -v "^warning:"; git log --oneline -1`,
+  `cd "C:/Users/u/Documents/proj-b" && sed -i '2s/^status: .*/status: done/' .constellation/tickets/T-304-hard-delete-cron.md && git add .constellation/tickets/T-304-hard-delete-cron.md 2>&1 | grep -v "^warning:"; git commit -q -F "msg.txt" 2>&1 | grep -v "^warning:"; git log --oneline -1`,
+  `cd "C:/Users/u/Documents/proj-b" && SC="/tmp/sc" && cat > "$SC/commit-msg.txt" <<'EOF'\nfeat(weekly+line): 週報不列停滯項目\nEOF\ngit add lib/notify/report-message.ts && git commit -q -F "$SC/commit-msg.txt" 2>&1 | grep -v "^warning:"; git log --oneline -1`,
   `cd "C:/Users/u/Documents/proj-b/.constellation" && echo "=== 找出貨審查報告 ===" && find . -maxdepth 2 -name "*review*" | grep -v "^./archive" && cd "C:/Users/u/Documents/proj-b" && git status --short .constellation | head -20 && git rev-list --count origin/main..main 2>/dev/null || echo "（無 origin/main）"`,
-  `$r = "C:\\Users\\u\\Documents\\proj-b"; git -C $r add -A; git -C $r commit -q -m "chore: 批2 三件小事" -m "Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>" 2>$null; git -C $r log --oneline -1`,
+  `$r = "C:\\Users\\u\\Documents\\proj-b"; git -C $r add -A; git -C $r commit -q -m "chore: 批2 三件小事" -m "Co-Authored-By: Claude Test 5 <noreply@example.com>" 2>$null; git -C $r log --oneline -1`,
   `cd "C:/Users/u/Documents/proj-b" && S="/tmp/s" && printf '%s\\n' "docs(constellation): 續期取樣點寫入規格" > "$S/c-notes2.txt" && git add .constellation/decisions && git commit -q -F "$S/c-notes2.txt" && git log --oneline -1 && for f in .constellation/tickets/T-5*.md; do printf "%s  " "$(basename $f .md | cut -c1-5)"; sed -n '2p' "$f"; done`,
   `cd "C:/Users/u/Documents/proj-c" && sed -n '90,96p' .constellation/decisions/244-export-completed-trips-net-value.md && git add .constellation/decisions/244-export-completed-trips-net-value.md && git commit -q -F - <<'EOF' && git push -q origin main && echo "已推送" && git log --oneline -1\ndocs(constellation): 決議 244 的懸置事項定案\nEOF`,
   `cd "C:/Users/u/Documents/proj-c"; S="/tmp/s"; echo "=== 第二批 t015 有跑嗎 ==="; f=$(ls -t "$S"/dbtest-batch2-*.log | head -1); grep -aE "^\\s+(ok|x|-) .*t015" "$f" | cut -c1-110; sed -n 462p .constellation/MAP.md; git add .constellation/MAP.md && git commit -q -F "$S/msg-map-jsonb.txt" && git log --oneline -1`,
   `cd "C:/Users/u/Documents/proj-c" && echo "=== T-106 相關符號位置 ==="; grep -rn "loadUnmatchedTaskNos\\|batchDays" app/api/import/_lib/trip-detail-route.ts | head -30; git log --oneline --since=2026-09-10 --until=2026-09-12 --name-only | head -60`,
-  `cd "C:\\Users\\u\\Documents\\proj-c" && git log --all --oneline -p -- lib/activity/recompute/daily.ts | grep -n "requeueActiveBackfills\\|GRACE_DAYS\\|^commit\\|^Date:" | grep -B2 "GRACE_DAYS" | head -80`,
+  `cd "C:\\Users\\u\\Documents\\proj-c" && git log --all --oneline -p -- lib/metrics/recompute/daily.ts | grep -n "requeueActiveBackfills\\|GRACE_DAYS\\|^commit\\|^Date:" | grep -B2 "GRACE_DAYS" | head -80`,
   `powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \\"Name like '%node%'\\" | Where-Object { \\$_.CommandLine -match 'proj-c' } | Select-Object ProcessId | Format-Table -AutoSize | Out-String" | grep -E "^\\s*[0-9]+" | head -3; git add tests/segment/t081.spec.ts && git commit -q -m "$(cat <<'EOF'\ntest(t081)+docs: 上車縣市改快照\nEOF\n)" && git push origin main 2>&1 | tail -1`,
   `git add tests/ops/prod-profile-open.measure.spec.ts && git commit -q -F - <<'EOF'\ntest(ops): 隊員 Profile 重現探針兩支\nEOF\ngit push origin main 2>&1 | tail -1; powershell -NoProfile -Command "Get-CimInstance Win32_Process | Select-Object ProcessId | Out-String" | grep -cE "^\\s*[0-9]+"`,
   `cd "C:/Users/u/Desktop/proj-a" && grep -n "git add\\|git commit\\|execSync\\|spawnSync" scripts/lib/txn.mjs | head -20`,
-  `cd "C:\\Users\\u\\Documents\\proj-c" && git log -p --follow -- lib/import/db.ts | grep -n "^\\-.*max:\\|^\\+.*max:\\|^commit\\|^Date:" | head -80`,
+  `cd "C:\\Users\\u\\Documents\\proj-c" && git log -p --follow -- lib/import/store.ts | grep -n "^\\-.*max:\\|^\\+.*max:\\|^commit\\|^Date:" | head -80`,
   `git log --oneline --since="2026-08-05" --until="2026-08-10" --all\necho "---playwright.config.ts history---"\ngit log --follow --oneline -- playwright.config.ts\ngit log -p --all -S "6543" -- . | grep -n "^commit\\|6543" | head -60`,
   `cd C:/Users/u/Documents/proj-c && S="/tmp/s" && git add "app/(dashboard)/activity/activity.css" .constellation/design-frozen.json && git commit -q -F "$S/commit-336.txt" && git log --oneline -1 && echo "== push" && git push origin main 2>&1 | tail -3`,
   `cd C:/Users/u/Documents/proj-c && git add tests/e2e/req-e2e-007-activity-create.e2e.spec.ts && git commit -q -F "/tmp/s/commit-e2e007.txt" && git log --oneline -1 && git status --short | head -3; (netstat -ano | grep -E ":3000 " | grep LISTEN | head -1 || echo "3000 free")`,
@@ -80,13 +81,13 @@ const FIELD_38 = [
   `cd "C:/Users/u/Documents/proj-c-worktrees/Function" && node "/tmp/freeze-tool.mjs" unfreeze "0903 輪 build 批次 2 接真資料" "app/(dashboard)/settings/ReasonDictTab.tsx" && git add .constellation/design-frozen.json && git commit -q -F - <<'EOF'\nchore(constellation): 批次 2 開工前解凍 7 支定稿檔（決議 286）\nEOF\ngit log --oneline -1; grep -n -i "port\\|usage\\|用法" "/tmp/serve.mjs" | head -25`,
   `M="/tmp/m"; cat > "$M/reference-commit-hook-dash-n-false-positive.md" <<'EOF'\n---\nname: reference-commit-hook-dash-n-false-positive\n---\nConstellation 的 PreToolUse hook 掃整條 Bash 命令字串：只要同時出現 \`git commit\` 與 \` -n\`，就判定為 \`--no-verify\` 短式而擋下——\`grep -n\`、\`sed -n\`、commit message 內文的「-n」都會誤中。\nEOF\ncat >> "$M/MEMORY.md" <<'EOF'\n- [commit 守門誤判 -n](reference-commit-hook-dash-n-false-positive.md)\nEOF\ntail -3 "$M/MEMORY.md"`,
   `cd "C:/Users/u/Documents/proj-d" && sed -i '44s|舊字串|新字串|' HANDOFF.md && grep -n "1212" HANDOFF.md | cut -c1-120 && git add HANDOFF.md && git commit -q -F - << 'EOF'\ndocs: 交接紀錄測試數字訂正為最終全量 1212\nEOF\ngit log --oneline -5 && git status --short`,
-  `cd 'C:\\Users\\u\\Documents\\proj-d'; $b=[System.IO.File]::ReadAllBytes('.constellation\\tickets\\T-009-ui-live-data-wiring.md')[0..2]; "ticket BOM: $($b -join ',')"; git add app/Ui.ps1 .constellation/tickets/T-009-ui-live-data-wiring.md; git commit -m @'\nfeat(T-009): 改列失敗真的寫回日誌\n\n全量 1382 passed / 1 failed / 1383 支，\n唯一紅燈是 Win.Tests AC9 剪貼簿既知偶發，單獨重跑該 Describe 17 / 0 全綠。\n'@; git log --oneline -4; git status --short`,
+  `cd 'C:\\Users\\u\\Documents\\proj-d'; $b=[System.IO.File]::ReadAllBytes('.constellation\\tickets\\T-105-ui-live-data-wiring.md')[0..2]; "ticket BOM: $($b -join ',')"; git add app/Ui.ps1 .constellation/tickets/T-105-ui-live-data-wiring.md; git commit -m @'\nfeat(T-105): 改列失敗真的寫回日誌\n\n全量 1382 passed / 1 failed / 1383 支，\n唯一紅燈是 Win.Tests AC9 剪貼簿既知偶發，單獨重跑該 Describe 17 / 0 全綠。\n'@; git log --oneline -4; git status --short`,
   `cd "C:/Users/u/Documents/proj-d" && git commit -F - -- app/lib/SendRunner.ps1 <<'EOF'\nfix(T-008): 補「清空後讀回仍非空」與「未定關閉段」兩處離線測試\n\nSendRunner 239 -> 248（0 failed）、SendEngine 440 -> 443（0 failed）。\nEOF`,
   `$ErrorActionPreference='Stop'; foreach ($f in @('.constellation/CONTEXT.md')) { $tmp="$env:TEMP\\chk.diff"; git --no-pager diff -U0 --no-color -- $f | Out-File $tmp -Encoding utf8; $addLines = @(Get-Content $tmp | Where-Object { $_.Length -gt 1 -and $_[0] -eq '+' -and $_ -notmatch '^\\+\\+\\+' }); $withDate = @($addLines | Where-Object { $_ -match '2026-09-20' }); "$f : 新增行=$($addLines.Count) 含2026-09-20=$($withDate.Count)" }`,
-  `cd 'C:\\Users\\u\\Documents\\proj-d'\n$head = (git rev-parse HEAD).Trim()\n$subject = (git log -1 --pretty=%s).Trim()\nif ($head -like '6c41444*' -and $subject -match 'fix\\(T-008\\): 背景執行緒') {\n  $msgPath = '/tmp/commit-msg.txt'\n  $t = [System.IO.File]::ReadAllText($msgPath, (New-Object System.Text.UTF8Encoding($true)))\n  [System.IO.File]::WriteAllText($msgPath, $t, (New-Object System.Text.UTF8Encoding($false)))\n  git commit --amend -F $msgPath\n  git log --oneline -1\n} else { "HEAD 已被其他執行者變更，跳過 amend" }`,
-  `cd 'C:\\Users\\u\\Documents\\proj-d'\n$head = git rev-parse HEAD\nif ($head.Trim().StartsWith('9a26a11')) {\n  $msg = git log -1 --pretty=%B\n  $clean = ($msg -join "\`n").TrimStart([char]0xFEFF)\n  $f = Join-Path $env:TEMP 'commit-msg-zone1-nobom.txt'\n  [System.IO.File]::WriteAllText($f, $clean, (New-Object System.Text.UTF8Encoding($false)))\n  git commit --amend -F $f --only 2>&1 | Select-String -NotMatch 'warning: in the working copy'\n  git log -1 --pretty='%H%n%s'\n} else {\n  "HEAD 已前進到 $head，不 amend"\n}`,
-  `cd 'C:\\Users\\u\\Documents\\proj-d'\n$head = (git rev-parse HEAD).Trim()\nif ($head.StartsWith('9a26a11')) {\n  $msg = (git log -1 --pretty=%B) -join "\`n"\n  $clean = $msg.TrimStart([char]0xFEFF)\n  $f = Join-Path $env:TEMP 'commit-msg-zone1-nobom.txt'\n  [System.IO.File]::WriteAllText($f, $clean, (New-Object System.Text.UTF8Encoding($false)))\n  git commit --amend -F $f -- app/lib/Config.ps1\n} else {\n  "HEAD 已前進到 $head，不 amend"\n}\ngit log -1 --pretty='%H%n%s'`,
-  `cd 'C:\\Users\\u\\Documents\\proj-d'\n$head = (git rev-parse HEAD).Trim()\nif ($head.StartsWith('9a26a11')) {\n  $msg = (git log -1 --pretty=%B) -join "\`r\`n"\n  $clean = $msg.TrimStart([char]0xFEFF)\n  $f = Join-Path $env:TEMP 'commit-msg-clean.txt'\n  [System.IO.File]::WriteAllText($f, $clean, (New-Object System.Text.UTF8Encoding($false)))\n  git commit --amend --file $f -- app/lib/Config.ps1\n} else {\n  "HEAD 已前進到 $head，不 amend"\n}\ngit log -1 --pretty='%H%n%s'`,
+  `cd 'C:\\Users\\u\\Documents\\proj-d'\n$head = (git rev-parse HEAD).Trim()\n$subject = (git log -1 --pretty=%s).Trim()\nif ($head -like 'a1b2c3d*' -and $subject -match 'fix\\(T-008\\): 背景執行緒') {\n  $msgPath = '/tmp/commit-msg.txt'\n  $t = [System.IO.File]::ReadAllText($msgPath, (New-Object System.Text.UTF8Encoding($true)))\n  [System.IO.File]::WriteAllText($msgPath, $t, (New-Object System.Text.UTF8Encoding($false)))\n  git commit --amend -F $msgPath\n  git log --oneline -1\n} else { "HEAD 已被其他執行者變更，跳過 amend" }`,
+  `cd 'C:\\Users\\u\\Documents\\proj-d'\n$head = git rev-parse HEAD\nif ($head.Trim().StartsWith('f4e5d6c')) {\n  $msg = git log -1 --pretty=%B\n  $clean = ($msg -join "\`n").TrimStart([char]0xFEFF)\n  $f = Join-Path $env:TEMP 'commit-msg-zone1-nobom.txt'\n  [System.IO.File]::WriteAllText($f, $clean, (New-Object System.Text.UTF8Encoding($false)))\n  git commit --amend -F $f --only 2>&1 | Select-String -NotMatch 'warning: in the working copy'\n  git log -1 --pretty='%H%n%s'\n} else {\n  "HEAD 已前進到 $head，不 amend"\n}`,
+  `cd 'C:\\Users\\u\\Documents\\proj-d'\n$head = (git rev-parse HEAD).Trim()\nif ($head.StartsWith('f4e5d6c')) {\n  $msg = (git log -1 --pretty=%B) -join "\`n"\n  $clean = $msg.TrimStart([char]0xFEFF)\n  $f = Join-Path $env:TEMP 'commit-msg-zone1-nobom.txt'\n  [System.IO.File]::WriteAllText($f, $clean, (New-Object System.Text.UTF8Encoding($false)))\n  git commit --amend -F $f -- app/lib/Settings.ps1\n} else {\n  "HEAD 已前進到 $head，不 amend"\n}\ngit log -1 --pretty='%H%n%s'`,
+  `cd 'C:\\Users\\u\\Documents\\proj-d'\n$head = (git rev-parse HEAD).Trim()\nif ($head.StartsWith('f4e5d6c')) {\n  $msg = (git log -1 --pretty=%B) -join "\`r\`n"\n  $clean = $msg.TrimStart([char]0xFEFF)\n  $f = Join-Path $env:TEMP 'commit-msg-clean.txt'\n  [System.IO.File]::WriteAllText($f, $clean, (New-Object System.Text.UTF8Encoding($false)))\n  git commit --amend --file $f -- app/lib/Settings.ps1\n} else {\n  "HEAD 已前進到 $head，不 amend"\n}\ngit log -1 --pretty='%H%n%s'`,
   `cd "C:/Users/u/Documents/proj-d" && for i in 1 2 3 4 5; do git add -- .constellation/decisions/088-clipboard-reliability-scope-ruling.md && git commit -q -m "docs: decisions/088 補記" -- .constellation/decisions/088-clipboard-reliability-scope-ruling.md && break || sleep 4; done; grep -n "剪貼簿" docs/交付說明.md | head -6`,
   `cd "C:/Users/u/Documents/proj-d"; perl -i -pe 's/^status: in-progress$/status: done/ if $. < 10' .constellation/tickets/T-014-csv-distribution.md; sed -n '1,6p' .constellation/tickets/T-014-csv-distribution.md; git add .constellation/tickets/T-014-csv-distribution.md; git commit -q -F - << 'EOF'\nfeat(T-014): 關票——分發用名單檔改為 CSV\nEOF\ngit log --oneline -1`,
   `cd "C:/Users/u/Documents/proj-d/.constellation/decisions"; cat > 099-skip-network-off-test.md <<'EOF'\n# 099 不做斷網送出測試\nEOF\ncd ../..; git add .constellation/decisions/099-skip-network-off-test.md; git commit -q -m "docs: decisions/099 不做斷網送出測試"; git log --oneline -1; grep -n "^| 3[89]\\|^| 4[0-9]" .constellation/decisions/013*.md | cut -c1-400`,
@@ -265,4 +266,131 @@ describe('第二輪 must-fix——GIT_COMMIT_LOOSE_RE 保底不能誤攔唯讀�
     assertPassed(bash('git commit-tree HEAD^{tree} -m x --no-verify'), 'commit-tree --no-verify'));
   test('PowerShell：git diff | Select-String --no-verify 放行', () =>
     assertPassed(ps("git diff -- gates/commit-gate.mjs | Select-String -Pattern '--no-verify'"), 'ps diff | Select-String'));
+});
+
+// 第三輪對抗複審 must-fix：GIT_COMMIT_LOOSE_RE 少了 must-fix 前的兩側邊界（(?<![=-])…(?!-)），
+// commit-gate.mjs、src/commit-utils.ts、.git/hooks/pre-commit、--grep=commit 這類檔名/樣式裡的
+// "commit" 字樣會誤觸前置關卡，讓 hooksPathBypass／三道檔案閘門這兩個「對整條指令字串」的判定連坐
+// 擋下唯讀指令。用 staged 了 .env 的 repo 測試——staging 乾淨時三道閘門本來就 fail-open、測不出
+// 「連坐擋下」這個問題，只有 staging 不乾淨時才會真的暴露（改前這些純檔名唯讀指令會被冠上
+// 「staged 含 secrets」的擋下理由，儘管跟這條指令毫無關係）。
+describe('第三輪 must-fix——GIT_COMMIT_LOOSE_RE 邊界收緊：唯讀指令連檔名都不該誤觸前置關卡（staged .env）', () => {
+  let filenameRepo;
+  before(() => {
+    filenameRepo = mkdtempSync(join(tmpdir(), 'cg-filename-'));
+    execFileSync('git', ['init', '-q'], { cwd: filenameRepo });
+    execFileSync('git', ['config', 'user.email', 'a@b.c'], { cwd: filenameRepo });
+    execFileSync('git', ['config', 'user.name', 'test'], { cwd: filenameRepo });
+    mkdirSync(join(filenameRepo, '.constellation'), { recursive: true });
+    writeFileSync(join(filenameRepo, '.env'), 'SECRET=1\n');
+    execFileSync('git', ['add', '.env'], { cwd: filenameRepo });
+  });
+  after(() => rmSync(filenameRepo, { recursive: true, force: true }));
+  const fbash = (command) => ({ tool_name: 'Bash', tool_input: { command }, cwd: filenameRepo });
+  const fps = (command) => ({ tool_name: 'PowerShell', tool_input: { command }, cwd: filenameRepo });
+
+  test('git diff HEAD~1 -- gates/commit-gate.mjs 放行', () =>
+    assertPassed(fbash('git diff HEAD~1 -- gates/commit-gate.mjs'), 'diff commit-gate.mjs filename'));
+  test('git log --oneline -5 -- src/commit-utils.ts 放行', () =>
+    assertPassed(fbash('git log --oneline -5 -- src/commit-utils.ts'), 'commit-utils.ts filename'));
+  test('git blame -L 10,20 gates/commit-gate.mjs 放行', () =>
+    assertPassed(fbash('git blame -L 10,20 gates/commit-gate.mjs'), 'blame commit-gate.mjs'));
+  test('git log --all --oneline -- "**/commit-gate*" 放行', () =>
+    assertPassed(fbash('git log --all --oneline -- "**/commit-gate*"'), 'log commit-gate*'));
+  test('cat .git/hooks/pre-commit 放行（.git 與 pre-commit 都不是真正的 commit 呼叫）', () =>
+    assertPassed(fbash('cat .git/hooks/pre-commit'), 'cat pre-commit'));
+  test('PowerShell：Get-Content .git/hooks/pre-commit 放行', () =>
+    assertPassed(fps('Get-Content .git/hooks/pre-commit'), 'ps Get-Content pre-commit'));
+  test('git config --get core.hooksPath; ls -la .git/hooks/pre-commit 放行（排查用唯讀指令）', () =>
+    assertPassed(fbash('git config --get core.hooksPath; ls -la .git/hooks/pre-commit'), 'config --get; ls pre-commit'));
+  test('git config core.hooksPath && cat .git/hooks/pre-commit 放行（裸讀，沒有值＝沒有改向）', () =>
+    assertPassed(fbash('git config core.hooksPath && cat .git/hooks/pre-commit'), 'config bare read && cat'));
+  test('PowerShell：git config --get core.hooksPath; Get-Content .git/hooks/pre-commit 放行', () =>
+    assertPassed(fps('git config --get core.hooksPath; Get-Content .git/hooks/pre-commit'), 'ps config --get; Get-Content'));
+});
+
+// 第三輪對抗複審 must-fix：hooksPathBypass 改前對整條指令字串做「看到 config…core.hooksPath 就擋」，
+// 就算 staged 是乾淨的、也就算擋下理由跟 staged 內容無關的唯讀查詢，一樣連坐擋下——用一個 staged
+// 了 .env 的 repo 確認：唯讀的 config 查詢不該因為 staging 剛好不乾淨就被冠上「改向 hooksPath」的
+// 罪名（本來就該被 secrets 閘門擋下的話，理由應該是 secrets，不是 hooksPath）。
+describe('第三輪 must-fix——hooksPathBypass 只認寫入形式（staged .env，確認不是巧合放行）', () => {
+  let secretRepo2;
+  before(() => {
+    secretRepo2 = mkdtempSync(join(tmpdir(), 'cg-secret2-'));
+    execFileSync('git', ['init', '-q'], { cwd: secretRepo2 });
+    execFileSync('git', ['config', 'user.email', 'a@b.c'], { cwd: secretRepo2 });
+    execFileSync('git', ['config', 'user.name', 'test'], { cwd: secretRepo2 });
+    mkdirSync(join(secretRepo2, '.constellation'), { recursive: true });
+    writeFileSync(join(secretRepo2, '.env'), 'SECRET=1\n');
+    execFileSync('git', ['add', '.env'], { cwd: secretRepo2 });
+  });
+  after(() => rmSync(secretRepo2, { recursive: true, force: true }));
+  const s2bash = (command) => ({ tool_name: 'Bash', tool_input: { command }, cwd: secretRepo2 });
+
+  test('git log --grep=commit --oneline 放行（=commit 是查詢樣式，不是真正的 commit 呼叫）', () =>
+    assertPassed(s2bash('git log --grep=commit --oneline'), 'log --grep=commit'));
+  test('git config --get core.hooksPath; git log --oneline -3 -- gates/commit-gate.mjs 放行', () =>
+    assertPassed(s2bash('git config --get core.hooksPath; git log --oneline -3 -- gates/commit-gate.mjs'), 'config --get; log filename'));
+  test('讀查詢與真正 commit 同一條指令混寫：讀的那段不該連坐擋下真正 commit（staged .env 本來就該擋，但理由要是 secrets）', () => {
+    const r = commitGateCheck(s2bash('git config --get core.hooksPath; git commit -m "x"'));
+    assert.equal(r.block, true, '應擋下（staged .env）');
+    assert.match(r.message, /secrets/, `擋下理由應是 secrets，不是誤判成 hooksPath 改向，實際：${r.message}`);
+  });
+});
+
+// 第三輪對抗複審 must-fix：LOOKS_WRAPPED_RE 改前只要整條指令出現任何括號就當「看起來像包了殼」，
+// PowerShell 的 `.Trim()`、bash 的子殼都算——這裡用「唯讀指令裡剛好同時有 git…log（非 commit 子命令）
+// 與帶括號的無關片段、外加 --no-verify 字面值」組合，重現「明明沒有真正的 commit 呼叫，卻因為整條
+// 字串同時湊到括號與 --no-verify 字樣而被擋下」。
+describe('第三輪 must-fix——LOOKS_WRAPPED_RE 收緊：無關括號＋巧合字樣不誤判成包殼繞過', () => {
+  test('git log --grep commit | grep -- --no-verify ; (pwd) 放行', () =>
+    assertPassed(bash('git log --grep commit | grep -- --no-verify ; (pwd)'), 'log --grep commit | grep --no-verify ; (pwd)'));
+  test('PowerShell：git log --grep commit | Select-String -- "--no-verify"; (Get-Date).ToString() 放行', () =>
+    assertPassed(ps('git log --grep commit | Select-String -- "--no-verify"; (Get-Date).ToString()'), 'ps grep commit; (Get-Date).ToString()'));
+});
+
+// 第三輪對抗複審 must-fix：splitChainSegments 引號沒收尾時（segments===null）退回的保底原本只看長式
+// --no-verify、還要 LOOKS_WRAPPED_RE 命中才看，短式 -n 在這條路徑上完全漏看。另外 bash 註解裡的撇號
+// （don't）會被誤判成單引號起頭而讓切段回 null——但既然 -n 本來就在註解之前，退回的保底本來就抓得到，
+// 這裡直接驗證「確實仍會擋下」，不特別區分是靠切段成功還是靠保底。
+describe('第三輪 must-fix——引號/heredoc 沒收尾時，短式 -n 不能漏擋', () => {
+  test("bash 註解裡的撇號（# don't run hooks）不能讓 -n 漏擋", () =>
+    assertBlockedNoVerify(bash("git commit -n -m wip  # don't run hooks"), 'comment apostrophe + -n'));
+  test('真的未收尾的雙引號（echo "it\'s done 沒有收尾）不能讓 -n 漏擋', () =>
+    assertBlockedNoVerify(bash('git commit -n -m wip; echo "it\'s done'), 'unterminated quote + -n'));
+  test('PowerShell：# 註解裡的撇號（# don\'t）不能讓 -n 漏擋', () =>
+    assertBlockedNoVerify(ps('git commit -n -m "wip" # don\'t'), 'ps comment apostrophe + -n'));
+  test('heredoc 訊息內文含未跳脫的英吋符號（27"）不能讓 -n 漏擋', () =>
+    assertBlockedNoVerify(bash(`git commit -n -m "$(cat <<'EOF'\nfeat: 支援 27" 螢幕\nEOF\n)"`), 'inch mark in heredoc + -n'));
+  test('heredoc 訊息內文含未收尾的中文引號描述（未收尾字串）不能讓 -n 漏擋', () =>
+    assertBlockedNoVerify(bash(`git add -A && git commit -n -m "$(cat <<'EOF'\nfix: 修正 "未收尾字串\nEOF\n)"`), 'unterminated quote text in heredoc + -n'));
+});
+
+// 第三輪對抗複審 must-fix：CMD_C_WRAPPER_RE／SH_C_WRAPPER_RE 改前只認殼名後面緊接 -c／-Command、
+// cmd 後面緊接 /c，`powershell -NoProfile -Command`（Windows 上呼叫工具幾乎都這樣寫）、
+// `pwsh -NoLogo -c`、`bash -lc`／`bash -l -c`、`cmd /d /c` 都認不出來，短式 -n 藏在這些包殼裡就漏擋。
+describe('第三輪 must-fix——包殼旗標組合擴充：更多殼層寫法要能精準展開', () => {
+  test('powershell -NoProfile -Command "git commit -n -m x" 要擋', () =>
+    assertBlockedNoVerify(bash('powershell -NoProfile -Command "git commit -n -m x"'), 'powershell -NoProfile -Command'));
+  test('powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "git commit -n -m x" 要擋', () =>
+    assertBlockedNoVerify(bash('powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "git commit -n -m x"'), 'powershell.exe multi-flag -Command'));
+  test('pwsh -NoLogo -c "git commit -n -m x" 要擋', () =>
+    assertBlockedNoVerify(bash('pwsh -NoLogo -c "git commit -n -m x"'), 'pwsh -NoLogo -c'));
+  test('bash -lc "git commit -n -m x" 要擋（合寫短旗標）', () =>
+    assertBlockedNoVerify(bash('bash -lc "git commit -n -m x"'), 'bash -lc'));
+  test('bash -l -c "git commit -n -m x" 要擋（分寫旗標）', () =>
+    assertBlockedNoVerify(bash('bash -l -c "git commit -n -m x"'), 'bash -l -c'));
+  test('cmd /d /c "git commit -n -m x" 要擋', () =>
+    assertBlockedNoVerify(bash('cmd /d /c "git commit -n -m x"'), 'cmd /d /c'));
+});
+
+// 第二輪對抗複審 should-fix：findCommitCallsInSegment（現已併入 findGitCallsInSegment）對每個 commit
+// 呼叫都把 rest 收到段尾是平方級——8000 次重複在改前要 7 秒多，改後應在幾百毫秒內完成（含實際 git
+// 子行程開銷），差距夠大不會誤判。
+describe('第二輪 should-fix——病態輸入（同段大量 git commit 字樣）不能逼近逾時', () => {
+  test("'git commit '.repeat(8000) 要在 3 秒內判完", () => {
+    const t0 = Date.now();
+    commitGateCheck(bash('git commit '.repeat(8000)));
+    assert.ok(Date.now() - t0 < 3000, `耗時 ${Date.now() - t0}ms，疑似退回 O(n²)`);
+  });
 });

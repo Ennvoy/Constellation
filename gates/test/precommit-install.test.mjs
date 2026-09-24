@@ -3,6 +3,11 @@
 // （resolve 後相等即視為標準位置）——hooksPath 剛好設成同一個目錄（不論相對或絕對寫法）時應該正常
 // 安裝，不再像舊版一樣只要 core.hooksPath 有設值就一律跳過。installPrecommit 是純函式、無自動執行，
 // 直接 import 呼叫。
+//
+// 第二輪對抗複審 should-fix：測試會讀開發者本機的全域 git 設定——本機若設了全域 core.hooksPath，
+// installPrecommit 會照正確邏輯回報 skipped=custom-hookspath，導致下面的斷言失敗（產品程式碼本身沒
+// 有錯，是測試依賴本機狀態）。用環境變數把子行程的全域/系統設定都指向空檔案隔離掉，user.name／
+// user.email 仍在 repo 層級設定，不受影響。
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
@@ -10,6 +15,13 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { installPrecommit } from '../precommit-install.mjs';
+
+before(() => {
+  const emptyGlobalConfig = join(mkdtempSync(join(tmpdir(), 'pci-gitcfg-')), 'gitconfig');
+  writeFileSync(emptyGlobalConfig, '', 'utf8');
+  process.env.GIT_CONFIG_GLOBAL = emptyGlobalConfig;
+  process.env.GIT_CONFIG_NOSYSTEM = '1';
+});
 
 function git(cwd, args) {
   return execFileSync('git', ['-C', cwd, ...args], { stdio: ['ignore', 'pipe', 'ignore'] }).toString('utf8').trim();
