@@ -1,15 +1,12 @@
 #!/usr/bin/env node
-// Constellation 閘門 5 —— 關票刷卡機（PreToolUse hook，matcher Edit|Write|MultiEdit／Codex 端另含
+// Constellation 閘門 5 —— 關票刷卡機（PreToolUse hook，matcher Edit|Write／Codex 端另含
 // apply_patch）。DESIGN.md §4／§5。
 // 只在「目標是 .constellation/tickets/*.md 且新內容把 status 設為 done」時檢查：
 //   - Write（帶完整新內容 content）→ 直接檢查新內容本身。
 //   - Edit（只帶變更片段 new_string）→ 讀磁碟現檔（編輯前）的「## 驗證證據」section。
-//   - MultiEdit（tool_input.edits 陣列）→ 任一 edit 的 new_string 把 status 設 done，就讀磁碟現檔驗證。
 //   - apply_patch（Codex 原生編輯工具）→ 解析 `*** Update File: <路徑>` 找出受影響票檔，patch 內容
-//     含新增的 `+status: done` 才驗證，讀磁碟現檔（patch 套用前）確認證據。patch 文字本身用 fallback
-//     鏈依序嘗試 tool_input.patch → tool_input.command → input.patch → input.command——Codex 官方
-//     payload 實際把 apply_patch 內容放在 command 欄位（不是 patch 欄位），只認 tool_input.patch
-//     會讀錯欄位、形同虛設，這是本檔這輪修復裡最重要的一項。
+//     含新增的 `+status: done` 才驗證，讀磁碟現檔（patch 套用前）確認證據。patch 文字讀
+//     tool_input.command——Codex 官方 payload 把 apply_patch 內容放在這個欄位，不是 patch 欄位。
 // 沒有「24 小時內＋簽章核對通過」的證據、或「## 驗收條件」尚有未勾項 → stderr 印理由、exit 2 擋下；
 // 都過 → 放行。任何解析異常一律 fail-open（放行），不誤擋日常編輯——擋人是例外，不是預設。
 //
@@ -17,18 +14,21 @@
 // 24 小時內的字串進去。真正把關的是簽章：對最新一筆證據的「ISO 時間戳＋票檔相對路徑＋全部指令
 // 串接＋輸出尾行＋repo 根絕對路徑」重算 HMAC-SHA256，核對證據筆尾的 `sig: <hex>` 行——簽章缺失／
 // 不符／unsigned／secret 檔不存在，一律擋下（secret 不存在時 fail-closed：沒有 secret 就無法驗證
-// 任何東西，一律當作未過關，不能因為讀不到 secret 就放水）。repo 根這段防跨專案重放。
+// 任何東西，一律當作未過關，不能因為讀不到 secret 就放水）。repo 根這段防跨專案重放；票檔的 repo 根
+// 一律從票檔自己的絕對路徑切出來（見 ticketRootFromPath），不依賴 hook 傳進來的 cwd——hook 的 cwd
+// 可能是子目錄或另一個 worktree，跟簽出證據當下的 repo 根對不上，會把合法證據誤判成竄改（見 P3／
+// findProjectRoot：其餘讀 .constellation 底下設定檔的地方，root 一律從目標檔所在目錄往上找）。
 // **鏡像提醒**：本檔的簽章建構邏輯（SECRET_PATH／ticketRelPath／FIELD_SEP／computeSignature／
 // repoRootToken，以及簽章涵蓋的欄位定義）與 gates/verify-runner.mjs 的簽章邏輯、gates/commit-gate.mjs
 // 的 done 票稽核驗簽邏輯必須逐字元一致，三檔各自內聯一份（不共用 import）——這是安全閘門，不依賴
 // 另一支腳本的存在／版本；改一份要同步改另兩份。
 //
-// 定稿 UI 凍結守衛（本輪新增，DESIGN.md §3 第 4 點／§5）：另外讀取 `.constellation/design-frozen.json`
-// 的 frozen 陣列，命中名單的目標檔案一律擋下編輯（Write／Edit／MultiEdit／apply_patch 皆涵蓋，不限
+// 定稿 UI 凍結守衛（DESIGN.md §3 第 4 點／§5）：另外讀取 `.constellation/design-frozen.json`
+// 的 frozen 陣列，命中名單的目標檔案一律擋下編輯（Write／Edit／apply_patch 皆涵蓋，不限
 // 票檔）——要改必須先經使用者彈窗同意、把該檔從 frozen 移除並在 log 記一筆 unfreeze（含原因）。名單
 // 檔不存在或解析失敗一律 fail-open，不影響非 UI 專案；目標本身就是 design-frozen.json 時不受此檢查
 // 限制（否則永遠無法解凍）。此檢查與上面的 done 票檢查各自獨立觸發，互不影響、互不依賴。
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
@@ -79,6 +79,15 @@ function ticketRelPath(p) {
   return m ? m[0] : norm;
 }
 
+// 票檔的絕對路徑必定含 `/.constellation/tickets/<檔名>`，切掉這段之後即為 repo 根——純字串運算，
+// 不查檔案系統，才能與 verify-runner.mjs 各自從同一個票檔路徑切出同一個根（見 P3、檔頭說明）。
+// 不是票檔路徑（呼叫端理論上已先過 TICKET_PATH_RE）就回 null，呼叫端退回舊的 cwd 判斷。
+function ticketRootFromPath(absTicketPath) {
+  const norm = String(absTicketPath).replace(/\\/g, '/');
+  const m = norm.match(/^(.*)\/\.constellation\/tickets\/[^/]+\.md$/i);
+  return m ? m[1] : null;
+}
+
 // repo 根識別 token：path.resolve 正規化後轉小寫、反斜線轉正斜線。
 function repoRootToken(cwd) {
   return resolve(cwd).toLowerCase().replace(/\\/g, '/');
@@ -107,34 +116,47 @@ function resolveCwd(input) {
   return input.cwd ?? input.workspace_root ?? input.workingDirectory ?? process.cwd();
 }
 
+// 讀 .constellation 底下設定檔（design-frozen.json／design-baseline.json）時找 repo 根：從某個
+// 起點目錄往上找，認 `.constellation` 目錄本身存在。
+// 對抗審查 must-fix（P3 殘留）：舊寫法認 `.constellation/config.json`，但 config.json 要到 weave
+// 階段才生成（DESIGN.md §4）、畫面定稿凍結卻發生在 design 階段（早於 weave）——新專案第一輪凍結
+// design-frozen.json 時，往上找一路走到家目錄都找不到 config.json，退回錯誤的起點，導致合法的定稿
+// 凍結被誤判成「baseline 不存在」而擋下，凍結守衛也會因為根算錯而讀錯位置、靜默 fail-open。改認
+// `.constellation` 目錄本身（不要求 config.json），design/weave 兩階段都認得出來。
+// 家目錄判斷順序很關鍵：**先**判斷是否已經走到家目錄、**再**檢查 `.constellation` 存不存在——
+// 家目錄底下的 ~/.constellation/ 只放簽章 secret（不含 config.json，但目錄本身確實存在），順序反過來
+// 會把家目錄誤判成專案根。找不到就回原起點（fail-open，維持「這層就是根」的舊行為，不誤擋）。
+// 與 gates/verify-runner.mjs 的同名函式同一套邏輯，各自內聯一份（見檔頭鏡像說明），不共用 import。
+function findProjectRoot(from) {
+  const home = resolve(homedir()).toLowerCase();
+  let dir = resolve(from);
+  for (;;) {
+    if (dir.toLowerCase() === home) return resolve(from);
+    if (existsSync(join(dir, '.constellation'))) return dir;
+    const up = dirname(dir);
+    if (up === dir) return resolve(from);
+    dir = up;
+  }
+}
+
 // ---------------------------------------------------------------------------
-// 驗收條件解析：取「## 驗收條件」section，判斷是否還有未勾選列項。
+// 通用 section 擷取：給定 content 與該 section 的標題正則，取標題後到下一個 `## ` 之前的內容
+// （沒有下一個標題就取到檔尾）。三個 section（驗收條件／驗證證據／決議記錄）都靠它，只差標題正則。
 // ---------------------------------------------------------------------------
-function acceptanceSection(content) {
-  const m = content.match(ACCEPTANCE_HEADING_RE);
+function sectionOf(content, headingRe) {
+  const text = String(content ?? '');
+  const m = text.match(headingRe);
   if (!m) return '';
   const after = m.index + m[0].length;
-  const rest = content.slice(after);
+  const rest = text.slice(after);
   const next = rest.match(/\n##\s/);
   return next ? rest.slice(0, next.index) : rest;
 }
 
 function hasUncheckedAcceptance(content) {
-  const section = acceptanceSection(content);
+  const section = sectionOf(content, ACCEPTANCE_HEADING_RE);
   if (!section) return false; // 沒有這個 section 就不擋——不強迫每張票都用這個模板
   return UNCHECKED_ACCEPTANCE_RE.test(section);
-}
-
-// ---------------------------------------------------------------------------
-// 證據 section／證據筆解析
-// ---------------------------------------------------------------------------
-function evidenceSection(content) {
-  const m = content.match(EVIDENCE_HEADING_RE);
-  if (!m) return '';
-  const after = m.index + m[0].length;
-  const rest = content.slice(after);
-  const next = rest.match(/\n##\s/);
-  return next ? rest.slice(0, next.index) : rest;
 }
 
 // 每筆證據以「- **<ISO 時間戳>**」這種頂層（不縮排）列項起頭，切到下一筆同格式列項或 section 尾端。
@@ -283,7 +305,7 @@ function verifyEvidence(content, filePath, cwd) {
   const secret = readSecret();
   if (!secret) return BLOCK(missingSecretMessage(filePath));
 
-  const section = evidenceSection(content);
+  const section = sectionOf(content, EVIDENCE_HEADING_RE);
   const entry = section ? latestEntry(section) : null;
   if (!entry) return BLOCK(noEvidenceMessage(filePath));
 
@@ -296,14 +318,14 @@ function verifyEvidence(content, filePath, cwd) {
   if (entry.sig === 'unsigned') return BLOCK(unsignedMessage(filePath));
 
   const relPath = ticketRelPath(filePath);
-  const repoRoot = repoRootToken(cwd);
+  const repoRoot = repoRootToken(ticketRootFromPath(filePath) ?? cwd);
   const expected = computeSignature(secret, entry.ts, relPath, entry.commandsJoined, entry.lastLine, repoRoot);
   if (!safeHexEqual(expected, entry.sig)) return BLOCK(mismatchMessage(filePath));
 
   return PASS;
 }
 
-// Edit／MultiEdit／apply_patch 共用：從磁碟讀「編輯前」的現檔內容來驗證（變更片段裡通常沒有
+// Edit／apply_patch 共用：從磁碟讀「編輯前」的現檔內容來驗證（變更片段裡通常沒有
 // 證據 section，證據活在檔案其他地方）。讀不到檔案就放行，不誤擋（fail-open）。
 function verifyFromDisk(filePath, cwd) {
   let disk;
@@ -344,35 +366,30 @@ function checkApplyPatch(patchText, input) {
   return PASS;
 }
 
-// 從一組候選值裡取第一個非空字串——apply_patch 的 patch 文字來源 fallback 鏈用。
-function firstNonEmptyString(...vals) {
-  for (const v of vals) if (typeof v === 'string' && v.length) return v;
-  return '';
-}
-
 // ---------------------------------------------------------------------------
 // 定稿 UI 凍結守衛（見檔頭說明）：讀 `.constellation/design-frozen.json`，命中 frozen 名單的檔案擋下。
 // ---------------------------------------------------------------------------
 const DESIGN_FROZEN_REL = '.constellation/design-frozen.json';
 const DESIGN_FROZEN_PATH_RE = /(^|[\\/])\.constellation[\\/]design-frozen\.json$/i;
 
-// 路徑正規化：反斜線轉正斜線、解析成絕對路徑後去掉 cwd（repo 根）前綴變成 repo 相對路徑、統一小寫
-// 做大小寫不敏感比對。frozen 名單裡的項目本來就是 repo 相對路徑，resolve(cwd, relPath) 會把它接到
-// cwd 下再還原回同一個相對路徑，兩邊（目標檔案／名單項目）都走這條正規化才能公平比較。
-function normalizeRepoRelPath(filePath, cwd) {
-  const root = resolve(cwd).replace(/\\/g, '/');
-  const abs = resolve(cwd, String(filePath)).replace(/\\/g, '/');
-  const rootLower = root.toLowerCase();
+// 路徑正規化：反斜線轉正斜線、解析成絕對路徑後去掉 root（repo 根）前綴變成 repo 相對路徑、統一小寫
+// 做大小寫不敏感比對。frozen 名單裡的項目本來就是 repo 相對路徑，resolve(root, relPath) 會把它接到
+// root 下再還原回同一個相對路徑，兩邊（目標檔案／名單項目）都走這條正規化才能公平比較。
+function normalizeRepoRelPath(filePath, root) {
+  const rootAbs = resolve(root).replace(/\\/g, '/');
+  const abs = resolve(root, String(filePath)).replace(/\\/g, '/');
+  const rootLower = rootAbs.toLowerCase();
   const absLower = abs.toLowerCase();
-  const rel = absLower.startsWith(rootLower + '/') ? abs.slice(root.length + 1) : abs;
+  const rel = absLower.startsWith(rootLower + '/') ? abs.slice(rootAbs.length + 1) : abs;
   return rel.toLowerCase();
 }
 
 // 讀凍結名單：不存在／JSON 解析失敗／格式不對（frozen 不是陣列）一律回 null——呼叫端當作
-// fail-open（跳過此檢查），不誤擋沒有用到定稿凍結機制的專案。
-function readFrozenList(cwd) {
+// fail-open（跳過此檢查），不誤擋沒有用到定稿凍結機制的專案。root 是已經找過的專案根（見
+// findProjectRoot），不是 hook 給的原始 cwd。
+function readFrozenList(root) {
   try {
-    const p = join(resolve(cwd), '.constellation', 'design-frozen.json');
+    const p = join(root, '.constellation', 'design-frozen.json');
     const data = JSON.parse(stripBom(readFileSync(p, 'utf8')));
     if (!data || !Array.isArray(data.frozen)) return null;
     return data.frozen.filter(f => typeof f === 'string' && f.length);
@@ -389,18 +406,21 @@ function frozenMessage(filePath) {
   ].join('\n');
 }
 
-// 給定單一目標檔案路徑，判斷是否命中凍結名單。回 BLOCK(...) 或 null（不擋）——刻意不用 PASS 物件，
-// 因為 PASS 本身是 truthy，呼叫端要能用 `if (result)` 分辨「有擋下」與「沒事」。
-function checkFrozenPath(filePath, cwd) {
+// 給定單一目標檔案路徑（必須是絕對路徑），判斷是否命中凍結名單。回 BLOCK(...) 或 null（不擋）——
+// 刻意不用 PASS 物件，因為 PASS 本身是 truthy，呼叫端要能用 `if (result)` 分辨「有擋下」與「沒事」。
+// root 從目標檔所在目錄往上找（見 findProjectRoot），不用 hook 給的 cwd——cwd 可能是子目錄或另一個
+// worktree，會讀錯 .constellation/design-frozen.json 的位置（見 P3）。
+function checkFrozenPath(filePath) {
   // 例外：目標本身就是 design-frozen.json → 不受凍結檢查限制，否則永遠無法解凍。
   if (DESIGN_FROZEN_PATH_RE.test(String(filePath))) return null;
-  if (normalizeRepoRelPath(filePath, cwd) === DESIGN_FROZEN_REL) return null;
+  const root = findProjectRoot(dirname(String(filePath)));
+  if (normalizeRepoRelPath(filePath, root) === DESIGN_FROZEN_REL) return null;
 
-  const frozen = readFrozenList(cwd);
+  const frozen = readFrozenList(root);
   if (!frozen || !frozen.length) return null; // 名單不存在／解析失敗／空清單 → fail-open
 
-  const rel = normalizeRepoRelPath(filePath, cwd);
-  const hit = frozen.some(f => normalizeRepoRelPath(f, cwd) === rel);
+  const rel = normalizeRepoRelPath(filePath, root);
+  const hit = frozen.some(f => normalizeRepoRelPath(f, root) === rel);
   return hit ? BLOCK(frozenMessage(filePath)) : null;
 }
 
@@ -426,16 +446,6 @@ const TICKET_ID_RE = /[\\/]tickets[\\/](T-\d+)/i;
 function extractTicketId(filePath) {
   const m = String(filePath).match(TICKET_ID_RE);
   return m ? m[1].toUpperCase() : null;
-}
-
-function decisionSection(content) {
-  const text = String(content ?? '');
-  const m = text.match(DECISION_HEADING_RE);
-  if (!m) return '';
-  const after = m.index + m[0].length;
-  const rest = text.slice(after);
-  const next = rest.match(/\n##\s/);
-  return next ? rest.slice(0, next.index) : rest;
 }
 
 // 讀 design-frozen.json 的 frozen／log 兩個陣列；檔案不存在、不是合法 JSON、或 frozen 缺欄／不是
@@ -504,9 +514,9 @@ function unfreezeRefreezeMessage(paths) {
   ].join('\n');
 }
 
-// newContent：這次編輯要寫入的新內容（Write 的 content／Edit 的 new_string／MultiEdit 各 edit 的
-// new_string 串接／apply_patch 的 diff 片段，外加呼叫端併入的磁碟現檔），用來判斷「## 決議記錄」是否
-// 已寫明未回凍的路徑。currentTicket：這次關的票號（從票檔路徑取出），用來把未回凍判定限縮到這張票
+// newContent：這次編輯要寫入的新內容（Write 的 content／Edit 的 new_string／apply_patch 的 diff
+// 片段，外加呼叫端併入的磁碟現檔），用來判斷「## 決議記錄」是否已寫明未回凍的路徑。currentTicket：
+// 這次關的票號（從票檔路徑取出），用來把未回凍判定限縮到這張票
 // 自己造成的部份，見 computeUnrefrozenPaths。
 function checkUnfreezeRefreeze(newContent, cwd, currentTicket) {
   const data = readDesignFrozenLog(cwd);
@@ -515,7 +525,7 @@ function checkUnfreezeRefreeze(newContent, cwd, currentTicket) {
   const unresolved = computeUnrefrozenPaths(data.log, data.frozen, currentTicket, cwd);
   if (!unresolved.length) return null;
 
-  const section = decisionSection(newContent);
+  const section = sectionOf(newContent, DECISION_HEADING_RE);
   const stillUnresolved = unresolved.filter(p => !section.includes(p));
   if (!stillUnresolved.length) return null;
 
@@ -524,10 +534,11 @@ function checkUnfreezeRefreeze(newContent, cwd, currentTicket) {
 
 // 關票驗簽放行之後、回 PASS 之前的收尾：驗簽本身已經擋下就直接回傳那個結果，沒擋下才補做解凍回凍
 // 檢查——兩者各自獨立判定，前者擋下不代表後者不用查（順序上驗簽先跑，故這裡先短路）。
-// filePath：這次要關的票檔路徑。①併入磁碟現檔內容一起搜尋「## 決議記錄」——Edit／MultiEdit／
-// apply_patch 只帶變更片段，決議記錄多半已經寫在磁碟其他地方，只看片段找不到（Write 本來就帶完整
-// 內容，併入磁碟版不影響結果，讀不到就只用 newContent，維持 fail-open）。②從路徑取出這次關的票號，
-// 交給 checkUnfreezeRefreeze 把未回凍判定限縮到這張票自己造成的部份（見 computeUnrefrozenPaths）。
+// filePath：這次要關的票檔路徑。①併入磁碟現檔內容一起搜尋「## 決議記錄」——Edit／apply_patch 只帶
+// 變更片段，決議記錄多半已經寫在磁碟其他地方，只看片段找不到（Write 本來就帶完整內容，併入磁碟版
+// 不影響結果，讀不到就只用 newContent，維持 fail-open）。②從路徑取出這次關的票號，交給
+// checkUnfreezeRefreeze 把未回凍判定限縮到這張票自己造成的部份（見 computeUnrefrozenPaths）。
+// ③root 一律先試從票檔路徑切出來（見 ticketRootFromPath），切不到才退回 cwd——理由同 verifyEvidence。
 function finalizeDoneCheck(verifyResult, newContent, cwd, filePath) {
   if (verifyResult.block) return verifyResult;
   let combined = newContent;
@@ -535,7 +546,8 @@ function finalizeDoneCheck(verifyResult, newContent, cwd, filePath) {
     try { combined = newContent + '\n' + stripBom(readFileSync(filePath, 'utf8')); } catch { /* fail-open：讀不到就只用 newContent */ }
   }
   const currentTicket = filePath ? extractTicketId(filePath) : null;
-  return checkUnfreezeRefreeze(combined, cwd, currentTicket) || PASS;
+  const root = filePath ? (ticketRootFromPath(filePath) ?? cwd) : cwd;
+  return checkUnfreezeRefreeze(combined, root, currentTicket) || PASS;
 }
 
 // apply_patch：對 patch 內全部 `*** Update File:` 路徑逐一檢查凍結（沿用 checkApplyPatch 同一套
@@ -549,20 +561,19 @@ function checkFrozenApplyPatch(patchText, cwd) {
   }
   for (const marker of markers) {
     if (marker.kind !== 'Update File') continue;
-    const r = checkFrozenPath(resolve(cwd, marker.path), cwd);
+    const r = checkFrozenPath(resolve(cwd, marker.path));
     if (r) return r;
   }
   return null;
 }
 
 // ---------------------------------------------------------------------------
-// 現況覆蓋閘門（design-baseline，2026-08-18 新增；DESIGN.md §3）：定稿凍結（寫入 design-frozen.json
-// 且 frozen 非空）之前，必須存在 `.constellation/design-baseline.json`，證明本輪每張畫面在生成前
-// 做過「全新 vs 改造」的判別，且改造型畫面的現況結構真的送上去過（推現況元件或從真 code 抽精確
-// 結構，sources 記來源檔）。起因：2026-08-18 實際踩到——條文有寫「改造既有畫面要把現況推上去」
-// 但沒有閘門，執行漏了，Claude Design 憑文字畫出「相似的新頁面」，使用者對照真系統才發現表格
-// 結構全不一樣。**此檢查刻意 fail-closed**（baseline 缺失／壞 JSON／rework 缺 sources 都擋）——
-// 凍結是 design 收尾必經之路，這裡不擋就等於沒有閘門；非 UI 專案不寫 design-frozen.json、不觸發。
+// 現況覆蓋閘門（design-baseline；DESIGN.md §3）：定稿凍結（寫入 design-frozen.json 且 frozen 非空）
+// 之前，必須存在 `.constellation/design-baseline.json`，證明本輪每張畫面在生成前做過「全新 vs 改造」
+// 的判別，且改造型畫面的現況結構真的送上去過（推現況元件或從真 code 抽精確結構，sources 記來源檔）
+// ——防止改造型畫面沒把現況送上設計服務、憑文字畫出相似新頁面。**此檢查刻意 fail-closed**（baseline
+// 缺失／壞 JSON／rework 缺 sources 都擋）——凍結是 design 收尾必經之路，這裡不擋就等於沒有閘門；
+// 非 UI 專案不寫 design-frozen.json、不觸發。
 // baseline 格式：{ "screens": [ { "screen": "<畫面名>", "kind": "new"|"rework",
 //   "sources": ["<repo 相對路徑>", ...] } ] }——kind=rework 時 sources 必須非空且每個路徑存在。
 // ---------------------------------------------------------------------------
@@ -577,9 +588,9 @@ function baselineMessage(reason) {
   ].join('\n');
 }
 
-// 寫入內容是否為「frozen 非空」的定稿凍結動作：Write 看 content、Edit/MultiEdit/apply_patch 因為
-// 只有片段，一律視為可能構成凍結（保守觸發——誤觸發的代價只是提醒補 baseline，漏放行的代價是
-// 整個閘門形同虛設）。content 解析失敗也保守觸發。
+// 寫入內容是否為「frozen 非空」的定稿凍結動作：Write 看 content、Edit/apply_patch 因為只有片段，
+// 一律視為可能構成凍結（保守觸發——誤觸發的代價只是提醒補 baseline，漏放行的代價是整個閘門形同
+// 虛設）。content 解析失敗也保守觸發。
 function writeContentFreezes(content) {
   try {
     const data = JSON.parse(stripBom(String(content)));
@@ -589,10 +600,11 @@ function writeContentFreezes(content) {
   }
 }
 
-function checkDesignBaseline(cwd) {
+// root：已經找過的專案根（見 findProjectRoot／checkBaselineGuard），不是 hook 給的原始 cwd。
+function checkDesignBaseline(root) {
   let rawBaseline;
   try {
-    rawBaseline = readFileSync(join(resolve(cwd), '.constellation', 'design-baseline.json'), 'utf8');
+    rawBaseline = readFileSync(join(root, '.constellation', 'design-baseline.json'), 'utf8');
   } catch {
     return BLOCK(baselineMessage('不存在'));
   }
@@ -611,7 +623,7 @@ function checkDesignBaseline(cwd) {
       if (!sources.length) return BLOCK(baselineMessage(`裡改造型畫面「${name}」的 sources 是空的——現況結構沒送上去`));
       for (const src of sources) {
         let ok = false;
-        try { readFileSync(resolve(cwd, src)); ok = true; } catch { ok = false; }
+        try { readFileSync(resolve(root, src)); ok = true; } catch { ok = false; }
         if (!ok) return BLOCK(baselineMessage(`裡「${name}」的 sources 路徑不存在於 repo：${src}`));
       }
     }
@@ -620,39 +632,40 @@ function checkDesignBaseline(cwd) {
 }
 
 // 現況覆蓋閘門入口：目標是 design-frozen.json 且此寫入構成凍結 → 驗 baseline。回 BLOCK 或 null。
+// root 一律從目標檔（或 apply_patch 用 cwd 解析後的起點）往上找第一個 .constellation（見
+// findProjectRoot）——理由同 checkFrozenPath：hook 的 cwd 不一定等於專案根（見 P3）。
 function checkBaselineGuard(tool, ti, input) {
   const cwd = resolveCwd(input);
 
-  if (tool === 'Write' || tool === 'Edit' || tool === 'MultiEdit') {
-    const filePath = String(ti.file_path ?? ti.filePath ?? '');
+  if (tool === 'Write' || tool === 'Edit') {
+    const filePath = String(ti.file_path ?? '');
     if (!filePath) return null;
-    const isFrozenFile = DESIGN_FROZEN_PATH_RE.test(filePath) || normalizeRepoRelPath(filePath, cwd) === DESIGN_FROZEN_REL;
+    const root = findProjectRoot(dirname(filePath));
+    const isFrozenFile = DESIGN_FROZEN_PATH_RE.test(filePath) || normalizeRepoRelPath(filePath, root) === DESIGN_FROZEN_REL;
     if (!isFrozenFile) return null;
     if (tool === 'Write' && !writeContentFreezes(ti.content)) return null; // 清空歸檔不觸發
-    return checkDesignBaseline(cwd);
+    return checkDesignBaseline(root);
   }
 
-  const patchText = firstNonEmptyString(ti.patch, ti.command, input.patch, input.command);
+  const patchText = typeof ti.command === 'string' ? ti.command : '';
   if (patchText && /(^|[\\/])\.constellation[\\/]design-frozen\.json/i.test(patchText) && /\*\*\* (Update|Add) File:/.test(patchText)) {
-    return checkDesignBaseline(cwd);
+    return checkDesignBaseline(findProjectRoot(resolve(cwd)));
   }
   return null;
 }
 
-// 統一入口：依工具型態取出目標檔案路徑（Write／Edit／MultiEdit 用 file_path；apply_patch 用 patch
-// 文字裡的 Update File 路徑），交給 checkFrozenPath／checkFrozenApplyPatch 判定。回 BLOCK(...) 或
-// null（沒事，呼叫端繼續往下走既有的 done 票檢查）。
+// 統一入口：依工具型態取出目標檔案路徑（Write／Edit 用 file_path；apply_patch 用 patch 文字裡的
+// Update File 路徑），交給 checkFrozenPath／checkFrozenApplyPatch 判定。回 BLOCK(...) 或 null
+// （沒事，呼叫端繼續往下走既有的 done 票檢查）。
 function checkFrozenGuard(tool, ti, input) {
-  const cwd = resolveCwd(input);
-
-  if (tool === 'Write' || tool === 'Edit' || tool === 'MultiEdit') {
-    const filePath = String(ti.file_path ?? ti.filePath ?? '');
+  if (tool === 'Write' || tool === 'Edit') {
+    const filePath = String(ti.file_path ?? '');
     if (!filePath) return null;
-    return checkFrozenPath(filePath, cwd);
+    return checkFrozenPath(filePath);
   }
 
-  const patchText = firstNonEmptyString(ti.patch, ti.command, input.patch, input.command);
-  if (patchText) return checkFrozenApplyPatch(patchText, cwd);
+  const patchText = typeof ti.command === 'string' ? ti.command : '';
+  if (patchText) return checkFrozenApplyPatch(patchText, resolveCwd(input));
 
   return null;
 }
@@ -673,7 +686,7 @@ export function closeGateCheck(input) {
   if (baselineBlock) return baselineBlock;
 
   if (tool === 'Write') {
-    const filePath = String(ti.file_path ?? ti.filePath ?? '');
+    const filePath = String(ti.file_path ?? '');
     if (!filePath || !TICKET_PATH_RE.test(filePath)) return PASS;
     const content = ti.content;
     if (typeof content !== 'string' || !STATUS_DONE_RE.test(content)) return PASS;
@@ -682,7 +695,7 @@ export function closeGateCheck(input) {
   }
 
   if (tool === 'Edit') {
-    const filePath = String(ti.file_path ?? ti.filePath ?? '');
+    const filePath = String(ti.file_path ?? '');
     if (!filePath || !TICKET_PATH_RE.test(filePath)) return PASS;
     const newString = ti.new_string ?? ti.newString;
     if (typeof newString !== 'string' || !STATUS_DONE_RE.test(newString)) return PASS;
@@ -690,30 +703,11 @@ export function closeGateCheck(input) {
     return finalizeDoneCheck(verifyFromDisk(filePath, cwd), newString, cwd, filePath);
   }
 
-  if (tool === 'MultiEdit') {
-    const filePath = String(ti.file_path ?? ti.filePath ?? '');
-    if (!filePath || !TICKET_PATH_RE.test(filePath)) return PASS;
-    const edits = Array.isArray(ti.edits) ? ti.edits : [];
-    const setsDone = edits.some(e => {
-      const ns = e && (e.new_string ?? e.newString);
-      return typeof ns === 'string' && STATUS_DONE_RE.test(ns);
-    });
-    if (!setsDone) return PASS;
-    const cwd = resolveCwd(input);
-    const newContent = edits
-      .map(e => e && (e.new_string ?? e.newString))
-      .filter(s => typeof s === 'string')
-      .join('\n\n');
-    return finalizeDoneCheck(verifyFromDisk(filePath, cwd), newContent, cwd, filePath);
-  }
-
   // Codex apply_patch：不嚴格卡 tool_name（Codex 端的實際 tool_name 可能是 apply_patch 或其他
   // 殼名），只要輸入形狀帶 patch 文字就進這條分支——matcher 層（hooks.codex.json）已經只放行
-  // Edit|Write|apply_patch 三種工具進來，這裡再檢查形狀是雙重保險。
-  // patch 文字來源 fallback 鏈：tool_input.patch → tool_input.command → input.patch → input.command
-  // ——Codex 官方 payload 實際把 apply_patch 內容放在 command 欄位，只認 tool_input.patch 讀錯欄位、
-  // 形同虛設，這是本檔這輪最重要的修復。
-  const patchText = firstNonEmptyString(ti.patch, ti.command, input.patch, input.command);
+  // Edit|Write|apply_patch 三種工具進來，這裡再檢查形狀是雙重保險。patch 文字讀 tool_input.command
+  // ——Codex 官方 payload 把 apply_patch 內容放在這個欄位，不是 patch 欄位。
+  const patchText = typeof ti.command === 'string' ? ti.command : '';
   if (patchText) return checkApplyPatch(patchText, input);
 
   return PASS;

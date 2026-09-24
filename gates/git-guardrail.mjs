@@ -8,26 +8,8 @@
 // 本閘門的確定性在「預設攔下＋放行必在命令留 CONSTELLATION_GIT_OK 審計痕跡」這一層，不宣稱對抗完備。
 // 誤攔權衡：寧可多攔一次要求確認（逃生口便宜），不可放過真的開分支/force push——判到危險子命令一律照攔，
 // 不因解析不完美而放水；「裸 checkout 一律攔」「裸 switch 一律攔」正是這個 fail-safe 精神的直接體現。
-import { pathToFileURL } from 'node:url';
-
-const stripBom = s => (s && s.charCodeAt(0) === 0xfeff ? s.slice(1) : s);
-
-// 本檔邏輯抽成 gitGuardrailCheck(input) → { block, message }，供未來若把多支 PreToolUse 閘門合併成
-// 單一 dispatcher 時直接 import 呼叫；也保留獨立 main() 讓本檔仍可單獨當 hook 跑（測試/相容）。
-// **只有直接執行本檔時才掛 stdin/跑 main**——被其他程式 import 時不可自動跑，否則會搶先 exit 短路呼叫端。
-if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
-  let raw = '';
-  process.stdin.setEncoding('utf8');
-  process.stdin.on('error', () => process.exit(0));
-  process.stdin.on('data', c => (raw += c));
-  process.stdin.on('end', () => {
-    let input;
-    try { input = JSON.parse(stripBom(raw).trim() || '{}'); } catch { return process.exit(0); }
-    let r; try { r = gitGuardrailCheck(input); } catch { r = null; }   // fail-open
-    if (r && r.block) { process.stderr.write(String(r.message || '') + '\n'); process.exit(2); }
-    process.exit(0);
-  });
-}
+// 本檔邏輯抽成 gitGuardrailCheck(input) → { block, message }，供 pre-tool-use.mjs 動態 import 直接
+// 呼叫（PreToolUse 路徑）；本檔不再保留獨立 main()，手動除錯改用 echo <json> | node pre-tool-use.mjs。
 
 const PASS = { block: false };
 const BLOCK = msg => ({ block: true, message: msg });
@@ -35,6 +17,21 @@ const BLOCK = msg => ({ block: true, message: msg });
 // 拍板後放行的逃生口指引，兩道規則的 BLOCK 訊息都附這句。
 const HINT = '依使用者全域規則，開/切分支與破壞性 git 操作 SHALL 先用 AskUserQuestion 取得使用者明示同意；' +
   "取得同意後在命令中帶 CONSTELLATION_GIT_OK=1 重跑放行（bash：CONSTELLATION_GIT_OK=1 git …；PowerShell：$env:CONSTELLATION_GIT_OK='1'; git …）。";
+
+// 組「擋下」訊息的共用樣板：what＝擋下的操作描述（含句尾｡），tips＝額外提示行（可 0～多行）。
+// 所有規則訊息固定「Constellation git 守門：擋下 」開頭、HINT 收尾，抽出來後新規則不必再抄一次樣板。
+function deny(what, ...tips) {
+  return BLOCK([
+    `Constellation git 守門：擋下 ${what}`,
+    ...tips.map(t => `  ${t}`),
+    `  ${HINT}`,
+  ].join('\n'));
+}
+
+// 判斷 rest 裡是否有「含指定字元的短旗標組合」（例如 -f、-fd、-D、-anm）；ch 只傳單一字母，無注入疑慮。
+function hasShort(rest, ch) {
+  return rest.split(/\s+/).some(t => new RegExp(`^-[A-Za-z]*${ch}[A-Za-z]*$`).test(t));
+}
 
 // 把 chain 命令（&&/;/||/|/換行，以及引號外、兩側有空白的單一 &）拆段，逐段找 git 呼叫——串接中段
 // 出現的 git 子命令也要抓（例：`git add . && git checkout -b x` 第二段沒有 && 之前的內容干擾）。
@@ -76,18 +73,39 @@ function expandCmdWrapper(segment) {
   return splitSegments(m[2]);
 }
 
+// GUARD-08：`bash -c "<指令>"` / `sh -c '<指令>'` 包裹——比照 cmd /c，取引號內容遞迴當指令重新拆段
+// 判定。不認 `-lc` 等其他旗標組合、也不展開 powershell -Command（同樣的包殼問題留給 commit-gate 的
+// 檔頭誠實記錄：無對抗完備承諾，只求不因套一層殼就整段漏判）。
+const SH_C_WRAPPER_RE = /^\s*(?:\/[\w.\/-]*\/)?(?:bash|sh)\s+-c\s+(["'])([\s\S]*)\1\s*$/i;
+function expandShWrapper(segment) {
+  const m = segment.match(SH_C_WRAPPER_RE);
+  if (!m) return [segment];
+  return splitSegments(m[2]);
+}
+
 function splitSegments(cmd) {
   const rough = cmd.split(/&&|\|\||;|\||\r?\n/);
   const out = [];
   for (const seg of rough) {
-    for (const piece of splitOnBareAmpersand(seg)) out.push(...expandCmdWrapper(piece));
+    for (const piece of splitOnBareAmpersand(seg)) {
+      for (const expanded of expandCmdWrapper(piece)) out.push(...expandShWrapper(expanded));
+    }
   }
   return out;
 }
 
 // token 化：引號段整段當一個 token——處理 `-C "/my repo"` 這種帶空白的引號值不被拆散。
+// GUARD-09：`(`/`)` 各自獨立成一個 token（不併入一般 bareword）——`(cd sub && git clean -fdx)` 這種
+// 括號子殼、`echo $(git stash drop)` 這種命令替換，樸素切段會把左右括號黏在鄰接字詞上（如 `-fdx)`），
+// 讓子命令/旗標判斷失準；拆開後括號變成無害的孤立 token，git 呼叫本身照常被找到、旗標照常被判到。
+// P22-fix：額外記每個 token 在原字串裡的起訖位置（start/end）——判斷「這個 token 跟上一個 token 中間
+// 有沒有空白」要靠位置，光看 token 陣列本身分不出來（見 skipFlagValue）。
 function tokenize(segment) {
-  return segment.match(/"[^"]*"|'[^']*'|\S+/g) || [];
+  const re = /"[^"]*"|'[^']*'|[()]|[^\s()]+/g;
+  const out = [];
+  let m;
+  while ((m = re.exec(segment)) !== null) out.push({ text: m[0], start: m.index, end: m.index + m[0].length });
+  return out;
 }
 const stripQuotes = t => t.replace(/^["']|["']$/g, '');
 
@@ -95,23 +113,86 @@ const stripQuotes = t => t.replace(/^["']|["']$/g, '');
 // 等 = 連寫形式是單一 token、走一般旗標跳過即可）。
 const VALUE_FLAGS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--config-env']);
 
-// 從一段命令找出 git 呼叫：定位 git token → 跳過**所有** global option（含帶值旗標的值 token）→
+// P22-fix：算「某個 token 之前」的括號巢狀深度（只數獨立的 `(`/`)` token，不含引號內或黏在別的字裡的
+// 括號——tokenize 已經把它們拆成獨立 token）。用來判斷後面收 rest 時，遇到的 `)` 是不是收攏「包住這個
+// git 呼叫本身」的外層子殼／命令替換，而不是這個 git 呼叫自己參數裡開的括號。
+function ambientDepthAt(toks, idx) {
+  let depth = 0;
+  for (let k = 0; k < idx; k++) {
+    if (toks[k].text === '(') depth++;
+    else if (toks[k].text === ')') depth = Math.max(0, depth - 1);
+  }
+  return depth;
+}
+
+// P22-fix：`-C`/`--git-dir` 這類帶值旗標的值，可能橫跨多個 token——`$(pwd)`、`$(pwd)/sub`、
+// `sub/$(date)`、`(Get-Location).Path`、`@(pwd)` 都是「一個值」，但 tokenize 會把 `$`、`(`、內容、
+// `)`、緊跟的殘留字都拆成獨立 token。判準是「token 之間有沒有空白」：只要後一個 token 緊貼著前一個
+// （start === 前一個的 end，中間沒有空白字元）就算同一個值的延續，一路吃到出現空白或段尾為止——
+// 不用管裡面有沒有括號、括號有沒有配對，反正只看「有沒有黏在一起」。回傳吃完之後、下一個 token 的
+// index（呼叫端接手從這裡繼續找子命令）。
+function skipFlagValue(toks, i) {
+  let j = i + 1;
+  if (j >= toks.length) return j;
+  let end = toks[j].end;
+  j++;
+  while (j < toks.length && toks[j].start === end) {
+    end = toks[j].end;
+    j++;
+  }
+  return j;
+}
+
+// 從一段命令找出**所有**git 呼叫（不只第一個——`GIT_DIR=$(git rev-parse --git-dir) git push --force`
+// 這種前面子殼先取值、後面才是真正危險呼叫的寫法，只看第一個 git token 會漏掉後面那個）。每個 git
+// token 各自往後找子命令：跳過**所有** global option（含帶值旗標的值，見 skipFlagValue）→
 // 第一個非旗標 token 才是子命令。GUARD-01：堵 `git -c k=v checkout -b`／`git --no-pager push --force`
-// 這類「前綴旗標讓第一 token 以 - 開頭而落 default 放行」的繞法。找不到 git 呼叫/子命令回 null。
-function extractGitCall(segment) {
+// 這類「前綴旗標讓第一 token 以 - 開頭而落 default 放行」的繞法。
+// rest（子命令後的參數字串）用「這個 git token 出現時的括號巢狀深度」當底線：只收在同一層或更深處
+// 新出現的內容，遇到會把深度收回底線以下的 `)`（代表收攏包住這個 git 呼叫本身的外層子殼／命令替換）
+// 就停手不收——不這樣做，`(git branch) -match 'x'`、`for b in $(git branch); do …` 這種唯讀列分支
+// 會把子殼的收尾括號當成 `git branch` 的第一個參數，誤判成「建立新分支」而擋下。
+function extractGitCalls(segment) {
   // 切出的段若以 & 開頭（前面可能有空白），視為 PowerShell call operator 殘留——去掉開頭的 &
   // 後照常判該段，不讓它干擾 git token 的定位。
   const leadTrimmed = segment.replace(/^\s+/, '');
   const seg = leadTrimmed.startsWith('&') ? leadTrimmed.slice(1) : segment;
   const toks = tokenize(seg);
-  const gi = toks.findIndex(t => /^git(\.exe)?$/i.test(stripQuotes(t)) || /[\\/]git(\.exe)?$/i.test(stripQuotes(t)));
-  if (gi < 0) return null;
-  for (let i = gi + 1; i < toks.length; i++) {
-    const t = stripQuotes(toks[i]);
-    if (t.startsWith('-')) { if (VALUE_FLAGS.has(t)) i += 1; continue; }
-    return { sub: t, rest: toks.slice(i + 1).map(stripQuotes).join(' ') };
+  const isGitTok = t => /^git(\.exe)?$/i.test(stripQuotes(t.text)) || /[\\/]git(\.exe)?$/i.test(stripQuotes(t.text));
+  const calls = [];
+  for (let gi = 0; gi < toks.length; gi++) {
+    if (!isGitTok(toks[gi])) continue;
+    const ambient = ambientDepthAt(toks, gi);
+    let depth = ambient;
+    let sub = null;
+    const restToks = [];
+    for (let i = gi + 1; i < toks.length; i++) {
+      const raw = toks[i];
+      if (raw.text === '(') {
+        depth++;
+        if (sub !== null) restToks.push(raw.text);
+        continue;
+      }
+      if (raw.text === ')') {
+        if (depth <= ambient) break; // 收攏外層子殼的括號——這個 git 呼叫到此為止
+        depth--;
+        if (sub !== null) restToks.push(raw.text);
+        continue;
+      }
+      if (sub === null) {
+        const t = stripQuotes(raw.text);
+        if (t.startsWith('-')) {
+          if (VALUE_FLAGS.has(t)) i = skipFlagValue(toks, i) - 1; // 整段值一起跳過（見 skipFlagValue）
+          continue;
+        }
+        sub = t;
+        continue;
+      }
+      restToks.push(stripQuotes(raw.text));
+    }
+    if (sub !== null) calls.push({ sub, rest: restToks.join(' ') });
   }
-  return null;
+  return calls;
 }
 
 // 只看「git 之後第一個非旗標 token」當子命令——不對整段命令字串做關鍵字掃描，避免 commit message 裡出現
@@ -127,80 +208,63 @@ function judgeSubcommand(sub, rest) {
       // 裸 checkout 一律攔：可能是切既有分支、可能是 `checkout -b/-B` 建新分支、也可能是
       // `checkout .`/`checkout -- .` 這種破壞性丟棄整個工作區——三者從命令字串上難以安全區分，
       // 還原單一檔案這種正當用法也混在裡面，索性全攔、fail-safe。
-      return BLOCK([
-        'Constellation git 守門：擋下 `git checkout` —— 可能是切分支（新建或既有）或丟棄工作區變更，命令字串難以安全區分。',
-        '  只是想取消暫存（不動檔案內容）？用 `git restore --staged <path>`（本守門不攔）；還原檔案內容屬破壞性，同樣要先問。',
-        `  ${HINT}`,
-      ].join('\n'));
+      return deny(
+        '`git checkout` —— 可能是切分支（新建或既有）或丟棄工作區變更，命令字串難以安全區分。',
+        '只是想取消暫存（不動檔案內容）？用 `git restore --staged <path>`（本守門不攔）；還原檔案內容屬破壞性，同樣要先問。',
+      );
 
     case 'switch':
       // `switch -c/-C`（建新分支）與裸 `switch <ref>`（切既有分支）都是「切分支」，一律攔。
-      return BLOCK([
-        'Constellation git 守門：擋下 `git switch` —— 這是切分支操作（含 -c/-C 新建分支，或切到既有分支）。',
-        `  ${HINT}`,
-      ].join('\n'));
+      return deny('`git switch` —— 這是切分支操作（含 -c/-C 新建分支，或切到既有分支）。');
 
     case 'branch': {
       if (!rest) return null;                                // 裸 `git branch`（列表）→ 放行
       const first = rest.match(/^(\S+)/)[1];
       if (!first.startsWith('-')) {
         // 第一個參數不是旗標 → `git branch <名稱>`，正在建分支。
-        return BLOCK([
-          'Constellation git 守門：擋下 `git branch <名稱>` —— 這是建立新分支。',
-          `  ${HINT}`,
-        ].join('\n'));
+        return deny('`git branch <名稱>` —— 這是建立新分支。');
       }
       // 帶旗標：-D（強制刪除，大寫 D）算破壞性；-d/-m/--list/-a/-r/-v 等非建立用法放行。
-      if (/(^|\s)-[A-Za-z]*D[A-Za-z]*(\s|$)/.test(rest)) {
-        return BLOCK([
-          'Constellation git 守門：擋下 `git branch -D` —— 強制刪除分支（破壞性，未合併的 commit 會直接丟失）。',
-          `  ${HINT}`,
-        ].join('\n'));
+      if (hasShort(rest, 'D')) {
+        return deny('`git branch -D` —— 強制刪除分支（破壞性，未合併的 commit 會直接丟失）。');
       }
       // GUARD-06：-f/--force（強制建立/移動 ref、或 --delete --force 冗長形強刪）同樣可能丟 commit。
-      if (/(^|\s)--force\b/.test(rest) || rest.split(/\s+/).some(t => /^-[A-Za-z]*f[A-Za-z]*$/.test(t))) {
-        return BLOCK([
-          'Constellation git 守門：擋下 `git branch -f`/`--force` —— 強制移動/刪除 ref（破壞性，可能丟失 commit）。',
-          `  ${HINT}`,
-        ].join('\n'));
+      if (/(^|\s)--force\b/.test(rest) || hasShort(rest, 'f')) {
+        return deny('`git branch -f`/`--force` —— 強制移動/刪除 ref（破壞性，可能丟失 commit）。');
       }
       return null;
     }
 
-    case 'push':
-      if (/(^|\s)--force(-with-lease)?(\s|=|$)/.test(rest) || /(^|\s)-f(\s|$)/.test(rest)) {
-        return BLOCK([
-          'Constellation git 守門：擋下 `git push --force`/`-f`（含 --force-with-lease）—— 會覆寫遠端歷史，可能沖掉他人的 commit。',
-          `  ${HINT}`,
-        ].join('\n'));
+    case 'push': {
+      if (/(^|\s)--force(-with-lease)?(\s|=|$)/.test(rest) || hasShort(rest, 'f')) {
+        return deny('`git push --force`/`-f`（含 --force-with-lease）—— 會覆寫遠端歷史，可能沖掉他人的 commit。');
       }
       // GUARD-02：refspec 的 `+` 前綴（git push origin +main / +src:dst）＝對該 ref 強推，與 --force 同等破壞力。
       if (/(^|\s)\+\S/.test(rest)) {
-        return BLOCK([
-          'Constellation git 守門：擋下 `git push` 帶 `+<refspec>` —— refspec 的 + 前綴＝強推該 ref（等同 --force），會覆寫遠端歷史。',
-          `  ${HINT}`,
-        ].join('\n'));
+        return deny('`git push` 帶 `+<refspec>` —— refspec 的 + 前綴＝強推該 ref（等同 --force），會覆寫遠端歷史。');
+      }
+      // GUARD-10：刪遠端分支的三種寫法——長式 --delete、短式 -d（含旗標組合如 -df）、
+      // 空 src 的 `:<ref>` refspec（`git push origin :feature-x`）——殺傷力等同強推，一律擋。
+      if (/(^|\s)--delete\b/.test(rest) || hasShort(rest, 'd') || /(^|\s):\S/.test(rest)) {
+        return deny('`git push --delete`/`-d`/`:<ref>` —— 會刪除遠端分支，不可逆。');
+      }
+      // GUARD-10：--mirror 用本地 refs 整個覆寫遠端（含刪除遠端獨有的分支/標籤），破壞力最大。
+      if (/(^|\s)--mirror\b/.test(rest)) {
+        return deny('`git push --mirror` —— 會用本地 refs 整個覆寫遠端（含刪除遠端獨有的分支/標籤）。');
       }
       return null;
+    }
 
     case 'reset':
       if (/(^|\s)--hard\b/.test(rest)) {
-        return BLOCK([
-          'Constellation git 守門：擋下 `git reset --hard` —— 會不可逆丟棄工作區與暫存區的未提交變更。',
-          `  ${HINT}`,
-        ].join('\n'));
+        return deny('`git reset --hard` —— 會不可逆丟棄工作區與暫存區的未提交變更。');
       }
       return null;
 
     case 'clean': {
       // 短旗標可能組合（-fd、-fx、-dfx…），只要出現含小寫 f 的短旗標 token，或明式 --force，都算強制清除。
-      const hasForce = /(^|\s)--force\b/.test(rest) ||
-        rest.split(/\s+/).some(t => /^-[A-Za-z]*f[A-Za-z]*$/.test(t));
-      if (hasForce) {
-        return BLOCK([
-          'Constellation git 守門：擋下 `git clean -f`（含 -fd/-fx 等組合）—— 會不可逆刪除未追蹤的檔案與目錄。',
-          `  ${HINT}`,
-        ].join('\n'));
+      if (/(^|\s)--force\b/.test(rest) || hasShort(rest, 'f')) {
+        return deny('`git clean -f`（含 -fd/-fx 等組合）—— 會不可逆刪除未追蹤的檔案與目錄。');
       }
       return null;
     }
@@ -209,37 +273,30 @@ function judgeSubcommand(sub, rest) {
       // 只有「純 --staged（不含 --worktree）」才是安全的取消暫存操作、放行；一旦帶 --worktree
       // （長式 --worktree 或短式 -W，含旗標 bundle 如 -SW）就會覆寫工作區內容——即使同時帶了
       // --staged 也要攔，不能讓 --staged 的存在掩護 --worktree 的破壞性。
-      const hasWorktree = /(^|\s)--worktree\b/.test(rest) ||
-        rest.split(/\s+/).some(t => /^-[A-Za-z]*W[A-Za-z]*$/.test(t));
-      const hasStaged = /(^|\s)--staged\b/.test(rest) ||
-        rest.split(/\s+/).some(t => /^-[A-Za-z]*S[A-Za-z]*$/.test(t));
+      const hasWorktree = /(^|\s)--worktree\b/.test(rest) || hasShort(rest, 'W');
+      const hasStaged = /(^|\s)--staged\b/.test(rest) || hasShort(rest, 'S');
       if (hasStaged && !hasWorktree) return null;
-      return BLOCK([
-        'Constellation git 守門：擋下 `git restore` —— 會覆寫工作區檔案內容（未加 --staged，或帶 --worktree/-W 的用法不可逆）。',
-        '  只是想取消暫存？只帶 `--staged`（不加 --worktree）即放行。',
-        `  ${HINT}`,
-      ].join('\n'));
+      return deny(
+        '`git restore` —— 會覆寫工作區檔案內容（未加 --staged，或帶 --worktree/-W 的用法不可逆）。',
+        '只是想取消暫存？只帶 `--staged`（不加 --worktree）即放行。',
+      );
     }
 
     case 'rebase':
       // --continue/--abort/--skip 是在收尾既有 rebase（使用者已經在流程中），裸 rebase（開新的
       // rebase，含互動式）才是需要先問過的高風險操作——會改寫既有 commit 歷史。
       if (/(^|\s)--(continue|abort|skip)\b/.test(rest)) return null;
-      return BLOCK([
-        'Constellation git 守門：擋下裸 `git rebase` —— 會改寫既有 commit 歷史（互動式 rebase 尤其危險）。',
-        '  只是要收尾既有 rebase？用 `--continue`/`--abort`/`--skip`（本守門不攔）。',
-        `  ${HINT}`,
-      ].join('\n'));
+      return deny(
+        '裸 `git rebase` —— 會改寫既有 commit 歷史（互動式 rebase 尤其危險）。',
+        '只是要收尾既有 rebase？用 `--continue`/`--abort`/`--skip`（本守門不攔）。',
+      );
 
     case 'worktree': {
       const firstTok = (rest.match(/^(\S+)/) || [, ''])[1];
       if (firstTok !== 'add') return null; // list/remove/prune/lock 等不在此規則範圍
       // 帶 -b/-B（明示建立新分支）比照「開分支」規則：先問過。
       if (/(^|\s)-[bB]\b/.test(rest)) {
-        return BLOCK([
-          'Constellation git 守門：擋下 `git worktree add -b`/`-B` —— 這會建立新分支（比照開分支規則）。',
-          `  ${HINT}`,
-        ].join('\n'));
+        return deny('`git worktree add -b`/`-B` —— 這會建立新分支（比照開分支規則）。');
       }
       return null;
     }
@@ -247,30 +304,21 @@ function judgeSubcommand(sub, rest) {
     case 'reflog': {
       const firstTok = (rest.match(/^(\S+)/) || [, ''])[1];
       if (firstTok === 'expire') {
-        return BLOCK([
-          'Constellation git 守門：擋下 `git reflog expire` —— 會清除 reflog 紀錄，之後難以復原已捨棄的 commit。',
-          `  ${HINT}`,
-        ].join('\n'));
+        return deny('`git reflog expire` —— 會清除 reflog 紀錄，之後難以復原已捨棄的 commit。');
       }
       return null;
     }
 
     case 'gc':
       if (/(^|\s)--prune(\s|=|$)/.test(rest)) {
-        return BLOCK([
-          'Constellation git 守門：擋下 `git gc --prune` —— 會立即清除已失去引用的物件，可能讓 reflog 復原路徑失效。',
-          `  ${HINT}`,
-        ].join('\n'));
+        return deny('`git gc --prune` —— 會立即清除已失去引用的物件，可能讓 reflog 復原路徑失效。');
       }
       return null;
 
     case 'stash': {
       const firstTok = (rest.match(/^(\S+)/) || [, ''])[1];
       if (firstTok === 'drop' || firstTok === 'clear') {
-        return BLOCK([
-          `Constellation git 守門：擋下 \`git stash ${firstTok}\` —— 會不可逆刪除 stash 內容。`,
-          `  ${HINT}`,
-        ].join('\n'));
+        return deny(`\`git stash ${firstTok}\` —— 會不可逆刪除 stash 內容。`);
       }
       return null;
     }
@@ -295,10 +343,10 @@ export function gitGuardrailCheck(input) {
   if (GIT_OK_BASH_RE.test(cmd) || GIT_OK_PS_RE.test(cmd)) return PASS;
 
   for (const segment of splitSegments(cmd)) {
-    const call = extractGitCall(segment);
-    if (!call) continue;
-    const verdict = judgeSubcommand(call.sub, call.rest);
-    if (verdict) return verdict;
+    for (const call of extractGitCalls(segment)) {
+      const verdict = judgeSubcommand(call.sub, call.rest);
+      if (verdict) return verdict;
+    }
   }
   return PASS;
 }

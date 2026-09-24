@@ -10,11 +10,12 @@
 //   證據寫入 {cwd}/.constellation/ship-evidence.md（沒有這個檔就自動建立）。
 // --ticket 可以給純票號（如 T-003）：先試直接路徑，找不到就在 .constellation/tickets/ 下
 // glob `<票號>*.md`，唯一命中才用；零命中或多重命中一律報錯並列出候選，不猜。
-// 全部指令 exit 0 才落一筆「## 驗證證據」（時間戳＋各指令＋exit code＋stdout 尾 15 行＋簽章）；任一失敗：
-// 印該指令完整輸出、不落這筆簽章證據、exit 1（或斷路器觸發時 exit 2）——證據不能靠人手填，必須是這支
-// runner 親自跑出來的。--scope ship 的失敗路徑另外會在 ship-evidence.md 檔尾 append 一段未簽章的
-// 「## 失敗紀錄」（指令＋exit code＋耗時＋輸出摘要，僅供追查，不參與關票／出貨判定）；--scope ticket
-// 的失敗路徑不寫任何東西進票檔。
+// 全部指令 exit 0 才落一筆「## 驗證證據」（時間戳＋各指令＋exit code＋stdout 尾 8 個非空白行＋簽章）；
+// 任一失敗：主控台只印該指令輸出最後 40 行、完整輸出另存到系統暫存目錄並印出路徑、不落這筆簽章證據、
+// exit 1（或斷路器觸發時 exit 2；runner 自身的退出碼判斷不變，只是印法改了）——證據不能靠人手填，
+// 必須是這支 runner 親自跑出來的。--scope ship 的失敗路徑另外會在 ship-evidence.md 檔尾 append 一段
+// 未簽章的「## 失敗紀錄」（指令＋exit code＋耗時＋輸出摘要，僅供追查，不參與關票／出貨判定）；
+// --scope ticket 的失敗路徑不寫任何東西進票檔。
 // 證據筆另附一行各指令耗時（「- 耗時：合計 Ns｜…」，獨立行、不帶反引號、不含「（exit」）——close-gate／
 // commit-gate 的證據行解析（COMMAND_LINE_RE 行尾錨定「（exit N）」）天然忽略本行；儀表用途，不參與簽章。
 //
@@ -56,11 +57,11 @@
 // runner 自己的 stderr，不混進指令輸出，故不進證據 tail、不影響簽章。
 // ⚠ 已知限制：快照靠 netstat 輸出的 "LISTENING" 字串，在狀態字被本地化的 Windows 語系上會抓到空
 //    集合，整套補刀無聲失效（fail-safe 方向：不誤殺，只是不生效）。
-import { readFileSync, writeFileSync, existsSync, readdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
-import { resolve, join, basename } from 'node:path';
-import { createHmac } from 'node:crypto';
-import { homedir } from 'node:os';
+import { resolve, join, basename, dirname } from 'node:path';
+import { createHmac, createHash } from 'node:crypto';
+import { homedir, tmpdir } from 'node:os';
 
 const stripBom = s => (s && s.charCodeAt(0) === 0xfeff ? s.slice(1) : s);
 
@@ -102,6 +103,24 @@ const FIELD_SEP = '\u0001';
 function computeSignature(secret, ts, relPath, commandsJoined, lastLine, repoRoot) {
   const payload = [ts, relPath, commandsJoined, lastLine, repoRoot].join(FIELD_SEP);
   return createHmac('sha256', secret).update(payload, 'utf8').digest('hex');
+}
+
+// 沒給 --cwd 時，從目前目錄往上找專案根：認 `.constellation` 目錄本身存在（不要求 config.json——
+// 見 close-gate.mjs 同名函式的 P3 殘留說明：config.json 要到 weave 階段才生成，只認它會在 design
+// 階段把根找錯）。家目錄判斷順序很關鍵：**先**判斷是否已經走到家目錄、**再**檢查 `.constellation`
+// 存不存在——家目錄底下的 ~/.constellation/ 只放簽章 secret（目錄本身確實存在），順序反過來會把
+// 家目錄誤判成專案根。找不到就回原目錄，讓後面讀 config.json 失敗時給出原本就有的錯誤訊息。與
+// close-gate.mjs 找專案根同一套邏輯，各自內聯一份（見檔頭鏡像說明），不共用 import。
+function findProjectRoot(from) {
+  const home = resolve(homedir()).toLowerCase();
+  let dir = resolve(from);
+  for (;;) {
+    if (dir.toLowerCase() === home) return resolve(from);
+    if (existsSync(join(dir, '.constellation'))) return dir;
+    const up = dirname(dir);
+    if (up === dir) return resolve(from);
+    dir = up;
+  }
 }
 
 function parseArgs(argv) {
@@ -221,6 +240,7 @@ function toCommandList(v) {
   return [];
 }
 
+// 主控台失敗預覽：字面最後 N 行（含空白行），只給人看，不進證據、不參與簽章。
 function tail(text, maxLines = 15) {
   const lines = String(text ?? '').split(/\r?\n/);
   return lines.slice(-maxLines).join('\n');
@@ -233,6 +253,37 @@ function lastNonBlankLine(text) {
     if (lines[i].trim() !== '') return lines[i];
   }
   return '';
+}
+
+// 證據段落尾巴：取最後 N 個「非空白」行（trim 後非空字串才算，行本身原樣保留），而非字面最後 N 行——
+// reporter 常在收尾多印幾行空白，字面切法會把真正有內容的行擠出視窗外。找不到非空白行則回空字串。
+function lastNonBlankLines(text, n) {
+  const lines = String(text ?? '').split(/\r?\n/);
+  return lines.filter(l => l.trim() !== '').slice(-n).join('\n');
+}
+
+// 證據跳脫：輸出裡長得像「fence 收尾」或「已簽章指令行」的行，前面加零寬字元（U+200B）再寫入與簽章。
+// 這兩個正則對應 close-gate.mjs／commit-gate.mjs 解析證據區塊時用的邊界判準（找第一個 4 空白＋``` 收尾
+// fence；COMMAND_LINE_RE 行尾錨定「（exit N）」）——輸出裡若剛好有一行長這樣，會把證據區塊提早收尾或
+// 被誤當成另一條指令行，合法證據永遠驗簽失敗、還誤導成「可能被竄改」。U+200B 不屬於 JS 正則的 \s，
+// 兩邊正則因此不再誤配，卻不影響肉眼閱讀；close-gate／commit-gate 完全不動，只要這裡跳脫、簽章也對
+// 跳脫後的文字算，兩邊各自獨立驗證就一致。
+const EVIDENCE_FENCE_LINE_RE = /^```\s*$/;
+const EVIDENCE_CMDLIKE_LINE_RE = /^\s*-\s*`(.+)`（exit\s*-?\d+）\s*$/;
+function escapeEvidenceText(text) {
+  return String(text ?? '')
+    .split('\n')
+    .map(l => (EVIDENCE_FENCE_LINE_RE.test(l) || EVIDENCE_CMDLIKE_LINE_RE.test(l) ? `​${l}` : l))
+    .join('\n');
+}
+
+// 驗證失敗時的完整輸出存檔路徑：<系統暫存目錄>/constellation-verify/<repo 根雜湊>-<target 安全檔名>.log。
+// 每次覆寫（同一 repo＋target 下一次失敗會蓋掉這次），不累積；檔名雜湊 repo 根避免不同專案撞名，
+// target 轉安全字元避免票檔路徑裡的斜線被誤解成子目錄。
+function failureLogPath(cwd, target) {
+  const repoHash = createHash('sha256').update(repoRootToken(cwd)).digest('hex').slice(0, 12);
+  const safeTarget = String(target).replace(/[\\/:*?"<>|]+/g, '_');
+  return join(tmpdir(), 'constellation-verify', `${repoHash}-${safeTarget}.log`);
 }
 
 // 失敗段落檔前的遮密（verification-playbook.md「證據遮密」：金鑰／token／密碼一律 <REDACTED>）：
@@ -447,11 +498,11 @@ function snapshotListeners() {
 // 查全機進程表（只在候選非 0 時才付這次 PowerShell 的成本）。
 // 回 Map<pid, { created: epoch ms, ppid, cmdline }>；查不到的 pid 不會出現在 Map 裡（呼叫端一律不動）。
 // 為什麼是全機而不是只查候選：血緣判準要沿 ParentProcessId 鏈往上走好幾跳，逐跳各查一次要付好
-// 幾次 PowerShell 冷啟。而全機查完全不比只查幾個 pid 貴——本機實測兩種寫法都是 7–15 秒，成本全在
-// 冷啟（單獨起 powershell 什麼都不做就要 2 秒）與 CIM 模組載入，不在掃描量（全機 440 進程約 170KB）。
+// 幾次 PowerShell 冷啟。查詢用 -Property 只限定需要的 4 個欄位——實測貴的是「沒限定欄位、把每個
+// 進程全部屬性都抓回來」（約 6–10 秒），限定後約 3.5–5 秒；掃描量本身（全機 440 進程約 170KB）不是成本大頭。
 function queryProcessTable() {
   const script =
-    `$r=@(Get-CimInstance Win32_Process | ` +
+    `$r=@(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,CreationDate,CommandLine | ` +
     `Select-Object ProcessId,ParentProcessId,@{n='Created';e={$_.CreationDate.ToUniversalTime().ToString('o')}},CommandLine); ` +
     `ConvertTo-Json -InputObject $r -Compress`;
   try {
@@ -614,7 +665,7 @@ async function main() {
     console.error(`--scope 只能是 ticket 或 ship（收到："${scopeArg}"）`);
     process.exit(1);
   }
-  const cwd = resolve(cwdArg || process.cwd());
+  const cwd = cwdArg ? resolve(cwdArg) : findProjectRoot(process.cwd());
 
   let ticketPath = '';
   let target = '';
@@ -681,12 +732,37 @@ async function main() {
       console.error(`驗證失敗：\`${cmd}\`（exit ${exitCode}，${durSec}s）`);
       if (timedOut) console.error(`逾時：超過 ${timeoutMs / 1000} 秒未結束，已強制終止該指令。`);
       if (r.error) console.error(`spawn 錯誤：${r.error.message}`);
-      console.error('--- stdout ---');
-      console.error(outDecoded.text);
-      if (outDecoded.note) console.error(outDecoded.note);
-      console.error('--- stderr ---');
-      console.error(errDecoded.text);
-      if (errDecoded.note) console.error(errDecoded.note);
+
+      // 完整輸出先試著存檔（同一 repo＋target 覆寫，不累積）；主控台只印最後 40 行，避免長輸出把
+      // harness 的預覽塞滿、逼模型自己接 `| tail` 把退出碼吃掉。寫檔失敗（暫存目錄不可寫等）就
+      // 退回印完整輸出，至少不會連線索都沒有。
+      let failureLog = '';
+      try {
+        const logPath = failureLogPath(cwd, target);
+        mkdirSync(dirname(logPath), { recursive: true });
+        const combined =
+          `--- stdout ---\n${outDecoded.text}${outDecoded.note ? `\n${outDecoded.note}` : ''}\n` +
+          `--- stderr ---\n${errDecoded.text}${errDecoded.note ? `\n${errDecoded.note}` : ''}`;
+        writeFileSync(logPath, combined, 'utf8');
+        failureLog = logPath;
+      } catch {}
+
+      if (failureLog) {
+        console.error('--- stdout（最後 40 行） ---');
+        console.error(tail(outDecoded.text, 40));
+        if (outDecoded.note) console.error(outDecoded.note);
+        console.error('--- stderr（最後 40 行） ---');
+        console.error(tail(errDecoded.text, 40));
+        if (errDecoded.note) console.error(errDecoded.note);
+        console.error(`完整輸出：${failureLog}`);
+      } else {
+        console.error('--- stdout ---');
+        console.error(outDecoded.text);
+        if (outDecoded.note) console.error(outDecoded.note);
+        console.error('--- stderr ---');
+        console.error(errDecoded.text);
+        if (errDecoded.note) console.error(errDecoded.note);
+      }
 
       if (scope === 'ship') {
         const failTs = new Date().toISOString();
@@ -715,7 +791,7 @@ async function main() {
       console.error('未寫入驗證證據，這張票不能標 done。');
       process.exit(1);
     }
-    const realTailText = tail(outDecoded.text, 15);
+    const realTailText = escapeEvidenceText(lastNonBlankLines(outDecoded.text, 8));
     // 註記獨立於 fenced block 之外（不混進去）：簽章的「輸出尾行」只認 block 內的真實內容，
     // 註記文字本身絕不能被誤當成輸出內容去參與簽章——兩者職責分開，關票刷卡機解析時才不會混淆。
     results.push({ cmd, durSec, realTailText, note: outDecoded.note, realLastLine: lastNonBlankLine(realTailText) });

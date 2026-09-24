@@ -6,9 +6,9 @@
 //   閘門一「先清、再 commit」：staged 含驗證垃圾（測試/驗證過程產物，含 .playwright-mcp 的 MCP 殘留）→ 擋下。
 //   閘門二「done 票稽核」：staged 的票檔若把 status 設為 done，驗其最新證據筆簽章（新鮮度放寬 7 天，
 //     其餘與關票刷卡機同一套驗簽邏輯）——堵「用 shell 指令繞過關票刷卡機直接改檔＋git add」這條旁門，
-//     關票刷卡機只在 Edit/Write/MultiEdit/apply_patch 當下擋，commit 這關再兜底一次。
-// 另補「模型端繞過 pre-commit」防線：命令帶 --no-verify/-n 或改向 -c core.hooksPath → 擋下（human 在終端機
-// 自己打的不過本 hook，--no-verify 對人仍是 documented 逃生門、reflog 可稽核）。
+//     關票刷卡機只在 Edit/Write/apply_patch 當下擋，commit 這關再兜底一次。
+// 另補「模型端繞過 pre-commit」防線：commit 那一段命令帶 --no-verify/-n，或整條指令改向 -c core.hooksPath
+// → 擋下（human 在終端機自己打的不過本 hook，--no-verify 對人仍是 documented 逃生門、reflog 可稽核）。
 // `--amend` 不豁免：三道閘門照常判斷當下 staged 內容。
 // repo root 一律用 `git rev-parse --show-toplevel`（在 cwd 下跑）解析，失敗才 fallback 用 cwd 本身——
 // `.constellation` 存在性偵測、staged 檔案清單、done 票稽核全部基於這個 root，子目錄開 commit 也準。
@@ -55,28 +55,13 @@ const stripBom = s => (s && s.charCodeAt(0) === 0xfeff ? s.slice(1) : s);
 const PASS = { block: false };
 const BLOCK = msg => ({ block: true, message: msg });
 
-// 本檔邏輯抽成 commitGateCheck(input) → { block, message }，供未來若把多支 PreToolUse 閘門合併成單一
-// dispatcher 時直接 import 呼叫；也保留獨立 main() 讓本檔仍可單獨當 hook 跑（測試/相容）。
-// **只有直接執行本檔時才掛 stdin/main**——被其他程式 import 時不可自動跑，否則會搶先 exit 短路呼叫端。
-if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
-  if (process.argv.includes('--precommit')) {
-    // git 原生 pre-commit 呼叫路徑（gates/precommit-install.mjs 裝進 .git/hooks/pre-commit）。
-    // 延到 nextTick 才跑：本入口位在模組頂部，下方的 const（ARTIFACT_DIRS/TICKET_PATH_RE…）尚在 TDZ，
-    // 同步執行會 ReferenceError。stdin 那條路徑靠事件非同步天然避開，這條得自己延。
-    process.nextTick(runPrecommit);
-  } else {
-    let raw = '';
-    process.stdin.setEncoding('utf8');
-    process.stdin.on('error', () => process.exit(0));
-    process.stdin.on('data', (c) => (raw += c));
-    process.stdin.on('end', () => {
-      let input;
-      try { input = JSON.parse(stripBom(raw).trim() || '{}'); } catch { return exit0(); }
-      let r; try { r = commitGateCheck(input); } catch { r = null; }   // fail-open
-      if (r && r.block) { process.stderr.write(String(r.message || '') + '\n'); process.exit(2); }
-      exit0();
-    });
-  }
+// 本檔邏輯抽成 commitGateCheck(input) → { block, message }，供 pre-tool-use.mjs 動態 import 直接呼叫
+// （PreToolUse 路徑，手動除錯改用 echo <json> | node pre-tool-use.mjs）；本檔只再保留 --precommit
+// 這一個可執行入口，供 git 原生 pre-commit 呼叫（gates/precommit-install.mjs 裝進 .git/hooks/pre-commit）。
+if (import.meta.url === pathToFileURL(process.argv[1] || '').href && process.argv.includes('--precommit')) {
+  // 延到 nextTick 才跑：本入口位在模組頂部，下方的 const（ARTIFACT_DIRS/TICKET_PATH_RE…）尚在 TDZ，
+  // 同步執行會 ReferenceError。
+  process.nextTick(runPrecommit);
 }
 
 // ── git 原生 pre-commit 兜底（--precommit）──
@@ -396,34 +381,143 @@ function doneTicketAuditReason(root, staged) {
   ].join('\n');
 }
 
+// ── 內聯：找出「真的是 git commit」的那一段（鏡像 git-guardrail.mjs 的切段/找子命令寫法，最小版）──
+// 只為了精準定位 commit 子命令的那一段命令字串，不做 git-guardrail 等級的完整威脅建模（不展開
+// cmd /c／bash -c／powershell -Command 包殼、不展開子殼/命令替換）；包在殼裡的 commit 多半認不出來
+// （見下方 GIT_COMMIT_LOOSE_RE 的保底，只補「長式 --no-verify」這一種情境），沒帶長式 --no-verify
+// 時仍由 git 原生 pre-commit 兜底（見檔頭），非對抗威脅模型下可接受。
+//
+// 對抗審查 must-fix：切段一律逐字元掃描（跳過雙引號／單引號／PowerShell here-string `@'…'@`／`@"…"@`
+// 整段內容），只在這些結構之外才認 &&/||/;/|/換行/裸 & 為分隔符——commit message 常常是多行
+// heredoc／here-string 寫法，本身就帶換行、分號、管線符號，樸素的字串 split（不管引號）會把訊息
+// 從中間切開，讓寫在訊息之後的 --no-verify 落到不算 commit 段的下一段，兜底判斷直接漏看。
+function splitChainSegments(cmd) {
+  const out = [];
+  let cur = '';
+  let i = 0;
+  const n = cmd.length;
+  while (i < n) {
+    // PowerShell here-string：@'…'@ 或 @"…"@，整段吞掉（不認內部跳脫——PowerShell here-string
+    // 本來就不支援用反斜線跳脫收尾標記）。
+    if (cmd[i] === '@' && (cmd[i + 1] === "'" || cmd[i + 1] === '"')) {
+      const closer = cmd[i + 1] + '@';
+      const end = cmd.indexOf(closer, i + 2);
+      const stop = end < 0 ? n : end + closer.length;
+      cur += cmd.slice(i, stop);
+      i = stop;
+      continue;
+    }
+    const ch = cmd[i];
+    if (ch === '"') {
+      // 雙引號吃反斜線跳脫（`\"` 不算收尾），對齊 stripMessageValues 對雙引號值的判準。
+      let j = i + 1;
+      while (j < n && cmd[j] !== '"') { j += cmd[j] === '\\' && j + 1 < n ? 2 : 1; }
+      j = j < n ? j + 1 : j;
+      cur += cmd.slice(i, j);
+      i = j;
+      continue;
+    }
+    if (ch === "'") {
+      // 單引號不支援跳脫（POSIX／PowerShell 一致），找下一個單引號就是收尾。
+      let j = i + 1;
+      while (j < n && cmd[j] !== "'") j += 1;
+      j = j < n ? j + 1 : j;
+      cur += cmd.slice(i, j);
+      i = j;
+      continue;
+    }
+    if (cmd.startsWith('&&', i) || cmd.startsWith('||', i)) { out.push(cur); cur = ''; i += 2; continue; }
+    if (ch === ';' || ch === '|') { out.push(cur); cur = ''; i += 1; continue; }
+    if (ch === '\n' || (ch === '\r' && cmd[i + 1] === '\n')) { out.push(cur); cur = ''; i += ch === '\r' ? 2 : 1; continue; }
+    if (ch === '&' && cmd[i - 1] !== '&' && cmd[i + 1] !== '&' &&
+        i > 0 && /\s/.test(cmd[i - 1]) && i + 1 < n && /\s/.test(cmd[i + 1])) {
+      out.push(cur); cur = ''; i += 1; continue;
+    }
+    cur += ch;
+    i += 1;
+  }
+  out.push(cur);
+  return out;
+}
+
+const COMMIT_VALUE_FLAGS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--config-env']);
+const stripSegQuotes = t => t.replace(/^["']|["']$/g, '');
+
+// 該段的子命令是否為 commit（跳過 git global option，第一個非旗標 token 才是子命令）。
+function isCommitSegment(seg) {
+  const toks = seg.match(/"[^"]*"|'[^']*'|\S+/g) || [];
+  const gi = toks.findIndex(t => /^git(\.exe)?$/i.test(stripSegQuotes(t)) || /[\\/]git(\.exe)?$/i.test(stripSegQuotes(t)));
+  if (gi < 0) return false;
+  for (let i = gi + 1; i < toks.length; i++) {
+    const t = stripSegQuotes(toks[i]);
+    if (t.startsWith('-')) { if (COMMIT_VALUE_FLAGS.has(t)) i += 1; continue; }
+    return t === 'commit';
+  }
+  return false;
+}
+
+// 挖掉 -m/-F 的值（含 here-string 與雙引號轉義），但保留旗標字母本身——`-anm "msg"` 這種以 m 結尾的
+// 組合旗標，值被挖掉後仍看得到裡面的 n（--no-verify 短式），不會因為挖值連旗標一起消失而漏擋。
+// -[a-zA-Z]*m\s*（而非 \s+）同時吃緊湊寫法 `-m"msg"`/`-mmsg`（無空白），否則訊息不被挖除＝假阻擋。
+function stripMessageValues(text) {
+  return text
+    .replace(/(-[a-zA-Z]*m)\s*@(['"])[\s\S]*?\2@/g, '$1 ')     // PowerShell here-string message
+    .replace(/(-[a-zA-Z]*m)\s*"(?:\\.|[^"\\])*"/g, '$1 ')      // 雙引號 message（吞轉義 \" 不提前收尾）
+    .replace(/(-[a-zA-Z]*m)\s*'[^']*'/g, '$1 ')                // 單引號 message（POSIX 無轉義）
+    .replace(/(-F)\s+\S+/g, '$1 ')                             // -F <file>
+    .replace(/['"]/g, ' ');                                    // 去殘餘引號字元（"--no-verify" → --no-verify）
+}
+
 // 純判定（不碰 exit/stderr）。呼叫端負責 fail-open（try-catch）與輸出。
 export function commitGateCheck(input) {
   const tool = input.tool_name ?? input.toolName ?? '';
   if (tool !== 'Bash' && tool !== 'PowerShell') return PASS;
   const ti = input.tool_input ?? input.toolInput ?? {};
   const cmd = String(ti.command ?? '');
-  // 只攔真正的 commit；放行非 commit / 唯讀 git（--amend 不豁免，見檔頭）。
-  // (?!-) 排除 commit-graph/commit-tree 這類非提交子命令、(?<![=-]) 排除 --grep=commit／分支名 fix-commit
-  // 這類唯讀語境，免得誤攔。
-  if (!/\bgit\b[^\n]*(?<![=-])\bcommit\b(?!-)/.test(cmd)) return PASS;
+  // 只攔真正的 commit：整條指令切段，找子命令真的是 commit 的那一段——不對整條指令字串做關鍵字掃描，
+  // 避免 `sed -n`、`tail -n`、`grep -rn` 這類同一行裡剛好出現 git/commit 字眼的非 commit 指令被誤攔
+  // （--amend 不豁免，見檔頭；commit-graph/commit-tree 這類非提交子命令天然不等於 'commit'，不會誤攔）。
+  const segments = splitChainSegments(cmd);
+  const commitSegments = segments.filter(isCommitSegment);
+  if (!commitSegments.length) {
+    // 對抗審查 should-fix：commit 包在殼裡（bash -c／cmd /c／powershell -Command／括號子殼／命令替換／
+    // -C 或 -c 的值本身就是 $(...)）時，isCommitSegment 認不出真正的 commit 子命令，上面就直接放行，
+    // 跟三道檔案閘門一樣 fail-open。長式 `--no-verify` 是無歧義字串（不像短式 `-n` 會跟 `sed -n`／
+    // `grep -n` 混淆，P4 就是在修這個），補一道保底：只有在 isCommitSegment 完全抓不到 commit 段、
+    // 但整條指令仍看得出「有 git 也有 commit 字樣」且挖掉訊息值後仍看得到長式 --no-verify 時才擋
+    // ——短式 -n 藏在殼層裡目前仍抓不到（誠實記錄，不宣稱這裡對抗完備）。GIT_COMMIT_LOOSE_RE 本身很
+    // 便宜，只有這道也命中才會真的解析 repo root（避免每支非 commit 指令都多付一次 git 子行程）。
+    const GIT_COMMIT_LOOSE_RE = /\bgit\b[^\n]*\bcommit\b/i;
+    if (GIT_COMMIT_LOOSE_RE.test(cmd) && /(^|\s)--no-verify(\s|$)/.test(stripMessageValues(cmd))) {
+      const cwd = input.cwd ?? process.cwd();
+      const root = resolveRepoRoot(cwd);
+      if (existsSync(join(root, '.constellation'))) {
+        return BLOCK([
+          'Constellation commit 守門：擋下 —— 指令包在殼層／子殼／命令替換裡，沒辦法精準定位 commit',
+          '  子命令本身，但整條指令看得出帶了 git…commit 字樣，且挖掉訊息值後仍看得到長式 --no-verify',
+          '  （會繞過 pre-commit 兜底）——保底直接擋下。',
+          '  真有正當理由跳過（例如 hook 本身壞了）→ 回報使用者由人拍板，別自行繞過。',
+        ].join('\n'));
+      }
+    }
+    return PASS;
+  }
 
   const cwd = input.cwd ?? process.cwd();
   const root = resolveRepoRoot(cwd); // R9：一律用 git rev-parse --show-toplevel 解析、失敗 fallback cwd
   if (!existsSync(join(root, '.constellation'))) return PASS; // 非 Constellation 專案
 
   // ── 補堵「繞過 pre-commit 兜底」的旗標 ──
-  // 只挖「-m/-F 的值」（含 here-string 與雙引號轉義），再去掉殘餘引號「字元」（非內容）：
-  // -m\s*（而非 \s+）同時吃緊湊寫法 `-m"msg"`/`-mmsg`（無空白），否則訊息不被挖除＝假阻擋。
-  //   ① message 內文含 --no-verify 隨值挖掉＝不誤擋；② 被引號包的旗標（git commit "--no-verify"）去引號後仍測得到＝不漏擋。
-  const cmdFlags = cmd
-    .replace(/-m\s*@(['"])[\s\S]*?\1@/g, ' ')                 // PowerShell here-string message
-    .replace(/-m\s*"(?:\\.|[^"\\])*"/g, ' ')                  // 雙引號 message（吞轉義 \" 不提前收尾）
-    .replace(/-m\s*'[^']*'/g, ' ')                            // 單引號 message（POSIX 無轉義）
-    .replace(/-F\s+\S+/g, ' ')                                // -F <file>
-    .replace(/['"]/g, ' ');                                   // 去殘餘引號字元（"--no-verify" → --no-verify）
-  // --no-verify（含短式 -n 與 bundle 含 n，如 -an）＋改向 core.hooksPath（-c 旗標形／大小寫不敏感／git config 子命令形持久改向）
-  const noVerify = /(^|\s)--no-verify(\s|$)/.test(cmdFlags) || /(^|\s)-[a-z]*n[a-z]*(\s|$)/.test(cmdFlags);
-  const hooksPathBypass = /-c\s+core\.hooksPath\b/i.test(cmdFlags) || /\bconfig\b[^\n]*\bcore\.hooksPath\b/i.test(cmdFlags);
+  // --no-verify/-n 只看 commit 那一段（旗標只對該子命令有意義，別段的 -n 如 `git log -n 1`、`tail -n 20`
+  // 不該連坐）；core.hooksPath 改向是獨立的 git 段（`git config core.hooksPath ...` 或 `-c core.hooksPath=`
+  // 全域旗標），要看整條指令，不能因為只看 commit 段而漏掉。
+  const noVerify = commitSegments.some((seg) => {
+    const flags = stripMessageValues(seg);
+    // --no-verify（含短式 -n 與 bundle 含 n，如 -an／-anm）
+    return /(^|\s)--no-verify(\s|$)/.test(flags) || /(^|\s)-[a-z]*n[a-z]*(\s|$)/.test(flags);
+  });
+  const wholeFlags = stripMessageValues(cmd);
+  const hooksPathBypass = /-c\s+core\.hooksPath\b/i.test(wholeFlags) || /\bconfig\b[^\n]*\bcore\.hooksPath\b/i.test(wholeFlags);
   if (noVerify || hooksPathBypass) {
     return BLOCK([
       'Constellation commit 守門：擋下 commit —— 命令帶了 --no-verify/-n 或改向 core.hooksPath（會繞過 pre-commit 兜底）。',
