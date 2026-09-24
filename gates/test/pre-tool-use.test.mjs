@@ -64,8 +64,8 @@ describe('pre-tool-use：P18——非 git 指令快速放行，git 指令維持�
     assert.match(r.stderr, /commit 守門/);
   });
 
-  test('sed -n 這類含 -n 但非 commit 繞過的 git 指令放行（P4 對應行為，經 dispatcher 整合驗證一次）', () => {
-    const r = run({ tool_name: 'Bash', cwd: repo, tool_input: { command: 'git log -1 && sed -n 1,5p a.md' } });
+  test('commit 後接 sed -n：-n 屬於 sed，放行（P4 放行類別 (A)，經 dispatcher 整合驗證一次）', () => {
+    const r = run({ tool_name: 'Bash', cwd: repo, tool_input: { command: 'git commit -m "x" && sed -n 1,5p a.md' } });
     assert.equal(r.status, 0);
   });
 

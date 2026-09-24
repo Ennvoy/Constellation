@@ -1,15 +1,22 @@
 // gates/test/commit-gate.test.mjs — P4 回歸表：commit 守門別再把 sed -n、tail -n 這類與 --no-verify
-// 無關的 -n 短旗標當成「想跳過檢查」。commitGateCheck 是純函式（檔案頂部有 import.meta.url 守衛，
-// 被 import 時不會自動掛 stdin），直接 import 呼叫。
+// 無關的 -n 短旗標當成「想跳過檢查」。commitGateCheck 是純函式（commit-gate.mjs 只有帶 --precommit
+// 直接執行時才跑入口，被 import 不會），直接 import 呼叫。
+//
+// 設計：commit-gate 不是 shell 解析器。短旗標 -n 只在 commit-gate.mjs 的 shortNOnlyInSafeSegments
+// 明列的類別裡放行：(A) 段首是不會代跑指令的白名單程式（grep 類、head、tail、git 唯讀查詢、只印行號的
+// sed -n、不帶 -exec 的 find），(B) PowerShell 沒緊貼引號的運算子（-ne、-and、-join…）；另有整條否決
+// （續行、跳脫引號、xargs／eval／iex）、段界推定（前面各段與本段的引號／括號都要成對）與「commit 那段
+// 不得有變數展開」。判不準一律照擋；長式 --no-verify 與 core.hooksPath 維持「整條指令出現即擋」。
+// 期望放行、但結構落在判不準範圍的案例，期望已改為擋下並註明「保守判定、刻意不放行」。
 //
 // 38 條「現場誤擋指令」取自對 3,440 份 transcript 的唯讀掃描結果（tool_result 以 hook error
-// 開頭、訊息含 --no-verify/-n 字樣的真擋下），對應 report.md ### P4「現場 5 筆真實擋下」統計裡的
-// 完整 38 筆（不是取樣）——形狀取自現場，內容已合成：使用者名稱、私人專案路徑、票號、內部路徑、
-// commit hash、業務訊息內文與共同作者行都已換成中性佔位字，但決定判定結果的形狀（sed -n、heredoc、
-// -F、PowerShell 多行、here-string、管線與分號的位置）維持原樣。逐條已用現行 commit-gate 重播過：
-// 38 筆全數命中「命令帶了 --no-verify/-n」擋下訊息，且逐一核對後真的帶 --no-verify/-n 的 0 筆——
-// 這 38 筆改後全部應該放行。真繞過寫法（--no-verify、-n、-anm、core.hooksPath）維持擋下，見下方
-// 「必須仍擋下」區塊。
+// 開頭、訊息含 --no-verify/-n 字樣的真擋下），逐一核對後真的帶 --no-verify/-n 的 0 筆——形狀取自
+// 現場，內容已合成：使用者名稱、私人專案路徑、票號、內部路徑、commit hash、業務訊息內文與共同作者行
+// 都已換成中性佔位字，但決定判定結果的形狀（sed -n、heredoc、-F、PowerShell 多行、here-string、管線
+// 與分號的位置）維持原樣。PowerShell 語法的案例以 PowerShell 工具送（現場即 PowerShell 工具呼叫，
+// Bash 無法執行這些語法）。依實際結果分兩組：已放行 36 條（其中 14 條的合成形狀在 048fe66 基底就已
+// 放行，22 條靠 -n 放行類別放行）、保守仍擋 2 條（原因見 FIELD_38_STILL_BLOCKED）。
+// 真繞過寫法（--no-verify、-n、-anm、core.hooksPath）維持擋下，見下方「必須仍擋下」區塊。
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
@@ -61,7 +68,7 @@ function assertBlocked(input, label) {
   assert.equal(r.block, true, `${label}：應擋下，實際 ${JSON.stringify(r).slice(0, 200)}`);
 }
 
-// ── 38 條現場誤擋指令（形狀取自現場，內容已合成）：改後全部應該放行 ──
+// ── 38 條現場誤擋指令（形狀取自現場，內容已合成）──
 const FIELD_38 = [
   `cd /c/Users/u/Desktop/proj-a && sed -n '60,72p' specs/architecture.md; echo "--- exists? ---"; ls system/project-aliases.json 2>&1 | head -2; ls system/promotion-queue.json 2>&1 | head -2; ls system/.state/promotion-queue.json 2>&1 | head -2; echo "--- git last commit of specs/architecture.md ---"; git log -1 --format='%ad %h' -- specs/architecture.md`,
   `git status --porcelain | grep -v "^?? .constellation/decisions/" | head -30; grep -n -i "worktree\\|commit" /c/Users/u/.claude/skills/constellation/references/phase-build.md | head -30`,
@@ -103,10 +110,89 @@ const FIELD_38 = [
   `cd C:/Users/u/Documents/proj-e && git show 218e935:backend/src/services/scoring.ts > "/tmp/scoring_old.ts"; grep -n "buildCombinedAnalysisPrompt\\|description" "/tmp/scoring_old.ts" | head -50; grep -rn "analyzeAudioComplete" backend/src --include=*.ts | grep -v "^backend/src/services/scoring.ts" | head; git log --format='%h %ad %s' --date=iso -8 -- backend/src/services/scoring.ts`,
 ];
 
-describe('commit-gate：P4——38 條現場誤擋指令改後全數放行', () => {
-  FIELD_38.forEach((cmd, i) => {
-    test(`案例 #${i + 1}`, () => assertPassed(bash(cmd), `#${i + 1}`));
+// PowerShell 語法的案例（$var = …、[System.IO.File]::…、if (…) { … }）以 PowerShell 工具送。
+const FIELD_38_PS = new Set([4, 11, 28, 30, 31, 32, 33, 34]);
+// 保守仍擋：-n 確實屬於別的程式，但所在結構落在判不準範圍，刻意不放行。
+const FIELD_38_STILL_BLOCKED = {
+  23: 'netstat -ano 在括號子殼 ( … ) 裡，樸素切段後括號不成對，判不準',
+  37: 'grep 樣式的雙引號內含 |，樸素切段會切進引號裡、引號不成對，判不準',
+};
+const field = n => (FIELD_38_PS.has(n) ? ps : bash)(FIELD_38[n - 1]);
+
+describe('commit-gate：P4——38 條現場誤擋指令：已放行組', () => {
+  FIELD_38.forEach((_, i) => {
+    const n = i + 1;
+    if (FIELD_38_STILL_BLOCKED[n]) return;
+    test(`案例 #${n}`, () => assertPassed(field(n), `#${n}`));
   });
+});
+
+describe('commit-gate：P4——38 條現場誤擋指令：保守仍擋組（保守判定、刻意不放行）', () => {
+  for (const [n, why] of Object.entries(FIELD_38_STILL_BLOCKED)) {
+    test(`案例 #${n}：${why}`, () => assertBlockedNoVerify(field(Number(n)), `#${n}`));
+  }
+});
+
+// 放行類別的邊界：(A) 段首是白名單程式；(B) PowerShell 未加引號的運算子。落在判不準結構（續行、括號
+// 子殼、引號內含分隔符、前面有落單引號）的一律照擋。
+describe('commit-gate：P4——-n 放行類別的邊界', () => {
+  test('(A) commit 後接 git log -n 放行', () => assertPassed(bash('git commit -m "x" && git log -n 1 --oneline'), 'log -n'));
+  test('(A) commit 後接 tail -n 放行', () => assertPassed(bash('git commit -m "x" 2>&1 | tail -n 20'), 'tail -n'));
+  test('(B) PowerShell：commit 後接 -ne 判斷放行', () =>
+    assertPassed(ps('git commit -m "x"; if ($LASTEXITCODE -ne 0) { exit 1 }'), 'ps -ne'));
+  test('(A) git log --grep commit -n 5 放行（段內的 commit 是查詢參數）', () =>
+    assertPassed(bash('git log --grep commit -n 5'), 'log --grep commit -n'));
+  test('(A) git log -n 的輸出經管線餵給 git commit -F - 放行（訊息走 stdin，不是參數）', () =>
+    assertPassed(bash('git log -n 1 --format=%B | git commit -F -'), 'log -n | commit -F -'));
+  test('(A) git -C "$repo" commit 後接 sed -n 放行（-C 的值是目錄，不算變數參數）', () =>
+    assertPassed(bash('git -C "$repo" commit -m x && sed -n 1p f'), '-C "$repo" commit && sed -n'));
+  test('保守判定、刻意不放行：續行後接 sed -n', () =>
+    assertBlockedNoVerify(bash('git commit -m "x" \\\n  && sed -n 1p a.md'), 'continuation'));
+  test('保守判定、刻意不放行：括號子殼裡的 sed -n', () =>
+    assertBlockedNoVerify(bash('(git commit -m "x"; sed -n 1p a.md)'), 'subshell'));
+  test('保守判定、刻意不放行：引號內含 | 的 grep -n', () =>
+    assertBlockedNoVerify(bash('git commit -m "x" && grep -n "a|b" a.md'), 'quoted pipe'));
+  test('保守判定、刻意不放行：heredoc 內文有落單的撇號，後面的 tail -n（段界推定不成立）', () =>
+    assertBlockedNoVerify(bash(`cat > /tmp/msg.txt <<'EOF'\nfix: handle user's locale\nEOF\ngit commit -q -F /tmp/msg.txt 2>&1 | tail -n 3`), 'heredoc apostrophe + tail -n'));
+  test('保守判定、刻意不放行：Bash 送的 PowerShell 運算子（(B) 只認 PowerShell 工具）', () =>
+    assertBlockedNoVerify(bash('git commit -m "x"; if ($LASTEXITCODE -ne 0) { exit 1 }'), 'bash -ne'));
+  test('保守判定、刻意不放行：sed -n 的腳本不是純行號範圍（可能含 e 命令）', () =>
+    assertBlockedNoVerify(bash("git commit -m x; sed -n '/x/p' f"), 'sed pattern script'));
+  test('跳脫的分號不算段界：git commit -m x\\; sed -n 要擋', () =>
+    assertBlockedNoVerify(bash('git commit -m x\\; sed -n'), 'escaped semicolon'));
+  test('段首不是白名單程式：變數間接呼叫 $g commit -n 要擋', () =>
+    assertBlockedNoVerify(bash('g=git; $g commit -n -m x'), 'indirect $g commit'));
+  test('不收會代跑指令的 git 子命令：submodule foreach 裡的 commit -n 要擋', () =>
+    assertBlockedNoVerify(bash("git submodule foreach 'git commit -n -m x'"), 'submodule foreach'));
+});
+
+// 上一輪差分裁定在語料外找到的放行漏洞（舊版擋、上一版放行），以及同型延伸寫法：-n 經由代跑指令的
+// 子命令、管線、函式、變數、陣列、splat、iex、跨行命令替換、引號計數湊平流進 git commit，全部要擋。
+describe('commit-gate：-n 不能經由間接寫法流進 git commit', () => {
+  const cases = [
+    ['git grep -O 代跑指令', bash("git grep -O'git commit -n -m x' foo")],
+    ['git grep --open-files-in-pager 代跑指令', bash("git grep --open-files-in-pager='git commit -n -m x' foo")],
+    ['git grep -n -O 包 sh -c', bash(`git grep -n -O'sh -c "git commit -n -m x"' foo`)],
+    ['printf -n | xargs git commit', bash("printf '%s\\n' -n | xargs git commit -m x")],
+    ['函式 "$@" 轉交', bash('c() { git commit "$@"; }; c -n -m "x"')],
+    ['變數存旗標', bash("NV='-n'; git commit $NV -m x")],
+    ['陣列存旗標', bash('args=( -n -m x ); git commit "${args[@]}"')],
+    ['PowerShell 函式 @args 轉交', ps('function g2 { git commit @args }; g2 -n -m "x"')],
+    ['PowerShell 陣列 splat', ps("$a = @('-n'); git commit @a -m \"x\"")],
+    ['PowerShell iex 組指令', ps("$f='-n'; iex \"git commit $f -m x\"")],
+    ['PowerShell -join 組出旗標再傳給 commit', ps("$x = @('-','n') -join ''; git commit $x -m y")],
+    ['跨行命令替換', bash('git commit -m "x" $(\nprintf -- -n\n)')],
+    ['引號計數湊平（異種引號）', bash(`git commit --author="A;B" --date='x"y' -n -m "m"`)],
+    ['引號計數湊平（跳脫引號）', bash('git commit --author="a;b\\"" -n -m "m"')],
+    ['find -exec 代跑存在變數裡的 commit', bash('G="git commit"; find . -iname x -exec $G -n \\;')],
+    ['sed e 命令代跑存在變數裡的 commit', bash('G="git commit"; sed -n "1e $G -n" f')],
+    ['sed 印出 -n 再 xargs', bash("sed -n 's/^/-n/p' f | xargs git commit -m x")],
+    ['while read 把輸出當參數', bash('tail -n 1 f | while read a; do git commit $a -m x; done')],
+    ['grep 段內背景執行 &', bash('grep -n commit f&git commit -n -m x')],
+    ['grep 引號裡藏命令替換', bash('grep -n "$(git commit -n -m x)" f')],
+    ['sed -n 後面再接 -e 腳本', bash('git commit -m x; sed -n 1p f -e "1e sh"')],
+  ];
+  for (const [label, input] of cases) test(`${label} 要擋`, () => assertBlockedNoVerify(input, label));
 });
 
 describe('commit-gate：真繞過寫法必須仍擋下', () => {
@@ -121,9 +207,8 @@ describe('commit-gate：真繞過寫法必須仍擋下', () => {
     assertBlockedNoVerify(ps('git commit --no-verify -m "x"'), 'ps --no-verify'));
 });
 
-// 對抗審查 must-fix：切段本來用「不管引號的字串 split」找 &&/;/||/|/換行，heredoc／here-string／
-// 訊息裡的分隔符會把 commit 段從中間切開，讓寫在訊息之後的 --no-verify/-n 落到下一段（不算 commit
-// 段）而漏擋。改法：切段一律逐字元掃描，跳過雙引號／單引號／PowerShell here-string 整段內容。
+// 訊息裡的分隔符（heredoc／分號／&&／管線／換行／here-string）不能讓寫在訊息之後的 --no-verify/-n 漏擋：
+// 長式整條指令出現即擋；短式所在段的段首不是白名單程式、或引號不成對，不屬放行類別，照擋。
 describe('commit-gate：對抗審查 must-fix——訊息含分隔符（heredoc／分號／&&／管線／換行／here-string）後接 --no-verify/-n 仍要擋', () => {
   test('heredoc 訊息（bash -m "$(cat <<\'EOF\' … EOF)"）後接 --no-verify 要擋', () =>
     assertBlocked(bash(`git commit -m "$(cat <<'EOF'\nfeat: x\n\nbody\nEOF\n)" --no-verify`), 'heredoc msg + --no-verify'));
@@ -141,9 +226,8 @@ describe('commit-gate：對抗審查 must-fix——訊息含分隔符（heredoc�
     assertBlocked(ps("git commit -m @'\nmsg\n'@ --no-verify"), 'PS here-string msg'));
 });
 
-// 對抗審查 should-fix：commit 包在殼裡（bash -c／cmd /c／powershell -Command／括號子殼／命令替換／
-// -C 值是 $(...)）時 isCommitSegment 認不出真正的 commit 子命令，長式 --no-verify 仍要靠整條指令的
-// 保底擋下（短式 -n 藏在殼裡不強求，見 commit-gate.mjs 的 GIT_COMMIT_LOOSE_RE 註解）。
+// commit 包在殼裡（bash -c／cmd /c／powershell -Command／括號子殼／命令替換／-C 值是 $(...)）：
+// 長式 --no-verify 整條指令出現即擋。
 describe('commit-gate：對抗審查 should-fix——commit 包在殼裡，長式 --no-verify 仍要擋', () => {
   test('bash -c 包裹要擋', () => assertBlocked(bash('bash -c "git commit --no-verify -m x"'), 'bash -c wrapped'));
   test('cmd /c 包裹要擋', () => assertBlocked(bash('cmd /c "git commit --no-verify -m x"'), 'cmd /c wrapped'));
@@ -168,8 +252,8 @@ describe('commit-gate：邊界案例（放行）', () => {
   test('非 git 指令直接放行（tool 判定）', () => assertPassed(bash('sed -n 1,5p a.md'), 'non-git'));
 });
 
-// 第二輪對抗複審 must-fix：續行寫法（bash `\`+換行、PowerShell 反引號+換行）不能把 --no-verify/-n
-// 切到認不出來的下一段（C1／C2／C3）。
+// 續行寫法（bash `\`+換行、PowerShell 反引號+換行）不能讓 --no-verify/-n 漏擋（C1／C2／C3）：
+// 有續行時短式 -n 一律不放行。
 describe('第二輪 must-fix——續行寫法不能漏擋', () => {
   test('C1：bash \\+換行接 --no-verify 要擋', () =>
     assertBlockedNoVerify(bash('git commit -m "msg" \\\n  --no-verify'), 'C1'));
@@ -179,9 +263,9 @@ describe('第二輪 must-fix——續行寫法不能漏擋', () => {
     assertBlockedNoVerify(ps('git commit -m "msg" `\n  --no-verify'), 'C3'));
 });
 
-// 第二輪對抗複審 must-fix：包在殼裡／子殼／命令替換的 commit（isCommitSegment 認不出來）不能讓三道
-// 檔案閘門跟著 fail-open——staged 的 secrets 要能被擋下，不管 commit 包得多深。獨立開一個帶 staged
-// .env 的 repo，避免污染其他測試假設的「空 staging」前提。
+// 包在殼裡／子殼／命令替換的 commit 也要跑三道檔案閘門——前置關卡只看整條指令有沒有「git … commit」
+// 字樣，staged 的 secrets 不管 commit 包得多深都擋得下。獨立開一個帶 staged .env 的 repo，避免污染
+// 其他測試假設的「空 staging」前提。
 describe('第二輪 must-fix——包殼裡的 commit 也要跑三道檔案閘門（staged .env）', () => {
   let secretRepo;
   before(() => {
@@ -209,7 +293,7 @@ describe('第二輪 must-fix——包殼裡的 commit 也要跑三道檔案閘�
     assertBlocked(sps('git -C (Split-Path $PWD) commit -m x'), 'ps -C (Split-Path) commit, staged .env'));
 });
 
-// 第二輪對抗複審 must-fix：短式 -n 包在殼裡也要精準擋下（空 staging，只測旗標判斷本身）。
+// 短式 -n 包在殼裡也要擋下（空 staging，只測旗標判斷本身）：所在段的段首不是白名單程式，不屬放行類別。
 describe('第二輪 must-fix——短式 -n 包在殼裡也要精準擋下', () => {
   test('bash -c "git commit -n -m x" 要擋', () => assertBlockedNoVerify(bash('bash -c "git commit -n -m x"'), 'bash -c -n'));
   test("sh -c 'git commit -an -m x' 要擋", () => assertBlockedNoVerify(bash("sh -c 'git commit -an -m x'"), 'sh -c -an'));
@@ -227,8 +311,7 @@ describe('第二輪 must-fix——短式 -n 包在殼裡也要精準擋下', () 
     assertBlockedNoVerify(bash('powershell -Command "git commit -n -m x"'), 'powershell -Command -n'));
 });
 
-// 第二輪對抗複審 must-fix：引號模型與真實 shell 對不上時，commit 段被切斷或併段，旗標漏看
-// （C9／C12／C14／C15／C23／C24，逐字取自複審報告）。
+// 引號／跳脫寫法與樸素切段對不上時，短式 -n 不能漏擋（C9／C12／C14／C15／C23／C24，逐字取自複審報告）。
 describe('第二輪 must-fix——引號／跳脫模型要對齊真實 shell', () => {
   test("C9：bash 單引號字串裡插字面撇號（'\\''）後接 --no-verify 要擋", () =>
     assertBlocked(bash("git commit -m 'it'\\''s; done' --no-verify"), 'C9'));
@@ -244,7 +327,7 @@ describe('第二輪 must-fix——引號／跳脫模型要對齊真實 shell', (
     assertBlocked(ps('git status `"; git commit -n -m x; echo `"'), 'C24'));
 });
 
-// 第二輪對抗複審 must-fix（heredoc 用來寫 commit message 再 add && commit，FIELD_38 最常見的形狀）。
+// heredoc 寫 commit message 再 add && commit（FIELD_38 最常見的形狀），後面真帶 -n 仍要擋。
 describe('第二輪 must-fix——heredoc 寫 commit message 再 add && commit 不能漏擋', () => {
   test('git commit -F - <<EOF 訊息含撇號後 add && commit -n 要擋', () =>
     assertBlocked(bash(`git commit -F - <<'EOF'\nfix: don't crash\nEOF\ngit add b && git commit -n -m y`), 'heredoc + add && commit -n'));
@@ -252,17 +335,15 @@ describe('第二輪 must-fix——heredoc 寫 commit message 再 add && commit �
     assertBlocked(bash(`cat > /tmp/msg.txt <<'EOF'\nfix: don't crash on empty input\nEOF\ngit add -A && git commit -n -q -F /tmp/msg.txt`), 'heredoc + add -A && commit -n -q -F'));
 });
 
-// 第二輪對抗複審 must-fix：多個 git 呼叫時（含包殼），第一個不是 commit 不能讓後面真正的
-// --amend --no-verify 漏看（C13）。
+// 多個 git 呼叫時（含包殼），第一個不是 commit 不能讓後面真正的 --amend --no-verify 漏看（C13）。
 describe('第二輪 must-fix——同指令內第二個以後的 commit 呼叫也要判', () => {
   test('C13：git commit -m a && bash -c "git commit --amend --no-verify -m b" 要擋', () =>
     assertBlocked(bash('git commit -m a && bash -c "git commit --amend --no-verify -m b"'), 'C13'));
 });
 
-// 第二輪對抗複審 must-fix：GIT_COMMIT_LOOSE_RE 保底原本沒有「看起來像包了殼層」的門檻，導致同一行
-// 剛好同時出現 git…commit 字樣（如檔名 commit-gate.mjs）與 --no-verify 字面值（如 grep 查詢樣式）的
-// 唯讀指令被誤判成想繞過 pre-commit。
-describe('第二輪 must-fix——GIT_COMMIT_LOOSE_RE 保底不能誤攔唯讀指令', () => {
+// 前置關卡的「git … commit」字樣排除 commit-gate.mjs 這類檔名與 commit-tree：同一行只有檔名裡的
+// commit 字樣、外加 --no-verify 字面值（grep 查詢樣式）的唯讀指令，根本不進旗標判斷。
+describe('唯讀指令：檔名裡的 commit 字樣＋--no-verify 查詢樣式不誤攔', () => {
   test('git diff -- commit-gate.mjs | grep -n -- --no-verify 放行', () =>
     assertPassed(bash("git diff HEAD -- gates/commit-gate.mjs | grep -n -- '--no-verify'"), 'diff | grep -n --no-verify'));
   test('git log -S --no-verify --oneline -- commit-gate.mjs 放行', () =>
@@ -277,13 +358,11 @@ describe('第二輪 must-fix——GIT_COMMIT_LOOSE_RE 保底不能誤攔唯讀�
     assertPassed(ps("git diff -- gates/commit-gate.mjs | Select-String -Pattern '--no-verify'"), 'ps diff | Select-String'));
 });
 
-// 第三輪對抗複審 must-fix：GIT_COMMIT_LOOSE_RE 少了 must-fix 前的兩側邊界（(?<![=-])…(?!-)），
-// commit-gate.mjs、src/commit-utils.ts、.git/hooks/pre-commit、--grep=commit 這類檔名/樣式裡的
-// "commit" 字樣會誤觸前置關卡，讓 hooksPathBypass／三道檔案閘門這兩個「對整條指令字串」的判定連坐
-// 擋下唯讀指令。用 staged 了 .env 的 repo 測試——staging 乾淨時三道閘門本來就 fail-open、測不出
-// 「連坐擋下」這個問題，只有 staging 不乾淨時才會真的暴露（改前這些純檔名唯讀指令會被冠上
-// 「staged 含 secrets」的擋下理由，儘管跟這條指令毫無關係）。
-describe('第三輪 must-fix——GIT_COMMIT_LOOSE_RE 邊界收緊：唯讀指令連檔名都不該誤觸前置關卡（staged .env）', () => {
+// 前置關卡的兩側邊界（(?<![=-])…(?!-)）：commit-gate.mjs、src/commit-utils.ts、.git/hooks/pre-commit、
+// --grep=commit 這類檔名/樣式裡的 "commit" 字樣不誤觸前置關卡，否則 hooksPath／三道檔案閘門這兩個
+// 「對整條指令字串」的判定會連坐擋下唯讀指令。用 staged 了 .env 的 repo 測試——staging 乾淨時三道閘門
+// 本來就 fail-open，只有 staging 不乾淨時才量得到「連坐擋下」。
+describe('前置關卡邊界：唯讀指令連檔名都不該誤觸（staged .env）', () => {
   let filenameRepo;
   before(() => {
     filenameRepo = mkdtempSync(join(tmpdir(), 'cg-filename-'));
@@ -318,11 +397,9 @@ describe('第三輪 must-fix——GIT_COMMIT_LOOSE_RE 邊界收緊：唯讀指�
     assertPassed(fps('git config --get core.hooksPath; Get-Content .git/hooks/pre-commit'), 'ps config --get; Get-Content'));
 });
 
-// 第三輪對抗複審 must-fix：hooksPathBypass 改前對整條指令字串做「看到 config…core.hooksPath 就擋」，
-// 就算 staged 是乾淨的、也就算擋下理由跟 staged 內容無關的唯讀查詢，一樣連坐擋下——用一個 staged
-// 了 .env 的 repo 確認：唯讀的 config 查詢不該因為 staging 剛好不乾淨就被冠上「改向 hooksPath」的
-// 罪名（本來就該被 secrets 閘門擋下的話，理由應該是 secrets，不是 hooksPath）。
-describe('第三輪 must-fix——hooksPathBypass 只認寫入形式（staged .env，確認不是巧合放行）', () => {
+// 唯讀的 config 查詢不該因為 staging 剛好不乾淨就被冠上「改向 hooksPath」的罪名：沒有 commit 字樣
+// 的查詢根本不進判斷；和真正 commit 混寫時，擋下理由應是 secrets（staged .env），不是 hooksPath。
+describe('hooksPath 唯讀查詢不誤判成改向（staged .env）', () => {
   let secretRepo2;
   before(() => {
     secretRepo2 = mkdtempSync(join(tmpdir(), 'cg-secret2-'));
@@ -347,21 +424,16 @@ describe('第三輪 must-fix——hooksPathBypass 只認寫入形式（staged .e
   });
 });
 
-// 第三輪對抗複審 must-fix：LOOKS_WRAPPED_RE 改前只要整條指令出現任何括號就當「看起來像包了殼」，
-// PowerShell 的 `.Trim()`、bash 的子殼都算——這裡用「唯讀指令裡剛好同時有 git…log（非 commit 子命令）
-// 與帶括號的無關片段、外加 --no-verify 字面值」組合，重現「明明沒有真正的 commit 呼叫，卻因為整條
-// 字串同時湊到括號與 --no-verify 字樣而被擋下」。
-describe('第三輪 must-fix——LOOKS_WRAPPED_RE 收緊：無關括號＋巧合字樣不誤判成包殼繞過', () => {
-  test('git log --grep commit | grep -- --no-verify ; (pwd) 放行', () =>
-    assertPassed(bash('git log --grep commit | grep -- --no-verify ; (pwd)'), 'log --grep commit | grep --no-verify ; (pwd)'));
-  test('PowerShell：git log --grep commit | Select-String -- "--no-verify"; (Get-Date).ToString() 放行', () =>
-    assertPassed(ps('git log --grep commit | Select-String -- "--no-verify"; (Get-Date).ToString()'), 'ps grep commit; (Get-Date).ToString()'));
+// 唯讀指令裡同時有「git … commit」字樣（git log --grep commit）與 --no-verify 字面值：長式 --no-verify
+// 維持「整條指令出現即擋」，不去分辨它是查詢樣式還是真旗標。保守判定、刻意不放行。
+describe('長式 --no-verify 字面值＋git…commit 字樣：保守判定、刻意不放行', () => {
+  test('git log --grep commit | grep -- --no-verify ; (pwd) 擋下（保守判定、刻意不放行）', () =>
+    assertBlockedNoVerify(bash('git log --grep commit | grep -- --no-verify ; (pwd)'), 'log --grep commit | grep --no-verify ; (pwd)'));
+  test('PowerShell：git log --grep commit | Select-String -- "--no-verify"; (Get-Date).ToString() 擋下（保守判定、刻意不放行）', () =>
+    assertBlockedNoVerify(ps('git log --grep commit | Select-String -- "--no-verify"; (Get-Date).ToString()'), 'ps grep commit; (Get-Date).ToString()'));
 });
 
-// 第三輪對抗複審 must-fix：splitChainSegments 引號沒收尾時（segments===null）退回的保底原本只看長式
-// --no-verify、還要 LOOKS_WRAPPED_RE 命中才看，短式 -n 在這條路徑上完全漏看。另外 bash 註解裡的撇號
-// （don't）會被誤判成單引號起頭而讓切段回 null——但既然 -n 本來就在註解之前，退回的保底本來就抓得到，
-// 這裡直接驗證「確實仍會擋下」，不特別區分是靠切段成功還是靠保底。
+// 引號／heredoc 沒收尾（註解裡的撇號、訊息裡的英吋符號）時，短式 -n 不能漏擋。
 describe('第三輪 must-fix——引號/heredoc 沒收尾時，短式 -n 不能漏擋', () => {
   test("bash 註解裡的撇號（# don't run hooks）不能讓 -n 漏擋", () =>
     assertBlockedNoVerify(bash("git commit -n -m wip  # don't run hooks"), 'comment apostrophe + -n'));
@@ -375,10 +447,9 @@ describe('第三輪 must-fix——引號/heredoc 沒收尾時，短式 -n 不能
     assertBlockedNoVerify(bash(`git add -A && git commit -n -m "$(cat <<'EOF'\nfix: 修正 "未收尾字串\nEOF\n)"`), 'unterminated quote text in heredoc + -n'));
 });
 
-// 第三輪對抗複審 must-fix：CMD_C_WRAPPER_RE／SH_C_WRAPPER_RE 改前只認殼名後面緊接 -c／-Command、
-// cmd 後面緊接 /c，`powershell -NoProfile -Command`（Windows 上呼叫工具幾乎都這樣寫）、
-// `pwsh -NoLogo -c`、`bash -lc`／`bash -l -c`、`cmd /d /c` 都認不出來，短式 -n 藏在這些包殼裡就漏擋。
-describe('第三輪 must-fix——包殼旗標組合擴充：更多殼層寫法要能精準展開', () => {
+// 各種包殼旗標組合（powershell -NoProfile -Command、pwsh -NoLogo -c、bash -lc／-l -c、cmd /d /c）
+// 裡的短式 -n 都要擋：所在段的段首是殼程式、不是白名單程式，不屬放行類別。
+describe('包殼旗標組合：殼裡的短式 -n 要擋', () => {
   test('powershell -NoProfile -Command "git commit -n -m x" 要擋', () =>
     assertBlockedNoVerify(bash('powershell -NoProfile -Command "git commit -n -m x"'), 'powershell -NoProfile -Command'));
   test('powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "git commit -n -m x" 要擋', () =>
@@ -393,9 +464,7 @@ describe('第三輪 must-fix——包殼旗標組合擴充：更多殼層寫法�
     assertBlockedNoVerify(bash('cmd /d /c "git commit -n -m x"'), 'cmd /d /c'));
 });
 
-// 第二輪對抗複審 should-fix：findCommitCallsInSegment（現已併入 findGitCallsInSegment）對每個 commit
-// 呼叫都把 rest 收到段尾是平方級——8000 次重複在改前要 7 秒多，改後應在幾百毫秒內完成（含實際 git
-// 子行程開銷），差距夠大不會誤判。
+// 病態輸入（同段大量 git commit 字樣）不能逼近 hook 逾時：3 秒是寬鬆上限（含實際 git 子行程開銷）。
 describe('第二輪 should-fix——病態輸入（同段大量 git commit 字樣）不能逼近逾時', () => {
   test("'git commit '.repeat(8000) 要在 3 秒內判完", () => {
     const t0 = Date.now();
@@ -404,11 +473,10 @@ describe('第二輪 should-fix——病態輸入（同段大量 git commit 字�
   });
 });
 
-// 第四輪對抗複審 must-fix：GIT_COMMIT_LOOSE_RE 帶 /i 比第三輪的邊界收緊還要寬——`--format="COMMIT
-// %ad"`（awk 慣用寫法）、`echo "--- LAST COMMIT ---"`、註解裡的 `Commit`、標題字串裡的
-// `Git commit gate: fix` 這類唯讀指令的大寫/混寫字樣都會誤觸前置關卡，讓 staged 有 secrets 時連坐
-// 擋下。用 staged .env 的夾具才量得到（空 staging 三道閘門天然 fail-open，測不出「連坐擋下」）。
-describe('第四輪 must-fix——GIT_COMMIT_LOOSE_RE 拿掉 /i：大寫/混寫的 COMMIT 字樣不誤觸前置關卡（staged .env）', () => {
+// 前置關卡區分大小寫：`--format="COMMIT %ad"`（awk 慣用寫法）、`echo "--- LAST COMMIT ---"`、註解裡的
+// `Commit`、標題字串裡的 `Git commit gate: fix` 這類唯讀指令的大寫/混寫字樣不誤觸前置關卡，否則
+// staged 有 secrets 時會連坐擋下。用 staged .env 的夾具才量得到（空 staging 三道閘門天然 fail-open）。
+describe('前置關卡區分大小寫：大寫/混寫的 COMMIT 字樣不誤觸（staged .env）', () => {
   let looseRepo;
   before(() => {
     looseRepo = mkdtempSync(join(tmpdir(), 'cg-loose-'));
@@ -439,11 +507,9 @@ describe('第四輪 must-fix——GIT_COMMIT_LOOSE_RE 拿掉 /i：大寫/混寫�
     assertBlocked(lbash('git log -1 --format="commit %h"'), 'control lowercase commit'));
 });
 
-// 第四輪對抗複審 must-fix：tokenizeSeg 不認 PowerShell here-string（@'…'@／@"…"@），會被拆成散字
-// token——訊息本文裡的裸 git 字樣、條列用的不成對 `1)`/`a)`、表情符號 `:)` 都會讓
-// findGitCallsInSegment 收 rest 提早收工，收尾的 `'@` 進不了 rest，stripMessageValues 的 here-string
-// 規則對不上訊息本文，PowerShell 運算子（-and/-join/-not…）被當成 --no-verify/-n 的組合旗標掃描。
-describe('第四輪 must-fix——tokenizeSeg 認得 PowerShell here-string，訊息裡的 -and/-join/-not/括號/表情符號不誤擋', () => {
+// PowerShell here-string 訊息（-m @'…'@／@"…"@）整段挖掉，訊息裡的 -and/-join/-not、條列括號、表情
+// 符號、裸 git 字樣都不參與旗標判斷。
+describe('PowerShell here-string 訊息裡的 -and/-join/-not/括號/表情符號不誤擋', () => {
   test('-and 串接 + 條列 1)/2) 放行', () =>
     assertPassed(ps(`git add -A; git commit -m @'\nfix(filter): 篩選條件改用 -and 串接\n\n驗過兩種情況：1) 空值 2) 非空值\n'@`), '-and + 條列'));
   test('-join 欄位 + 條列 a)/b)/c) 放行', () =>
@@ -458,10 +524,8 @@ describe('第四輪 must-fix——tokenizeSeg 認得 PowerShell here-string，�
     assertPassed(ps(`git add -A; git commit -m @'\nfix(gates): sed -n 不再被當成 --no-verify\n\n- 只看真正的 git 呼叫\n'@`), 'sed -n in message body'));
 });
 
-// 第四輪對抗複審 should-fix：LOOKS_WRAPPED_RE 命中但定位不到 commit 呼叫時的保底，改前用兩段懶惰
-// 匹配（[\s\S]*?…[\s\S]*?）掃整條指令找 --no-verify，指令裡沒有 --no-verify 時耗時隨長度三次方成長，
-// 病態輸入（大量 $(git …)／(git …) 反覆出現）會逼近 hook 逾時。改後應在幾百毫秒內完成。
-describe('第四輪 should-fix——LOOKS_WRAPPED_RE 保底不能逼近逾時（兩種病態形狀）', () => {
+// 病態輸入（大量 $(git …)／(git …) 反覆出現）不能逼近 hook 逾時。
+describe('病態輸入（兩種形狀）不能逼近逾時', () => {
   test("'echo $(git rev-parse HEAD) `git commit`; '.repeat(1600) 要在 3 秒內判完", () => {
     const t0 = Date.now();
     commitGateCheck(bash('echo $(git rev-parse HEAD) `git commit`; '.repeat(1600)));
