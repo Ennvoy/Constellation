@@ -18,3 +18,5 @@
 - 成本：候選為 0 時零 PowerShell（每條指令只多兩次 netstat，約 40–250ms）；候選非 0 時每條多付 2–20 秒（PowerShell 冷啟＋全機 CIM 進程表），只有會起 server 的指令才付。
 - serve.mjs：reap 只碰本 session 的登記、整棵樹（含中間層）都死才刪登記、認不出 session 就不殺不刪；start 撞埠只回報不殺；殺前比對外殼與綁埠進程的建立時間。**subagent 經它起的登記記在 subagent 名下，主 session 的 SessionEnd 收不到**，靠 worker 自己 stop。
 - 兩處失手供後人參考：埠差集補刀在調查期間真的殺過同機另一個 agent 的實驗 server（誤殺不是理論風險）；審查 agent 用命令列子字串過濾殺進程時把自己的 shell 一起殺了——殺進程的過濾條件永遠要先列清單再動手。
+
+更正（見 023）：落地補記「subagent 的登記記在 subagent 名下」前提有誤——subagent 與主 session 共用 session_id，收不到的原因是登記檔位置；結論「worker 收工前自己 stop」不變。
