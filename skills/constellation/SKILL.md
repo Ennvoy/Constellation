@@ -30,7 +30,7 @@ description: 當使用者要啟動新功能開發、想走完整開發工作流�
 2. **`.constellation/` 存在，但 `tickets/` 不存在或裡面沒有任何 `*.md`**：
    - `decisions/grill-close.md` 不存在 → 訪談尚未完成——**即使 `CONTEXT.md` 或 `decisions/` 底下已經有其他內容也一樣**，這份固定決議檔是唯一的機讀完成標記，沒有它一律判定訪談未完成，不能拿其他檔案有內容來腦補「應該問得差不多了」（`decisions/` 有內容不代表訪談開過：「拍板即落檔」通則下，流程外的平時討論也會合法落 decisions/——那些是既有決議背景，不是訪談進度）。
      Lazy Read `references/phase-grill.md`，走增量重訪（機制會自動判斷從哪接，不會重問已拍板的節點）。
-   - `decisions/grill-close.md` 存在、記著大流程，但檔尾沒有「盲點審：已收斂（第 N 輪）」這一行（使用者喊停時寫成「盲點審：使用者喊停（第 N 輪）」，效力相同）→ 訪談收尾已拍板，但獨立盲點審還沒跑完（例如跑到一半換了 session）。不得因為看到 grill-close.md 就當盲點審已經跑完：Lazy Read `references/phase-grill.md`，照「完整性四保險」第 3 點接回盲點審；需要 UI 時畫面製作可同時接續，但 5b 看圖拍板前要收斂。
+   - `decisions/grill-close.md` 存在、記著大流程，但檔尾沒有「盲點審：已收斂（第 N 輪）」這一行（使用者喊停時寫成「盲點審：使用者喊停（第 N 輪）」，效力相同）→ 訪談收尾已拍板，但獨立盲點審還沒跑完（例如跑到一半換了 session）。不得因為看到 grill-close.md 就當盲點審已經跑完：Lazy Read `references/phase-grill.md`，照「完整性四保險」第 3 點接回盲點審，收斂後才進 `references/phase-design.md`／`references/phase-weave.md`。
    - `decisions/grill-close.md` 存在（內容為大小流程、是否需要 UI、高風險標記、必備模組排除、一句話任務摘要五欄；大流程檔尾另有盲點審收斂那一行；`next-round/` 有票且這輪對它們有任何決定時，檔尾另有「下輪待辦」那一行）→ 訪談已完成、尚未拆票。
      Lazy Read `references/phase-weave.md`；若該任務需要 UI 定稿而尚未定稿，weave 會據此轉交
      `references/phase-design.md`，照它接手即可，不必在此另行判斷。
@@ -63,4 +63,5 @@ description: 當使用者要啟動新功能開發、想走完整開發工作流�
   - **AskUserQuestion 彈窗**（Claude Code 端所有提問——開放問題與封閉確認——都走彈窗，一次一題）→ Codex 端沒有這個工具，一律降級為純文字點列格式：一則訊息一題、置於結尾醒目處、推薦排第一並標記；使用者可回數字、回「ok」、或打自由文字。
   - **Workflow 工具（票平行 fan-out）** → Codex 端沒有這個工具，這批票改序列逐張做，不平行。
   - **DesignSync／Claude Design canvas、瀏覽器工具與 Artifact**（②畫面定稿整套判準與降級）→ 不重複列在這裡，寫在 `references/phase-design.md`；判準是「工具此刻在不在」，不是按 runtime 分。
+  - **SendMessage 喚回／Agent 工具起審查員**（大流程獨立盲點審複查輪，決議 028）→ 不重複列在這裡，寫在 `references/phase-grill.md`「完整性四保險」第 3 點；Codex 端沒有這兩個工具，每輪（含複查）一律改派新審查員看決議全集，也沒有最終確認這一步。
   - **SessionEnd 自動收臨時 server** → Codex 端上限 3 秒，`reap` 常收不完（不殺也不刪登記），得靠 `serve.mjs stop --port <p>` 手動收；細節見本檔同目錄 `references/verification-playbook.md`「臨時 server 的起與收」，這裡不重複。

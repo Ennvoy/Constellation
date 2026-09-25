@@ -269,6 +269,11 @@ describe('session-start：決議 024 D1 附則——盲點審未收斂的機器�
     assert.match(ctx, /盲點審尚未收斂/);
     assert.match(ctx, /決議 024|完整性四保險/); // 對齊 phase-grill.md 的處置指引
     assert.match(ctx, /舊規則/, '舊規則已記載跑完時應補行而非要求重跑，措辭要能看到這個例外');
+    // 決議 028：時機規則改成「收斂前不進 design／weave」，換 session 一律改派新審查員看全集
+    // （取代舊規則「需要 UI 時畫面製作可同時接續，5b 看圖拍板前才收斂」那套時機）。
+    assert.match(ctx, /收斂前不進\s*design／weave/);
+    assert.match(ctx, /換了 session 一律改派新審查員看全集/);
+    assert.doesNotMatch(ctx, /畫面製作可同時接續/, '舊規則的時機措辭應已被取代');
   });
 
   test('半形冒號「大小流程:大」也要接受 → 印警示', () => {

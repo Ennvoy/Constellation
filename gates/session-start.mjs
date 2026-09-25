@@ -462,8 +462,9 @@ function buildDesignSentinel(base, root) {
     '  處置：Read skills/constellation/references/phase-design.md，補做步驟 5（直接改專案正式頁面 code）→ 5b（執行端在本地逐一點過每個互動、截圖發私人 Artifact 給使用者看圖拍板；瀏覽器工具或 Artifact 任一缺，退回使用者本地點）→ 7（定稿記錄附逐區塊元件清單、凍結名單與 source 欄）。'].join('\n');
 }
 
-// 決議 024 D1 附則：把「盲點審有沒有真的跑完」從紀律改成機器提醒。grill-close.md 記著大流程時，
-// weave 進場與 5b 看圖拍板前都要求檔尾有收斂行（DESIGN.md §2 保險 3、SKILL.md Step 0）；換 session
+// 決議 024 D1 附則（時機部分已由決議 028 取代，機器提醒本身不變）：把「盲點審有沒有真的跑完」從紀律
+// 改成機器提醒。grill-close.md 記著大流程時，design 進場與 weave 進場都要求檔尾有收斂行
+// （DESIGN.md §2 保險 3、SKILL.md Step 0）；換 session
 // 常把這步無聲跳過（grill-close.md 在、盲點審沒跑完），這裡補一道機器提醒。fail-open：解析異常一律
 // 不叫，不拖垮開場。
 // 對抗複審 M1：真實專案的寫法遠比純文字「大小流程：大」多——欄位名加粗（**大小流程**）、單列
@@ -519,7 +520,8 @@ function buildBlindspotSentinel(base) {
   return '⚠【盲點審尚未收斂】decisions/grill-close.md 記著大流程，但檔尾沒有「盲點審：已收斂（第 N 輪）」' +
     '也沒有「盲點審：使用者喊停（第 N 輪）」——訪談收尾已拍板，但獨立盲點審還沒跑完（例如跑到一半換了 ' +
     `session）。不得因為看到 grill-close.md 就當盲點審已經跑完：Read "${PHASE_GRILL_ABS_PATH}"，` +
-    '照「完整性四保險」第 3 點接回盲點審；需要 UI 時畫面製作可同時接續，但 5b 看圖拍板前要收斂。若這份' +
+    '照「完整性四保險」第 3 點——收斂前不進 design／weave，先接回盲點審（換了 session 一律改派新審查員' +
+    '看全集）。若這份' +
     'grill-close.md 是舊規則寫的（當時收斂才轉交、本來就沒有收斂行）且盲點審其實已經跑完（該檔或決議裡' +
     '已有記載），照實告知使用者，經同意後補上收斂行即可，不必重跑。';
 }
