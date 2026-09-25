@@ -47,9 +47,10 @@ const SECRET = 'test-secret-close-gate';
 const CMD = `node -e "console.log('all green')"`;
 const OUT_LINE = 'all green';
 
-// 造一筆「repoRoot 這個專案根底下、簽章對得上」的合法證據票檔內容。
-function ticketWithEvidence({ repoRoot, filePath, status = 'done' }) {
-  const ts = new Date().toISOString();
+// 造一筆「repoRoot 這個專案根底下、簽章對得上」的合法證據票檔內容。ageMs：證據時間戳往前推多少
+// 毫秒（預設 0＝現在），用來造「簽章合法但已超過新鮮期」的 fixture（見「新鮮度窗口」測試）。
+function ticketWithEvidence({ repoRoot, filePath, status = 'done', ageMs = 0 }) {
+  const ts = new Date(Date.now() - ageMs).toISOString();
   const rel = ticketRelPath(filePath);
   const sig = sign(SECRET, ts, rel, CMD, OUT_LINE, repoRootToken(repoRoot));
   return [
@@ -72,7 +73,7 @@ function ticketNoEvidence(status = 'in-progress') {
   return ['---', `status: ${status}`, '---', '# T-002 noevid', '', '## 驗收條件', '- [x] 條件一', '', '## 驗證證據（關票時由 runner 寫入）', ''].join('\n');
 }
 
-let fakeHome, projRoot, projRootNoBaseline, projRootNoConfig, T1, T1_nb, T2, FZ, FZ_nb, FZ_nc, PAGE, PAGE_nb, PAGE_nc, subDir, anotherWorktree, nonProjectFile;
+let fakeHome, projRoot, projRootNoBaseline, projRootNoConfig, T1, T1_nb, T2, FZ, FZ_nb, FZ_nc, PAGE, PAGE_nb, PAGE_nc, subDir, anotherWorktree, nonProjectFile, NR1;
 
 before(() => {
   fakeHome = mkdtempSync(join(tmpdir(), 'cgate-home-'));
@@ -95,6 +96,11 @@ before(() => {
   writeFileSync(join(projRoot, '.constellation', 'design-baseline.json'), JSON.stringify({ screens: [{ screen: 'Page', kind: 'new' }] }), 'utf8');
   writeFileSync(PAGE, '<div>1</div>', 'utf8');
   subDir = join(projRoot, 'sub');
+
+  // 下輪待辦抽屜（附帶）：跟 tickets/ 平行的暫存區，票號沿用同一套命名慣例。
+  mkdirSync(join(projRoot, '.constellation', 'next-round'), { recursive: true });
+  NR1 = join(projRoot, '.constellation', 'next-round', 'T-901-carryover.md');
+  writeFileSync(NR1, ['---', 'status: open', '---', '# T-901 carryover', ''].join('\n'), 'utf8');
 
   // 專案 B：跟 A 結構相同但**沒有** design-baseline.json（驗 baseline 缺失擋下用）。
   projRootNoBaseline = mkdtempSync(join(tmpdir(), 'cgate-proj-nb-'));
@@ -266,4 +272,98 @@ describe('close-gate：P24——Write／Edit／apply_patch × 凍結／baseline�
       tool_input: { file_path: T2, edits: [{ old_string: 'status: in-progress', new_string: 'status: done' }] },
     }, 'MultiEdit removed-branch');
   });
+});
+
+// 附帶：下輪待辦抽屜（.constellation/next-round/*.md）不驗、不關——只擋「把抽屜裡的票直接標成
+// done」，其他編輯（如改標題、補描述）不受影響。
+describe('close-gate：附帶——下輪待辦抽屜守衛（.constellation/next-round/ 不驗、不關）', () => {
+  test('Edit：把抽屜裡的票改成 status: done → 擋下，訊息點名下輪待辦抽屜', () =>
+    assertBlock(
+      { tool_name: 'Edit', cwd: projRoot, tool_input: { file_path: NR1, old_string: 'status: open', new_string: 'status: done' } },
+      'next-round Edit done',
+      /下輪待辦抽屜/,
+    ));
+
+  test('Write：把抽屜裡的票整份改成 status: done → 擋下', () => {
+    const content = ['---', 'status: done', '---', '# T-901 carryover', ''].join('\n');
+    assertBlock({ tool_name: 'Write', cwd: projRoot, tool_input: { file_path: NR1, content } }, 'next-round Write done', /下輪待辦抽屜/);
+  });
+
+  test('apply_patch：把抽屜裡的票標成 done → 擋下', () => {
+    const patch = `*** Update File: ${NR1}\n@@\n-status: open\n+status: done\n`;
+    assertBlock({ tool_name: 'apply_patch', cwd: projRoot, tool_input: { command: patch } }, 'next-round apply_patch done', /下輪待辦抽屜/);
+  });
+
+  test('Edit：改抽屜裡的票但不涉及 status: done（例如補標題）→ 不受影響，照放行', () =>
+    assertPass(
+      { tool_name: 'Edit', cwd: projRoot, tool_input: { file_path: NR1, old_string: 'carryover', new_string: 'carryover（補充說明）' } },
+      'next-round Edit non-done',
+    ));
+
+  // 對抗審查 should-fix：擋下訊息原本只給一條路（要做就經 weave 搬進 tickets/），沒講「不需要做了」
+  // 這條路，容易誘使代理人在 build 中途把票直接改成 done 或搬進 tickets/ 繞過 weave 與核准。
+  test('Edit：把抽屜裡的票改成 status: done → 擋下訊息也點名 archive/next-round-closed/ 這條出路', () =>
+    assertBlock(
+      { tool_name: 'Edit', cwd: projRoot, tool_input: { file_path: NR1, old_string: 'status: open', new_string: 'status: done' } },
+      'next-round Edit done（archive 出路）',
+      /archive\/next-round-closed\//,
+    ));
+});
+
+// 對抗審查 should-fix：關票的 24 小時新鮮度窗口原本完全沒有邊界測試——簽章合法但太舊，一樣要擋下。
+describe('close-gate：新鮮度窗口邊界（24 小時）', () => {
+  let staleRoot, staleTicket;
+  before(() => {
+    staleRoot = mkdtempSync(join(tmpdir(), 'cgate-stale-'));
+    mkdirSync(join(staleRoot, '.constellation', 'tickets'), { recursive: true });
+    staleTicket = join(staleRoot, '.constellation', 'tickets', 'T-003-stale.md');
+    // 25 小時前：簽章本身合法（用同一套 sign()／repoRootToken 算對），只是超過 24 小時新鮮期。
+    writeFileSync(staleTicket, ticketWithEvidence({ repoRoot: staleRoot, filePath: staleTicket, ageMs: 25 * 60 * 60 * 1000 }), 'utf8');
+  });
+  after(() => rmSync(staleRoot, { recursive: true, force: true }));
+
+  test('簽章合法但最新一筆證據是 25 小時前（超過 24 小時新鮮期）→ 擋下，訊息點名過期', () =>
+    assertBlock(
+      { tool_name: 'Edit', cwd: staleRoot, tool_input: { file_path: staleTicket, old_string: 'x', new_string: 'status: done' } },
+      'close-gate 25h stale',
+      /超過 24 小時新鮮期/,
+    ));
+});
+
+// 對抗審查 should-fix：latestEntry() 依 ts 取最大值那一筆，不是「檔案裡位置最後一筆」——沒有測試證明
+// 過這件事。造一筆合法證據（較早 ts），後面再插一筆 ts 較晚、簽章偽造的證據，驗證仍會被擋下
+// （挑到的是較晚那筆偽造的，不會誤用位置在前的合法筆放行）。
+describe('close-gate：以最新一筆證據（依 ts）為準，不是檔案裡位置最後一筆', () => {
+  let laRoot, laTicket;
+  before(() => {
+    laRoot = mkdtempSync(join(tmpdir(), 'cgate-latest-'));
+    mkdirSync(join(laRoot, '.constellation', 'tickets'), { recursive: true });
+    laTicket = join(laRoot, '.constellation', 'tickets', 'T-004-latest.md');
+    const legitTs = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(); // 2 小時前，合法簽章
+    const legitSig = sign(SECRET, legitTs, ticketRelPath(laTicket), CMD, OUT_LINE, repoRootToken(laRoot));
+    const forgedTs = new Date(Date.now() - 1 * 60 * 60 * 1000).toISOString(); // 1 小時前，比合法那筆更新
+    writeFileSync(laTicket, [
+      '---', 'status: done', '---', '# T-004 latest', '',
+      '## 驗收條件', '- [x] 條件一', '',
+      '## 決議記錄', '',
+      '## 驗證證據（關票時由 runner 寫入）',
+      `- **${legitTs}**`,
+      `  - \`${CMD}\`（exit 0）`,
+      '    ```', `    ${OUT_LINE}`, '    ```',
+      `  - sig: ${legitSig}`,
+      `- **${forgedTs}**`, // 位置在後、時間也較新，但簽章是偽造的
+      `  - \`${CMD}\`（exit 0）`,
+      '    ```', `    ${OUT_LINE}`, '    ```',
+      '  - sig: 0000000000000000000000000000000000000000000000000000000000000000',
+      '',
+    ].join('\n'), 'utf8');
+  });
+  after(() => rmSync(laRoot, { recursive: true, force: true }));
+
+  test('較新一筆是偽造的（簽章不符）→ 擋下，不會誤用位置在前但較舊的合法筆放行', () =>
+    assertBlock(
+      { tool_name: 'Edit', cwd: laRoot, tool_input: { file_path: laTicket, old_string: 'x', new_string: 'status: done' } },
+      'close-gate latest-entry-wins',
+      /簽章核對不符/,
+    ));
 });

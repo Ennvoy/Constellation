@@ -30,14 +30,15 @@ import { commitGateCheck } from '../commit-gate.mjs';
 const GATE = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'commit-gate.mjs');
 const RUNNER = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'verify-runner.mjs');
 
-let repo;
+let repo, gitCfgDir;
 
 before(() => {
   // 第四輪對抗複審 should-fix：本檔多處夾具會 `git add .env`——開發者的全域 excludesFile 只要列了
   // .env（全域 gitignore 範本的常見內容），git add 就會失敗、before() 拋錯，整組測試被取消。比照
   // precommit-install.test.mjs／session-start.test.mjs 的既有隔離手法，指到一個空的暫存全域設定檔，
   // 讓本檔的 git 操作不受開發者機器上的全域設定影響。
-  const emptyGlobalConfig = join(mkdtempSync(join(tmpdir(), 'cg-gitcfg-')), 'gitconfig');
+  gitCfgDir = mkdtempSync(join(tmpdir(), 'cg-gitcfg-')); // 對抗審查 should-fix：先前沒清，每跑一次留一個
+  const emptyGlobalConfig = join(gitCfgDir, 'gitconfig');
   writeFileSync(emptyGlobalConfig, '', 'utf8');
   process.env.GIT_CONFIG_GLOBAL = emptyGlobalConfig;
   process.env.GIT_CONFIG_NOSYSTEM = '1';
@@ -54,6 +55,7 @@ before(() => {
 
 after(() => {
   rmSync(repo, { recursive: true, force: true });
+  try { rmSync(gitCfgDir, { recursive: true, force: true }); } catch {}
 });
 
 const bash = command => ({ tool_name: 'Bash', tool_input: { command }, cwd: repo });
@@ -696,6 +698,32 @@ describe('commit-gate：done 票驗簽往返（runner 簽出證據 → git 原�
     assert.equal(r.status, 1, `應擋下，實際 exit ${r.status}｜${r.stderr.slice(0, 300)}`);
   });
 
+  // 對抗審查 should-fix：只測過「超過 7 天要擋」，沒測過「7 天內要放行」這一側——commit 稽核的新鮮
+  // 期比關票當下寬（7 天，票可能關了幾天才真的 commit），這一側如果被改壞（例如誤傳成 24 小時），
+  // 之前完全測不出來。
+  test('合法：最新一筆證據 2 天前（在 7 天新鮮期內），--precommit 判定放行', () => {
+    const repoDir = makePcRepo();
+    const rootOut = execFileSync('git', ['-C', repoDir, 'rev-parse', '--show-toplevel']).toString('utf8').trim();
+    const repoRoot = precommitRepoRootToken(rootOut);
+    const ticket = join(repoDir, '.constellation', 'tickets', 'T-916-fresh2d.md');
+    const CMD = 'node -e "console.log(1)"';
+    const OUT_LINE = '1';
+    const ts = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(); // 2 天前，在 7 天窗口內
+    const sig = precommitSign(PC_SECRET, ts, precommitTicketRelPath(ticket), CMD, OUT_LINE, repoRoot);
+    writeFileSync(ticket, [
+      '---', 'status: done', '---', '# T-916 fresh2d', '',
+      '## 驗收條件', '- [x] 條件一', '',
+      '## 驗證證據（關票時由 runner 寫入）',
+      `- **${ts}**`,
+      `  - \`${CMD}\`（exit 0）`,
+      '    ```', `    ${OUT_LINE}`, '    ```',
+      `  - sig: ${sig}`, '',
+    ].join('\n'), 'utf8');
+    pcStageTicket(repoDir, ticket);
+    const r = precommitCheck(repoDir, pcHome);
+    assert.equal(r.status, 0, `應放行，實際 exit ${r.status}｜${r.stderr.slice(0, 300)}`);
+  });
+
   test('反例：簽章裡的 repo 根跟實際 repo 不同（跨 repo 重放），--precommit 判定擋下', () => {
     const repoDir = makePcRepo();
     const otherRoot = precommitRepoRootToken(join(tmpdir(), 'cg-some-other-project'));
@@ -716,5 +744,47 @@ describe('commit-gate：done 票驗簽往返（runner 簽出證據 → git 原�
     pcStageTicket(repoDir, ticket);
     const r = precommitCheck(repoDir, pcHome);
     assert.equal(r.status, 1, `應擋下，實際 exit ${r.status}｜${r.stderr.slice(0, 300)}`);
+  });
+});
+
+// 附帶：下輪待辦抽屜（.constellation/next-round/*.md）不驗、不關——只擋 staged 內容把抽屜裡的票
+// 標成 done，抽屜票的其他狀態不受任何三道閘門審查（它們還沒經 weave 收編進 tickets/）。
+describe('commit-gate：附帶——下輪待辦抽屜守衛（.constellation/next-round/ 不驗、不關）', () => {
+  let nrRepo;
+  before(() => {
+    nrRepo = mkdtempSync(join(tmpdir(), 'cg-nextround-'));
+    execFileSync('git', ['init', '-q'], { cwd: nrRepo });
+    execFileSync('git', ['config', 'user.email', 'a@b.c'], { cwd: nrRepo });
+    execFileSync('git', ['config', 'user.name', 'test'], { cwd: nrRepo });
+    mkdirSync(join(nrRepo, '.constellation', 'next-round'), { recursive: true });
+  });
+  after(() => rmSync(nrRepo, { recursive: true, force: true }));
+  const nrBash = (command) => ({ tool_name: 'Bash', tool_input: { command }, cwd: nrRepo });
+
+  test('staged 的抽屜票標成 done → 擋下，訊息點名下輪待辦抽屜，也點名 archive/next-round-closed/ 這條出路', () => {
+    const p = join(nrRepo, '.constellation', 'next-round', 'T-901-carryover.md');
+    writeFileSync(p, ['---', 'status: done', '---', '# T-901 carryover', ''].join('\n'), 'utf8');
+    execFileSync('git', ['add', p], { cwd: nrRepo });
+    try {
+      const r = commitGateCheck(nrBash('git commit -m "x"'));
+      assert.equal(r.block, true, `應擋下，實際 ${JSON.stringify(r).slice(0, 200)}`);
+      assert.match(r.message, /下輪待辦抽屜/, `訊息應點名下輪待辦抽屜，實際：${r.message}`);
+      // 對抗審查 should-fix：擋下訊息原本只給一條路（要做就經 weave 搬進 tickets/），沒講「不需要
+      // 做了」這條路，容易誘使代理人繞過 weave 與核准直接把票搬進 tickets/ 或改成 done。
+      assert.match(r.message, /archive\/next-round-closed\//, `訊息應點名 archive/next-round-closed/，實際：${r.message}`);
+    } finally {
+      execFileSync('git', ['rm', '--cached', '-f', p], { cwd: nrRepo, stdio: 'ignore' }); // 清 staging，不影響本區塊下一例
+    }
+  });
+
+  test('staged 的抽屜票不是 done（例如 open）→ 不受影響，照放行', () => {
+    const p = join(nrRepo, '.constellation', 'next-round', 'T-902-carryover.md');
+    writeFileSync(p, ['---', 'status: open', '---', '# T-902 carryover', ''].join('\n'), 'utf8');
+    execFileSync('git', ['add', p], { cwd: nrRepo });
+    try {
+      assertPassed(nrBash('git commit -m "x"'), 'next-round open staged');
+    } finally {
+      execFileSync('git', ['rm', '--cached', '-f', p], { cwd: nrRepo, stdio: 'ignore' });
+    }
   });
 });

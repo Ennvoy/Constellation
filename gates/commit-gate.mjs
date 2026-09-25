@@ -21,30 +21,32 @@
 //      對應防護落在本檔「done 票稽核」＋獨立的「關票刷卡機」（gates/close-gate.mjs，票標 done 時檢查
 //      驗證證據存在且新鮮），兩層責任分開：close-gate 管「改檔當下」、commit-gate 管「進歷史前兜底」。
 //   2) 原本 secrets／驗證垃圾判定抽在共用檔 commit-gate-core.mjs（供 git 原生 pre-commit 對應檔
-//      flow-precommit.mjs 共用），故本檔內聯全部判定邏輯，改為單檔自足，不再依賴外部 core 檔。
-//      PreToolUse 只攔得到 Claude Code 發起的 commit，人在終端機手打的 commit 要靠 git 原生 pre-commit：
-//      不另立執行體，本檔提供 `--precommit` 入口（見下方 runPrecommit），由 gates/precommit-install.mjs
-//      冪等裝進 .git/hooks/pre-commit。兩條呼叫路徑共用同一組判定函式，杜絕規則漂移。
+//      flow-precommit.mjs 共用），故本檔內聯全部判定邏輯。PreToolUse 只攔得到 Claude Code 發起的
+//      commit，人在終端機手打的 commit 要靠 git 原生 pre-commit：不另立執行體，本檔提供 `--precommit`
+//      入口（見下方 runPrecommit），由 gates/precommit-install.mjs 冪等裝進 .git/hooks/pre-commit。
+//      兩條呼叫路徑共用同一組判定函式，杜絕規則漂移。
 //   3) 「驗證垃圾」白名單原本 import 自 flow-toolkit/clean-verify-artifacts.mjs（該檔另兼 CLI 清理／
 //      補 .gitignore 職責）。本檔只內聯 isCommitBlockableArtifact 判定所需的最小規則集（Tier A 絕對垃圾
 //      檔名＋已知產物目錄清單），不認 Tier B（散落截圖／影片），避免誤擋使用者故意 commit 的資產。
 //      當初未搬的「清理／補 .gitignore」職責已補齊為 gates/clean-artifacts.mjs，
-//      並反向 import 本檔 export 的規則（單向依賴：本檔仍不 import 任何外部檔）；擋下時的建議動作
-//      相應改為指向該 CLI。
+//      並反向 import 本檔 export 的規則（單向依賴：那支 CLI 才 import 本檔，本檔不回頭 import 它）；
+//      擋下時的建議動作相應改為指向該 CLI。P14 起，done 票稽核改用 createRequire 延遲同步載入
+//      gates/evidence.cjs（見上方檔頭說明），本檔不再是「完全不 import 任何外部檔」，但仍是單向、
+//      延遲、且失敗即擋下的載入，不是把判定邏輯外包出去。
 //   4) 生效範圍門檻由「.flow 存在」改為「.constellation 存在」——僅在已採用 Constellation 工作流的專案
 //      生效，非本工作流專案不受影響（與原檔「非 flow 專案放行」同一設計精神，只是換了目錄名）。
 //
-// R1 證據防偽（done 票稽核用）：與 gates/verify-runner.mjs／gates/close-gate.mjs 的簽章邏輯**逐字元一致
-// 鏡像**（SECRET_PATH／ticketRelPath／FIELD_SEP／computeSignature／repoRootToken，以及簽章涵蓋欄位），
-// 三檔各自內聯一份、不共用 import——安全閘門不依賴另一支腳本的存在／版本；改一份要同步改另兩份。
-// 與另外兩檔的差異僅止於「新鮮度窗口」：關票當下 24 小時、commit 稽核放寬到 7 天（票可能關了幾天
-// 才真的 commit），驗簽核心邏輯完全相同。
+// R1 證據防偽（done 票稽核用）：簽章與解析的唯一實作在 gates/evidence.cjs（P14：三份鏡像合一）。
+// 本檔只在 staged 內容真的把某張票標成 done 時才用 createRequire 同步載入該模組——載入或執行任一步
+// 失敗（缺檔／語法壞掉／丟例外／少了匯出／回傳未知代碼）一律擋下，訊息講明是模組故障、不是繞過
+// 刷卡機（見 verifyTicketEvidence／doneTicketAuditReason）。與 close-gate.mjs 的差異僅止於
+// 「新鮮度窗口」：關票當下 24 小時、commit 稽核放寬到 7 天（票可能關了幾天才真的 commit），
+// 驗簽核心邏輯完全相同（都是呼叫同一個 checkLatestEvidence）。
 import { existsSync, readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { createHmac, timingSafeEqual } from 'node:crypto';
-import { homedir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 
 // 清理 CLI 的絕對路徑（由本檔實際所在目錄推導，不受呼叫時 cwd 影響）——擋下驗證垃圾時指路用。
 const CLEAN_CLI = join(dirname(fileURLToPath(import.meta.url)), 'clean-artifacts.mjs');
@@ -79,7 +81,8 @@ function runPrecommit() {
     if (!existsSync(join(root, '.constellation'))) return exit0(); // 非 Constellation 專案
 
     const staged = stagedFiles(root); // 取不到＝null＝三道全 fail-open
-    const reason = secretsReason(root, staged) || artifactsReason(staged) || doneTicketAuditReason(root, staged);
+    const reason = secretsReason(root, staged) || artifactsReason(staged) || doneTicketAuditReason(root, staged) ||
+      nextRoundReason(root, staged);
     if (reason) {
       process.stderr.write(reason + '\n  （這是 Constellation 的 git pre-commit 兜底；真要跳過：git commit --no-verify）\n');
       process.exit(1);
@@ -98,161 +101,41 @@ function resolveRepoRoot(cwd) {
   return cwd;
 }
 
-// ── 內聯：R1 簽章（與 verify-runner.mjs／close-gate.mjs 鏡像，見檔頭說明）──
-const SECRET_PATH = join(homedir(), '.constellation', 'secret');
+// evidence.cjs 只在真的碰到「staged 內容把某張票標成 done」時才載入（見 doneTicketAuditReason），
+// 用 createRequire 同步載入——ESM 的 import() 是非同步，會讓判定函式變成 Promise，呼叫端漏加 await
+// 就會靜默放行（P14 對抗審查否決的做法）。
+const loadEvidence = () => createRequire(import.meta.url)('./evidence.cjs');
 
-function readSecret() {
-  try {
-    const s = readFileSync(SECRET_PATH, 'utf8').trim();
-    return s || null;
-  } catch {
-    return null;
-  }
-}
-
-function ticketRelPath(p) {
-  const norm = String(p).replace(/\\/g, '/');
-  const m = norm.match(/\.constellation\/tickets\/[^/]+\.md$/i);
-  return m ? m[0] : norm;
-}
-
-function repoRootToken(cwd) {
-  return resolve(cwd).toLowerCase().replace(/\\/g, '/');
-}
-
-const FIELD_SEP = '\u0001';
-function computeSignature(secret, ts, relPath, commandsJoined, lastLine, repoRoot) {
-  const payload = [ts, relPath, commandsJoined, lastLine, repoRoot].join(FIELD_SEP);
-  return createHmac('sha256', secret).update(payload, 'utf8').digest('hex');
-}
-
-function safeHexEqual(a, b) {
-  try {
-    const ba = Buffer.from(String(a), 'hex');
-    const bb = Buffer.from(String(b), 'hex');
-    if (ba.length === 0 || ba.length !== bb.length) return false;
-    return timingSafeEqual(ba, bb);
-  } catch {
-    return false;
-  }
-}
-
-const EVIDENCE_HEADING_RE = /^##\s*驗證證據.*$/m;
-function evidenceSection(content) {
-  const m = content.match(EVIDENCE_HEADING_RE);
-  if (!m) return '';
-  const after = m.index + m[0].length;
-  const rest = content.slice(after);
-  const next = rest.match(/\n##\s/);
-  return next ? rest.slice(0, next.index) : rest;
-}
-
-function splitEntries(section) {
-  const lines = section.split(/\r?\n/);
-  const starts = [];
-  for (let i = 0; i < lines.length; i++) {
-    if (/^-\s*\*\*[^*]+\*\*\s*$/.test(lines[i])) starts.push(i);
-  }
-  const out = [];
-  for (let i = 0; i < starts.length; i++) {
-    const begin = starts[i];
-    const end = i + 1 < starts.length ? starts[i + 1] : lines.length;
-    out.push(lines.slice(begin, end));
-  }
-  return out;
-}
-
-function findLastOutputLine(contentLines, lastCmdIdx) {
-  if (lastCmdIdx < 0) return '';
-  let idx = lastCmdIdx + 1;
-  if (idx < contentLines.length && /^ {4}\(.*\)\s*$/.test(contentLines[idx])) idx++;
-  if (idx < contentLines.length && /^ {4}```\s*$/.test(contentLines[idx])) {
-    let j = idx + 1;
-    const block = [];
-    while (j < contentLines.length && !/^ {4}```\s*$/.test(contentLines[j])) {
-      block.push(contentLines[j]);
-      j++;
-    }
-    for (let k = block.length - 1; k >= 0; k--) {
-      const rawLine = block[k].startsWith('    ') ? block[k].slice(4) : block[k];
-      if (rawLine.trim() !== '') return rawLine;
-    }
-  }
-  return '';
-}
-
-const COMMAND_LINE_RE = /^\s*-\s*`(.+)`（exit\s*-?\d+）\s*$/;
-const SIG_LINE_RE = /^\s*-\s*sig:\s*(\S+)\s*$/;
-
-function parseEntry(linesArr) {
-  const tsMatch = linesArr[0] && linesArr[0].match(/^-\s*\*\*([^*]+)\*\*\s*$/);
-  const ts = tsMatch ? tsMatch[1].trim() : '';
-
-  let sigIdx = -1, sig = null;
-  for (let i = 0; i < linesArr.length; i++) {
-    const m = linesArr[i].match(SIG_LINE_RE);
-    if (m) { sigIdx = i; sig = m[1]; }
-  }
-  const contentLines = sigIdx >= 0 ? linesArr.slice(0, sigIdx) : linesArr.slice();
-
-  const cmds = [];
-  let lastCmdIdx = -1;
-  for (let i = 0; i < contentLines.length; i++) {
-    const m = contentLines[i].match(COMMAND_LINE_RE);
-    if (m) { cmds.push(m[1]); lastCmdIdx = i; }
-  }
-
-  return {
-    ts,
-    sig,
-    commandsJoined: cmds.join('\n'),
-    lastLine: findLastOutputLine(contentLines, lastCmdIdx),
-  };
-}
-
-function latestEntry(section) {
-  let best = null, bestTs = -Infinity;
-  for (const g of splitEntries(section)) {
-    const e = parseEntry(g);
-    const t = Date.parse(e.ts);
-    if (Number.isNaN(t)) continue;
-    if (t > bestTs) { bestTs = t; best = e; }
-  }
-  return best;
-}
-
-// done 票稽核用新鮮度窗口：7 天（比關票當下的 24 小時寬——票可能關了幾天才真的 commit）。
+// done 票稽核用新鮮度窗口：7 天（比關票當下的 24 小時寬——票可能關了幾天才真的 commit），
+// 傳給 evidence.cjs 的 checkLatestEvidence 當 maxAgeMs。
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
-const CLOCK_SKEW_MS = 5 * 60 * 1000;
+
+// evidence.cjs 回傳的六種失敗代碼（no-secret／no-entry／stale／no-sig／unsigned／mismatch）都算
+// 「證據沒過關」，doneTicketAuditReason 用同一句既有訊息回報；除此之外的任何值（載入例外、執行例外、
+// 少了匯出、未知代碼）都算「模組本身故障」，訊息要另外講明，不能讓人誤以為是繞過刷卡機。
+const EVIDENCE_FAIL_CODES = new Set(['no-secret', 'no-entry', 'stale', 'no-sig', 'unsigned', 'mismatch']);
 
 // 驗某張 done 票的最新證據筆是否簽章核對通過且在 7 天新鮮期內。root＝repo 根（resolveRepoRoot 結果），
-// relFsPath＝該票相對 root 的路徑（git 給的 staged 路徑，天生就是這個格式）。
+// relFsPath＝該票相對 root 的路徑（git 給的 staged 路徑，天生就是這個格式）。「載入＋呼叫」evidence.cjs
+// 整段包在同一個 try/catch——任何例外都算模組故障，不讓例外一路丟到 pre-tool-use.mjs 的 fail-open
+// catch（見該檔）而被誤判成「沒事，放行」；回傳值不是 'ok' 也不是已知失敗代碼時同樣視為模組故障。
+// 回傳：'ok'（放行）｜'fail'（證據沒過關）｜'module-error'（模組故障，稽核暫停）。
 function verifyTicketEvidence(content, relFsPath, root) {
-  const secret = readSecret();
-  if (!secret) return false; // fail-closed：沒有 secret 一律視為未過關
-
-  const section = evidenceSection(content);
-  const entry = section ? latestEntry(section) : null;
-  if (!entry) return false;
-
-  const now = Date.now();
-  const t = Date.parse(entry.ts);
-  const fresh = !Number.isNaN(t) && (now - t <= SEVEN_DAYS_MS) && (now - t >= -CLOCK_SKEW_MS);
-  if (!fresh) return false;
-
-  if (!entry.sig || entry.sig === 'unsigned') return false;
-
-  const relPath = ticketRelPath(relFsPath);
-  const repoRoot = repoRootToken(root);
-  const expected = computeSignature(secret, entry.ts, relPath, entry.commandsJoined, entry.lastLine, repoRoot);
-  return safeHexEqual(expected, entry.sig);
+  let code;
+  try {
+    code = loadEvidence().checkLatestEvidence(content, relFsPath, root, SEVEN_DAYS_MS);
+  } catch {
+    return 'module-error';
+  }
+  if (code === 'ok') return 'ok';
+  return EVIDENCE_FAIL_CODES.has(code) ? 'fail' : 'module-error';
 }
 
 // ── 內聯：驗證垃圾白名單判定（原 flow-toolkit/clean-verify-artifacts.mjs 的最小子集，見去 Flow 化紀錄③）──
 // 只認 Tier A（絕對垃圾）＋已知產物目錄；不含原檔的 Tier B（散落截圖/影片，需另查 git untracked 才清），
 // 避免在 commit-gate 這種輕量判定裡誤擋使用者故意 commit 的資產。
 // 這組規則對外 export：gates/clean-artifacts.mjs 單向 import 沿用，確保「擋下的」與「清掉的」永遠同一套
-// 標準、不會各養一份而漂移。本檔仍不 import 任何外部檔（單檔自足的安全閘門紀律不變，見去 Flow 化紀錄②）。
+// 標準、不會各養一份而漂移（P14 起 done 票稽核改用延遲載入 gates/evidence.cjs，見去 Flow 化紀錄②）。
 export const ARTIFACT_DIRS = new Set([
   'test-results', 'playwright-report', '.playwright',     // @playwright/test
   '.playwright-mcp', 'playwright-mcp-output',             // @playwright/mcp 操作殘留
@@ -353,6 +236,34 @@ function artifactsReason(staged) {
 
 const TICKET_PATH_RE = /(^|[\\/])\.constellation[\\/]tickets[\\/][^\\/]+\.md$/i;
 const STATUS_DONE_RE = /^\s*status\s*:\s*done\s*(?:#.*)?$/im;
+// 「下輪待辦」抽屜（附帶，鏡像 close-gate.mjs 同名規則）：出貨時開給下一輪的候選票暫存區，不算
+// 這一輪的 tickets/，不驗、不關——要做就先經 weave 原樣搬進 tickets/。這裡只擋「staged 內容把抽屜
+// 裡的票標成 done」這個動作，不驗簽章（本來就不該驗——這些票還沒經過 weave 收編）。
+const NEXT_ROUND_PATH_RE = /(^|[\\/])\.constellation[\\/]next-round[\\/][^\\/]+\.md$/i;
+
+// staged 裡有下輪待辦抽屜的票被標成 done → 直接擋（不驗簽章）。root／staged 與其餘三道閘門共用同一份。
+function nextRoundReason(root, staged) {
+  if (!staged) return null;
+  const hits = [];
+  for (const p of staged) {
+    if (!NEXT_ROUND_PATH_RE.test(p)) continue;
+    let content = null;
+    try {
+      content = execFileSync('git', ['-C', root, 'show', ':' + p], { maxBuffer: 1 << 24 }).toString('utf8');
+    } catch {
+      try { content = readFileSync(join(root, p), 'utf8'); } catch { content = null; }
+    }
+    if (content == null) continue;
+    if (STATUS_DONE_RE.test(stripBom(content))) hits.push(p);
+  }
+  if (!hits.length) return null;
+  return [
+    'Constellation commit 守門：擋下 commit —— 下輪待辦抽屜（.constellation/next-round/）裡的票被標成 done：',
+    ...hits.map((p) => '    ' + p),
+    '  → 下輪待辦抽屜裡的票不驗、不關；要做先經 weave 搬進 tickets/。',
+    '  → 不需要做了（放棄，或已被本輪別的改動順手解決）：git mv 到 .constellation/archive/next-round-closed/，並在決議記錄寫下原因——不要就地改成 status: done。',
+  ].join('\n');
+}
 
 // staged 裡標 done 的票，逐張驗證據簽章——讀 staged 版本內容（git show :path），失敗才 fallback 磁碟
 // （例如檔案已從 index 移除但還在工作區這種邊緣狀況，寧可再試一次也不要 fail-open 漏掉稽核）。
@@ -362,6 +273,7 @@ function doneTicketAuditReason(root, staged) {
   if (!ticketPaths.length) return null;
 
   const failing = [];
+  let moduleFailed = false;
   for (const p of ticketPaths) {
     let content = null;
     try {
@@ -372,9 +284,21 @@ function doneTicketAuditReason(root, staged) {
     if (content == null) continue; // 兩邊都讀不到 → 跳過（fail-open，不誤擋不存在/已刪的檔案）
     content = stripBom(content);
     if (!STATUS_DONE_RE.test(content)) continue; // 這次 staged 內容沒把它設 done，不必稽核
-    if (!verifyTicketEvidence(content, p, root)) failing.push(p);
+    const result = verifyTicketEvidence(content, p, root);
+    if (result === 'ok') continue;
+    failing.push(p);
+    if (result === 'module-error') moduleFailed = true;
   }
   if (!failing.length) return null;
+  // 模組本身故障（缺檔／語法壞掉／執行例外／少了匯出）跟「證據沒過關」是兩件不同的事，訊息要分開講——
+  // 模組故障不是使用者繞過刷卡機，別誤導成那樣。
+  if (moduleFailed) {
+    return [
+      'Constellation commit 守門：擋下 commit —— 簽章模組 evidence.cjs 載入或執行失敗，done 票稽核暫停' +
+        '（這是模組本身的故障，不是繞過刷卡機判定）；確認 gates/evidence.cjs 存在且正常後再重試：',
+      ...failing.map((p) => '    ' + p),
+    ].join('\n');
+  }
   return [
     'Constellation commit 守門：擋下 commit —— staged 的 done 票證據驗簽失敗——可能是繞過刷卡機直接改檔；請跑 verify-runner 重新取證再 commit：',
     ...failing.map((p) => '    ' + p),
@@ -467,14 +391,16 @@ export function commitGateCheck(input) {
     ].join('\n'));
   }
 
-  // ── 三道閘門 ──
-  const staged = stagedFiles(root); // 取一次，三道共用；取不到＝null＝三道 fail-open
+  // ── 三道閘門（＋附帶的下輪待辦抽屜守衛）──
+  const staged = stagedFiles(root); // 取一次，全部共用；取不到＝null＝全部 fail-open
   const secret = secretsReason(root, staged);
   if (secret) return BLOCK(secret);
   const artifact = artifactsReason(staged);
   if (artifact) return BLOCK(artifact);
   const doneAudit = doneTicketAuditReason(root, staged);
   if (doneAudit) return BLOCK(doneAudit);
+  const nextRound = nextRoundReason(root, staged);
+  if (nextRound) return BLOCK(nextRound);
 
   return PASS;
 }

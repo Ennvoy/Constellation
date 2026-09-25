@@ -18,10 +18,15 @@
 // 一律從票檔自己的絕對路徑切出來（見 ticketRootFromPath），不依賴 hook 傳進來的 cwd——hook 的 cwd
 // 可能是子目錄或另一個 worktree，跟簽出證據當下的 repo 根對不上，會把合法證據誤判成竄改（見 P3／
 // findProjectRoot：其餘讀 .constellation 底下設定檔的地方，root 一律從目標檔所在目錄往上找）。
-// **鏡像提醒**：本檔的簽章建構邏輯（SECRET_PATH／ticketRelPath／FIELD_SEP／computeSignature／
-// repoRootToken，以及簽章涵蓋的欄位定義）與 gates/verify-runner.mjs 的簽章邏輯、gates/commit-gate.mjs
-// 的 done 票稽核驗簽邏輯必須逐字元一致，三檔各自內聯一份（不共用 import）——這是安全閘門，不依賴
-// 另一支腳本的存在／版本；改一份要同步改另兩份。
+// 簽章與解析的唯一實作在 gates/evidence.cjs（P14：三份鏡像合一）：本檔只在「碰到 done 票」（目標是
+// 票檔且要把 status 設為 done）時才用 createRequire 同步載入該模組並呼叫 checkLatestEvidence——
+// 載入或執行任一步失敗（缺檔／語法壞掉／丟例外／少了匯出／回傳未知代碼）一律 fail-closed 擋下，
+// 訊息講明是模組故障、不是繞過刷卡機（見 verifyEvidence／evidenceModuleFailureMessage）。
+//
+// 下輪待辦抽屜守衛（DESIGN.md §5，決議 027）：Write／Edit／apply_patch 把 `.constellation/next-round/`
+// 裡的票標成 `status: done` 一律擋下——那些票還沒經 weave 收編進 `tickets/`，不驗、不關；要做先經
+// weave 搬進 `tickets/`，不需要做了則搬進 `archive/next-round-closed/`（見 checkNextRoundGuard／
+// nextRoundMessage）。此檢查與上面的 done 票檢查、下面的定稿凍結守衛各自獨立觸發。
 //
 // 定稿 UI 凍結守衛（DESIGN.md §3 第 4 點／§5）：另外讀取 `.constellation/design-frozen.json`
 // 的 frozen 陣列，命中名單的目標檔案一律擋下編輯（Write／Edit／apply_patch 皆涵蓋，不限
@@ -29,10 +34,10 @@
 // 檔不存在或解析失敗一律 fail-open，不影響非 UI 專案；目標本身就是 design-frozen.json 時不受此檢查
 // 限制（否則永遠無法解凍）。此檢查與上面的 done 票檢查各自獨立觸發，互不影響、互不依賴。
 import { readFileSync, existsSync } from 'node:fs';
-import { createHmac, timingSafeEqual } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 
 const stripBom = s => (s && s.charCodeAt(0) === 0xfeff ? s.slice(1) : s);
 
@@ -45,39 +50,20 @@ const TICKET_PATH_RE = /(^|[\\/])\.constellation[\\/]tickets[\\/][^\\/]+\.md$/i;
 const STATUS_DONE_RE = /^\s*status\s*:\s*done\s*(?:#.*)?$/im;
 // apply_patch 的新增行以 `+` 開頭（unified diff 慣例），只有「新增」status: done 才算這次操作把票關掉。
 const STATUS_DONE_ADDED_RE = /^\+\s*status\s*:\s*done\s*(?:#.*)?\s*$/m;
-// 只認「驗證證據」開頭即可，不要求整行只有這四個字——實際模板標題帶括號說明文字
-// （如「## 驗證證據（關票時由 runner 寫入...）」），要求整行精確符合會漏配該 section。
-const EVIDENCE_HEADING_RE = /^##\s*驗證證據.*$/m;
+// 「下輪待辦」抽屜（附帶）：出貨時開給下一輪的候選票暫存區，不算這一輪的 tickets/，不驗、不關——
+// 要做就先經 weave 原樣搬進 tickets/ 再走正常流程。這裡只擋「把抽屜裡的票直接標成 done」這個動作。
+const NEXT_ROUND_PATH_RE = /(^|[\\/])\.constellation[\\/]next-round[\\/][^\\/]+\.md$/i;
 // 「## 驗收條件」section 內、行首未勾選的列項（- [ ]，允許前導縮排——巢狀清單也算數）。
 const ACCEPTANCE_HEADING_RE = /^##\s*驗收條件.*$/m;
 const UNCHECKED_ACCEPTANCE_RE = /^\s*-\s*\[\s\]/m;
+// 關票當下的證據新鮮期（傳給 evidence.cjs 的 checkLatestEvidence 當 maxAgeMs；commit-gate 稽核放寬
+// 到 7 天，見該檔）。
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
-const CLOCK_SKEW_MS = 5 * 60 * 1000; // 容許 5 分鐘時鐘飄移，別把剛寫入的證據當成「未來時間」而判失敗
 
 // R6：驗證 runner 的絕對路徑，攔截訊息裡建議的呼叫指令一律用絕對路徑（不靠使用者猜相對路徑、
 // 不受 hook 執行時 cwd 影響）。
 const GATES_DIR = dirname(fileURLToPath(import.meta.url));
 const VERIFY_RUNNER_ABS_PATH = join(GATES_DIR, 'verify-runner.mjs');
-
-// ---------------------------------------------------------------------------
-// R1 簽章（與 verify-runner.mjs／commit-gate.mjs 鏡像，見檔頭說明）
-// ---------------------------------------------------------------------------
-const SECRET_PATH = join(homedir(), '.constellation', 'secret');
-
-function readSecret() {
-  try {
-    const s = readFileSync(SECRET_PATH, 'utf8').trim();
-    return s || null;
-  } catch {
-    return null;
-  }
-}
-
-function ticketRelPath(p) {
-  const norm = String(p).replace(/\\/g, '/');
-  const m = norm.match(/\.constellation\/tickets\/[^/]+\.md$/i);
-  return m ? m[0] : norm;
-}
 
 // 票檔的絕對路徑必定含 `/.constellation/tickets/<檔名>`，切掉這段之後即為 repo 根——純字串運算，
 // 不查檔案系統，才能與 verify-runner.mjs 各自從同一個票檔路徑切出同一個根（見 P3、檔頭說明）。
@@ -86,28 +72,6 @@ function ticketRootFromPath(absTicketPath) {
   const norm = String(absTicketPath).replace(/\\/g, '/');
   const m = norm.match(/^(.*)\/\.constellation\/tickets\/[^/]+\.md$/i);
   return m ? m[1] : null;
-}
-
-// repo 根識別 token：path.resolve 正規化後轉小寫、反斜線轉正斜線。
-function repoRootToken(cwd) {
-  return resolve(cwd).toLowerCase().replace(/\\/g, '/');
-}
-
-const FIELD_SEP = '\u0001';
-function computeSignature(secret, ts, relPath, commandsJoined, lastLine, repoRoot) {
-  const payload = [ts, relPath, commandsJoined, lastLine, repoRoot].join(FIELD_SEP);
-  return createHmac('sha256', secret).update(payload, 'utf8').digest('hex');
-}
-
-function safeHexEqual(a, b) {
-  try {
-    const ba = Buffer.from(String(a), 'hex');
-    const bb = Buffer.from(String(b), 'hex');
-    if (ba.length === 0 || ba.length !== bb.length) return false;
-    return timingSafeEqual(ba, bb);
-  } catch {
-    return false;
-  }
 }
 
 // 從 hook payload 解析 cwd（多鍵名 fallback）——與 verify-runner 的 --cwd 概念上是同一個「專案根」，
@@ -126,7 +90,8 @@ function resolveCwd(input) {
 // 家目錄判斷順序很關鍵：**先**判斷是否已經走到家目錄、**再**檢查 `.constellation` 存不存在——
 // 家目錄底下的 ~/.constellation/ 只放簽章 secret（不含 config.json，但目錄本身確實存在），順序反過來
 // 會把家目錄誤判成專案根。找不到就回原起點（fail-open，維持「這層就是根」的舊行為，不誤擋）。
-// 與 gates/verify-runner.mjs 的同名函式同一套邏輯，各自內聯一份（見檔頭鏡像說明），不共用 import。
+// 與 gates/verify-runner.mjs 的同名函式同一套邏輯，各自內聯一份，不共用 import——這是決議 023
+// 否決「熱路徑小函式抽共用檔」那條的範圍，不屬於 P14 合一的 evidence.cjs（那支模組只管簽章驗證）。
 function findProjectRoot(from) {
   const home = resolve(homedir()).toLowerCase();
   let dir = resolve(from);
@@ -159,87 +124,6 @@ function hasUncheckedAcceptance(content) {
   return UNCHECKED_ACCEPTANCE_RE.test(section);
 }
 
-// 每筆證據以「- **<ISO 時間戳>**」這種頂層（不縮排）列項起頭，切到下一筆同格式列項或 section 尾端。
-function splitEntries(section) {
-  const lines = section.split(/\r?\n/);
-  const starts = [];
-  for (let i = 0; i < lines.length; i++) {
-    if (/^-\s*\*\*[^*]+\*\*\s*$/.test(lines[i])) starts.push(i);
-  }
-  const out = [];
-  for (let i = 0; i < starts.length; i++) {
-    const begin = starts[i];
-    const end = i + 1 < starts.length ? starts[i + 1] : lines.length;
-    out.push(lines.slice(begin, end));
-  }
-  return out;
-}
-
-// 找「最後一個指令」之後的輸出尾行：可能先有一行保底解碼註記（4 空白縮排、整行括號包住），
-// 跳過它，再看是否緊接 fenced block（4 空白縮排的 ``` 開合），取 block 內最後一個非空白行
-// （去掉 4 空白縮排，還原成 verify-runner 當初寫入的原始字串）——沒有 block 就是空字串。
-function findLastOutputLine(contentLines, lastCmdIdx) {
-  if (lastCmdIdx < 0) return '';
-  let idx = lastCmdIdx + 1;
-  if (idx < contentLines.length && /^ {4}\(.*\)\s*$/.test(contentLines[idx])) idx++;
-  if (idx < contentLines.length && /^ {4}```\s*$/.test(contentLines[idx])) {
-    let j = idx + 1;
-    const block = [];
-    while (j < contentLines.length && !/^ {4}```\s*$/.test(contentLines[j])) {
-      block.push(contentLines[j]);
-      j++;
-    }
-    for (let k = block.length - 1; k >= 0; k--) {
-      const raw = block[k].startsWith('    ') ? block[k].slice(4) : block[k];
-      if (raw.trim() !== '') return raw;
-    }
-  }
-  return '';
-}
-
-const COMMAND_LINE_RE = /^\s*-\s*`(.+)`（exit\s*-?\d+）\s*$/;
-const SIG_LINE_RE = /^\s*-\s*sig:\s*(\S+)\s*$/;
-
-function parseEntry(linesArr) {
-  const tsMatch = linesArr[0] && linesArr[0].match(/^-\s*\*\*([^*]+)\*\*\s*$/);
-  const ts = tsMatch ? tsMatch[1].trim() : '';
-
-  let sigIdx = -1, sig = null;
-  for (let i = 0; i < linesArr.length; i++) {
-    const m = linesArr[i].match(SIG_LINE_RE);
-    if (m) { sigIdx = i; sig = m[1]; }
-  }
-  const contentLines = sigIdx >= 0 ? linesArr.slice(0, sigIdx) : linesArr.slice();
-
-  const cmds = [];
-  let lastCmdIdx = -1;
-  for (let i = 0; i < contentLines.length; i++) {
-    const m = contentLines[i].match(COMMAND_LINE_RE);
-    if (m) { cmds.push(m[1]); lastCmdIdx = i; }
-  }
-
-  return {
-    ts,
-    sig,
-    commandsJoined: cmds.join('\n'),
-    lastLine: findLastOutputLine(contentLines, lastCmdIdx),
-  };
-}
-
-// 最新鮮證據筆：section 內所有證據筆依 ts 取最大值那一筆（不是「隨便找到一個近期時間戳」，
-// 也不是「檔案裡位置最後一筆」——攻擊者插入的假筆若 ts 不是最大，不影響判定；若 ts 是最大，
-// 一樣要通過簽章核對才放行）。
-function latestEntry(section) {
-  let best = null, bestTs = -Infinity;
-  for (const g of splitEntries(section)) {
-    const e = parseEntry(g);
-    const t = Date.parse(e.ts);
-    if (Number.isNaN(t)) continue;
-    if (t > bestTs) { bestTs = t; best = e; }
-  }
-  return best;
-}
-
 // ---------------------------------------------------------------------------
 // 訊息
 // ---------------------------------------------------------------------------
@@ -247,10 +131,19 @@ function runnerHint() {
   return `先跑 node "${VERIFY_RUNNER_ABS_PATH}" --ticket <這張票路徑> [--cwd <專案根>]，讓驗證真的跑一次、把簽章證據落進票裡，再標 done。`;
 }
 
-function missingSecretMessage(filePath) {
+function missingSecretMessage(filePath, secretPath) {
   return [
-    `Constellation 關票刷卡機：擋下——${filePath} 要把 status 設為 done，但讀不到簽章 secret 檔（${SECRET_PATH}）。`,
+    `Constellation 關票刷卡機：擋下——${filePath} 要把 status 設為 done，但讀不到簽章 secret 檔（${secretPath}）。`,
     '  → 沒有 secret 就無法驗證任何簽章，一律視為未過關（fail-closed）；請先跑 install.ps1 產生 secret，再重跑 verify-runner 補一筆簽章證據。',
+  ].join('\n');
+}
+
+// evidence.cjs 載入失敗（缺檔／語法壞掉）或執行失敗（丟例外／少了匯出／回傳未知代碼）一律歸類這條——
+// 是模組本身故障，不是這張票的證據有問題，訊息刻意不講「可能被竄改」，避免誤導成使用者的問題。
+function evidenceModuleFailureMessage(filePath) {
+  return [
+    `Constellation 關票刷卡機：擋下——${filePath} 要把 status 設為 done，但簽章模組 evidence.cjs 載入或執行失敗，關票暫停。`,
+    '  → 這是模組本身的故障（缺檔／語法錯／執行例外），不是這張票的證據有問題；確認 gates/evidence.cjs 存在且正常後再重試關票。',
   ].join('\n');
 }
 
@@ -297,32 +190,56 @@ function uncheckedAcceptanceMessage(filePath) {
   ].join('\n');
 }
 
-// 核心驗證：給定完整票檔內容、檔案路徑、cwd（用於 repo 根 token），判斷驗收條件是否全勾、
-// 最新一筆證據是否新鮮且簽章核對通過。
+function nextRoundMessage(filePath) {
+  return [
+    `Constellation 關票刷卡機：擋下——${filePath} 在「下輪待辦」抽屜（.constellation/next-round/）裡。`,
+    '  → 下輪待辦抽屜裡的票不驗、不關；要做先經 weave 搬進 tickets/。',
+    '  → 不需要做了（放棄，或已被本輪別的改動順手解決）：git mv 到 .constellation/archive/next-round-closed/，並在決議記錄寫下原因——不要就地改成 status: done。',
+  ].join('\n');
+}
+
+// 下輪待辦抽屜守衛：只擋 Write／Edit 把抽屜裡的票直接標成 done 這個動作，其他編輯（改標題、補描述）
+// 不受影響。apply_patch 的抽屜檢查併入 checkApplyPatch 自己的 marker 迴圈（見該函式），不在此重複。
+function checkNextRoundGuard(tool, ti) {
+  if (tool !== 'Write' && tool !== 'Edit') return null;
+  const filePath = String(ti.file_path ?? '');
+  if (!filePath || !NEXT_ROUND_PATH_RE.test(filePath)) return null;
+  const text = tool === 'Write' ? ti.content : (ti.new_string ?? ti.newString);
+  if (typeof text !== 'string' || !STATUS_DONE_RE.test(text)) return null;
+  return BLOCK(nextRoundMessage(filePath));
+}
+
+// evidence.cjs 只在真的碰到「目標是票檔且要把 status 設為 done」時才載入（見上方呼叫端），
+// 用 createRequire 同步載入——ESM 的 import() 是非同步，會讓判定函式變成 Promise，呼叫端漏加
+// await 就會靜默放行（P14 對抗審查否決的做法）。
+const loadEvidence = () => createRequire(import.meta.url)('./evidence.cjs');
+
+// 核心驗證：給定完整票檔內容、檔案路徑、cwd（用於 repo 根推導），判斷驗收條件是否全勾、
+// 最新一筆證據是否新鮮且簽章核對通過。「載入＋呼叫」evidence.cjs 整段包在同一個 try/catch——
+// 缺檔／語法壞掉／執行時丟例外／少了匯出，任何一種壞法都擋下，不讓例外一路丟到頂層的 fail-open
+// catch（見檔尾 stdin handler）而被誤判成「沒事，放行」。
 function verifyEvidence(content, filePath, cwd) {
   if (hasUncheckedAcceptance(content)) return BLOCK(uncheckedAcceptanceMessage(filePath));
 
-  const secret = readSecret();
-  if (!secret) return BLOCK(missingSecretMessage(filePath));
+  let ev, code;
+  try {
+    ev = loadEvidence();
+    const root = ticketRootFromPath(filePath) ?? cwd;
+    code = ev.checkLatestEvidence(content, filePath, root, ONE_DAY_MS);
+  } catch {
+    return BLOCK(evidenceModuleFailureMessage(filePath));
+  }
 
-  const section = sectionOf(content, EVIDENCE_HEADING_RE);
-  const entry = section ? latestEntry(section) : null;
-  if (!entry) return BLOCK(noEvidenceMessage(filePath));
-
-  const now = Date.now();
-  const t = Date.parse(entry.ts);
-  const fresh = !Number.isNaN(t) && (now - t <= ONE_DAY_MS) && (now - t >= -CLOCK_SKEW_MS);
-  if (!fresh) return BLOCK(staleMessage(filePath));
-
-  if (!entry.sig) return BLOCK(missingSigMessage(filePath));
-  if (entry.sig === 'unsigned') return BLOCK(unsignedMessage(filePath));
-
-  const relPath = ticketRelPath(filePath);
-  const repoRoot = repoRootToken(ticketRootFromPath(filePath) ?? cwd);
-  const expected = computeSignature(secret, entry.ts, relPath, entry.commandsJoined, entry.lastLine, repoRoot);
-  if (!safeHexEqual(expected, entry.sig)) return BLOCK(mismatchMessage(filePath));
-
-  return PASS;
+  switch (code) {
+    case 'ok': return PASS;
+    case 'no-secret': return BLOCK(missingSecretMessage(filePath, ev.SECRET_PATH));
+    case 'no-entry': return BLOCK(noEvidenceMessage(filePath));
+    case 'stale': return BLOCK(staleMessage(filePath));
+    case 'no-sig': return BLOCK(missingSigMessage(filePath));
+    case 'unsigned': return BLOCK(unsignedMessage(filePath));
+    case 'mismatch': return BLOCK(mismatchMessage(filePath));
+    default: return BLOCK(evidenceModuleFailureMessage(filePath)); // 未知代碼（含 undefined）一律擋
+  }
 }
 
 // Edit／apply_patch 共用：從磁碟讀「編輯前」的現檔內容來驗證（變更片段裡通常沒有
@@ -353,11 +270,15 @@ function checkApplyPatch(patchText, input) {
   for (let i = 0; i < markers.length; i++) {
     const marker = markers[i];
     if (marker.kind !== 'Update File') continue; // 新增/刪除檔案不會有「既有磁碟證據」可驗證
-    if (!TICKET_PATH_RE.test(marker.path)) continue;
+    const isTicket = TICKET_PATH_RE.test(marker.path);
+    const isNextRound = !isTicket && NEXT_ROUND_PATH_RE.test(marker.path);
+    if (!isTicket && !isNextRound) continue;
 
     const end = i + 1 < markers.length ? markers[i + 1].idx : lines.length;
     const segment = lines.slice(marker.idx, end).join('\n');
     if (!STATUS_DONE_ADDED_RE.test(segment)) continue;
+
+    if (isNextRound) return BLOCK(nextRoundMessage(marker.path)); // 下輪待辦抽屜：不驗、直接擋
 
     const absPath = resolve(cwd, marker.path);
     const r = finalizeDoneCheck(verifyFromDisk(absPath, cwd), segment, cwd, absPath);
@@ -701,6 +622,10 @@ export function closeGateCheck(input) {
   // 現況覆蓋閘門（design-baseline）——攔「定稿凍結」動作，驗改造型畫面的現況結構已送上去。
   const baselineBlock = checkBaselineGuard(tool, ti, input);
   if (baselineBlock) return baselineBlock;
+
+  // 下輪待辦抽屜守衛（附帶）：抽屜裡的票不驗、不關，見 checkNextRoundGuard。
+  const nextRoundBlock = checkNextRoundGuard(tool, ti);
+  if (nextRoundBlock) return nextRoundBlock;
 
   if (tool === 'Write') {
     const filePath = String(ti.file_path ?? '');

@@ -431,7 +431,10 @@ if ($Uninstall) {
 if (-not $Uninstall) {
     $gatesDir = Join-Path $Root 'gates'
     if (Test-Path -LiteralPath $gatesDir) {
-        $mjsFiles = Get-ChildItem -LiteralPath $gatesDir -Filter '*.mjs' -File -ErrorAction SilentlyContinue
+        # P14：gates/evidence.cjs 是 .cjs，-Filter 一次只認一種萬用字元，兩支各查一次再合併
+        # （-LiteralPath 搭 -Include 不會生效，只有 -Filter 或加 -Recurse 才會篩選，故不用 -Include）。
+        $mjsFiles = @(Get-ChildItem -LiteralPath $gatesDir -Filter '*.mjs' -File -ErrorAction SilentlyContinue) +
+                    @(Get-ChildItem -LiteralPath $gatesDir -Filter '*.cjs' -File -ErrorAction SilentlyContinue)
         foreach ($f in $mjsFiles) {
             if (-not $script:NodeAvailable) {
                 $mjsResults.Add([PSCustomObject]@{ File = $f.Name; Ok = $false; Detail = '找不到 node，略過語法檢查' })

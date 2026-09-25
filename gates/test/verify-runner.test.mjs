@@ -567,8 +567,12 @@ describe('verify-runner ×lease：--scope ship 開跑前搶機器鎖，被佔就
 
   test('持有者 pid 已死：零成本判定失效，不必等滿一輪 poll 就立刻接手', async () => {
     const dead = spawnFakeHolder(1);
+    // 對抗審查 should-fix：exit Promise 要在 spawn 後立刻建立、掛上監聽器——holdMs=1 的假持有者
+    // 幾乎立刻退場，若等 waitForHolderPid 那輪 poll 跑完才掛 on('exit')，子行程往往早就結束、
+    // 事件已經發過，這個 Promise 永遠不會 resolve（機器負載高時會直接卡死整個測試檔）。
+    const exited = new Promise(resolve => dead.once('exit', resolve));
     assert.ok(await waitForHolderPid(dead.pid), '假持有者應登記到自己的 pid');
-    await new Promise(resolve => dead.on('exit', resolve));
+    await exited;
     assert.ok(existsSync(holderFilePath()), '假持有者應留下登記檔（它不會自己清）');
 
     const start = Date.now();
@@ -745,8 +749,10 @@ describe('verify-runner ×lease：--scope ship 開跑前搶機器鎖，被佔就
 
   test('失效改名一直失敗（目標路徑被卡住）：仍會遵守 --max-wait，不會無限空轉（S3）', async () => {
     const dead = spawnFakeHolder(1);
+    // 對抗審查 should-fix：理由同前一個案例，exit Promise 要在 spawn 後立刻建立、掛上監聽器。
+    const exited = new Promise(resolve => dead.once('exit', resolve));
     assert.ok(await waitForHolderPid(dead.pid), '假持有者應登記到自己的 pid');
-    await new Promise(resolve => dead.on('exit', resolve));
+    await exited;
     assert.ok(existsSync(holderFilePath()), '假持有者應留下登記檔（它不會自己清）');
 
     // 卡住失效改名：在 invalidate() 要 rename 過去的路徑上預先放一個目錄，rename 會一直失敗。
@@ -779,11 +785,14 @@ describe('verify-runner ×lease：--scope ship 開跑前搶機器鎖，被佔就
         }),
         stdio: ['ignore', 'ignore', 'ignore'],
       });
+      // 對抗審查 should-fix：exit Promise 要在 spawn 後立刻建立——這裡子行程活 800ms，一般情況下
+      // waitForHolderPid 早就完成，但機器負載高時 poll 可能拖久，晚掛監聽器一樣會踩到同一個競態。
+      const exited = new Promise(r => child.once('exit', r));
       assert.ok(await waitForHolderPid(child.pid), '應該搶到鎖並登記');
       const holder = readHolderRaw();
       assert.equal(holder.session, 'inner-codex', 'Codex 從 Claude Code 內被啟動時，兩個 session id 都在，應以 CODEX_SESSION_ID 為準');
       assert.equal(holder.runtime, 'codex');
-      await new Promise(r => child.on('exit', r));
+      await exited;
     } finally {
       try { child && child.kill(); } catch {}
       try { rmSync(proj, { recursive: true, force: true }); } catch {}

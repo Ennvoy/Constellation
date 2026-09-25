@@ -28,10 +28,13 @@
 // ＋repo 根絕對路徑」算 HMAC-SHA256（secret 只存在使用者家目錄、不進 git、不落 repo），證據筆尾附一行
 // `sig: <hex>`。沒有這把 secret 就無法算出合法簽章，手填時間戳因此真的擋不過關票刷卡機（gates/close-gate.mjs）。
 // repo 根這段是防「跨專案重放」——把另一個專案跑出來的合法證據筆整段複製貼到這個專案的票裡，簽章對不上。
-// **鏡像提醒**：本檔的簽章建構邏輯（SECRET_PATH／ticketRelPath／FIELD_SEP／computeSignature／
-// repoRootToken，以及簽章涵蓋的欄位定義）與 gates/close-gate.mjs 的驗簽邏輯、gates/commit-gate.mjs
-// 的 done 票稽核驗簽邏輯必須逐字元一致，三檔各自內聯一份（不共用 import）——關票刷卡機與 commit 守門
-// 是安全閘門，不依賴另一支腳本的存在／版本；改一份要同步改另兩份。
+// 簽章與解析的唯一實作在 gates/evidence.cjs（P14：三份鏡像合一），本檔靜態 import（見下方 import
+// 區塊）：SECRET_PATH／readSecret／ticketRelPath／repoRootToken／computeSignature／COMMAND_LINE_RE
+// 都從那支模組來——runner 是簽證據的來源，模組壞了就讓 runner 直接跑不出來（fail-closed）。這是
+// P14 新增的代價：重構前讀不到 secret 時 runner 照跑、寫 sig: unsigned；現在模組整支壞掉，runner
+// 所有模式（含 --scope ship 全量與機器鎖排隊）都會直接跑不出來——換來的是大聲擋下而非悄悄退化，
+// 代價可接受，但不是「本來就是」。close-gate.mjs／commit-gate.mjs 則是延遲用 createRequire 同步
+// 載入同一支模組（見兩檔檔頭說明），三邊呼叫的是同一份實作，不再是各自內聯一份鏡像。
 //
 // 斷路器（R2）：{cwd}/.constellation/.verify-state.json 記 per-target（票相對路徑或 "ship"）連續失敗
 // 計數；成功歸零、失敗 +1；達 5 次時 exit 2，請使用者拍板，不再盲目重試（見 recordFailure）。
@@ -72,62 +75,34 @@
 import { readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { resolve, join, basename, dirname } from 'node:path';
-import { createHmac, createHash } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
 import {
   readHolder, peekHolder, isPidAlive, myStartedAtMs, acquire as acquireLease, invalidate as invalidateLease,
   invalidateCorrupt as invalidateCorruptLease, release as releaseLease,
   updateShellPid as updateLeaseShellPid, estimateEndFromShipEvidence, formatHolder,
 } from './lease.mjs';
+// 簽章與解析的唯一實作在 gates/evidence.cjs（P14：三份鏡像合一）。runner 是 CLI（不是 hook），
+// 靜態 import——模組壞了就讓 runner 直接跑不出來（fail-closed）。這是 P14 新增的代價，不是既有
+// 精神：重構前讀不到 secret 時 runner 照跑、寫 sig: unsigned，現在模組整支壞掉會讓 runner 所有
+// 模式都跑不出來，含 --scope ship 全量與機器鎖排隊——runner 已經靜態 import 同層的 lease.mjs，
+// 這個代價可以接受，但要照實記為代價（runner 本身仍是簽證據的來源，模組壞掉時讓它直接失敗，
+// 好過帶著壞掉的簽章邏輯繼續跑）。
+// ⚠ 這是具名匯入 CJS，Node 靠 evidence.cjs 的 `module.exports = { a, b, ... }` 這種簡寫（值就是同名
+// 變數）才能靜態推出匯出名稱——evidence.cjs 的 module.exports 若插入「值不是同名變數」的項目（例如
+// `X: 5*60*1000`），它後面的名稱會推不出來，runner 啟動時直接 SyntaxError（大聲失敗，不會靜默放行，
+// 但仍值得避免）。改動 evidence.cjs 的 module.exports 時維持簡寫，或都放最後面。
+import { SECRET_PATH, readSecret, ticketRelPath, repoRootToken, computeSignature, COMMAND_LINE_RE } from './evidence.cjs';
 
 const stripBom = s => (s && s.charCodeAt(0) === 0xfeff ? s.slice(1) : s);
-
-// ---------------------------------------------------------------------------
-// R1 簽章（與 close-gate.mjs／commit-gate.mjs 鏡像，見檔頭說明）
-// ---------------------------------------------------------------------------
-const SECRET_PATH = join(homedir(), '.constellation', 'secret');
-
-function readSecret() {
-  try {
-    const s = readFileSync(SECRET_PATH, 'utf8').trim();
-    return s || null;
-  } catch {
-    return null;
-  }
-}
-
-// 票檔的「相對識別路徑」：從絕對路徑裡截出 `.constellation/tickets/xxx.md` 這一段並統一用 `/`。
-// 不依賴呼叫時的 cwd（cwd 不同、絕對路徑前綴不同，但這一段永遠一樣），兩邊腳本各自從自己拿到的
-// 路徑字串獨立算出來，仍會得到同一個結果——這是簽章能跨檔驗證的關鍵前提。
-function ticketRelPath(p) {
-  const norm = String(p).replace(/\\/g, '/');
-  const m = norm.match(/\.constellation\/tickets\/[^/]+\.md$/i);
-  return m ? m[0] : norm;
-}
-
-// repo 根識別 token：path.resolve 正規化後轉小寫、反斜線轉正斜線——同一台機器上不同大小寫/斜線
-// 風格寫法的同一個路徑，token 仍相同；不同專案的 cwd 一定不同，簽章因此天然綁定 repo（防跨專案重放）。
-function repoRootToken(cwd) {
-  return resolve(cwd).toLowerCase().replace(/\\/g, '/');
-}
-
-// 欄位分隔字元：一般文字與指令輸出裡幾乎不可能出現的控制字元（U+0001, SOH），
-// 用來串接簽章的各欄位、避免欄位邊界混淆。三邊腳本的值與位置必須逐字元一致。
-const FIELD_SEP = '\u0001';
-
-// 簽章涵蓋欄位：ISO 時間戳、票檔相對路徑（或 "ship"）、全部指令以 '\n' 串接、輸出尾行（最後一個指令
-// 的 tail 輸出裡最後一個非空白行；沒有輸出則為空字串）、repo 根絕對路徑 token。
-function computeSignature(secret, ts, relPath, commandsJoined, lastLine, repoRoot) {
-  const payload = [ts, relPath, commandsJoined, lastLine, repoRoot].join(FIELD_SEP);
-  return createHmac('sha256', secret).update(payload, 'utf8').digest('hex');
-}
 
 // 沒給 --cwd 時，從目前目錄往上找專案根：認 `.constellation` 目錄本身存在（不要求 config.json——
 // 見 close-gate.mjs 同名函式的 P3 殘留說明：config.json 要到 weave 階段才生成，只認它會在 design
 // 階段把根找錯）。家目錄判斷順序很關鍵：**先**判斷是否已經走到家目錄、**再**檢查 `.constellation`
 // 存不存在——家目錄底下的 ~/.constellation/ 只放簽章 secret（目錄本身確實存在），順序反過來會把
 // 家目錄誤判成專案根。找不到就回原目錄，讓後面讀 config.json 失敗時給出原本就有的錯誤訊息。與
-// close-gate.mjs 找專案根同一套邏輯，各自內聯一份（見檔頭鏡像說明），不共用 import。
+// close-gate.mjs 找專案根同一套邏輯，各自內聯一份，不共用 import——這是決議 023 否決「熱路徑小函式
+// 抽共用檔」那條的範圍，不屬於 P14 合一的 evidence.cjs（那支模組只管簽章驗證）。
 function findProjectRoot(from) {
   const home = resolve(homedir()).toLowerCase();
   let dir = resolve(from);
@@ -287,11 +262,10 @@ function lastNonBlankLines(text, n) {
 // 兩邊正則因此不再誤配，卻不影響肉眼閱讀；close-gate／commit-gate 完全不動，只要這裡跳脫、簽章也對
 // 跳脫後的文字算，兩邊各自獨立驗證就一致。
 const EVIDENCE_FENCE_LINE_RE = /^```\s*$/;
-const EVIDENCE_CMDLIKE_LINE_RE = /^\s*-\s*`(.+)`（exit\s*-?\d+）\s*$/;
 function escapeEvidenceText(text) {
   return String(text ?? '')
     .split('\n')
-    .map(l => (EVIDENCE_FENCE_LINE_RE.test(l) || EVIDENCE_CMDLIKE_LINE_RE.test(l) ? `​${l}` : l))
+    .map(l => (EVIDENCE_FENCE_LINE_RE.test(l) || COMMAND_LINE_RE.test(l) ? `​${l}` : l))
     .join('\n');
 }
 
