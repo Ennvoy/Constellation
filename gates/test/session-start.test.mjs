@@ -18,10 +18,11 @@ import { fileURLToPath } from 'node:url';
 
 const GATE = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'session-start.mjs');
 
-let nonProj, proj;
+let nonProj, proj, gitCfgDir;
 
 before(() => {
-  const emptyGlobalConfig = join(mkdtempSync(join(tmpdir(), 'ss-gitcfg-')), 'gitconfig');
+  gitCfgDir = mkdtempSync(join(tmpdir(), 'ss-gitcfg-'));
+  const emptyGlobalConfig = join(gitCfgDir, 'gitconfig');
   writeFileSync(emptyGlobalConfig, '', 'utf8');
   process.env.GIT_CONFIG_GLOBAL = emptyGlobalConfig;
   process.env.GIT_CONFIG_NOSYSTEM = '1';
@@ -40,7 +41,7 @@ before(() => {
 });
 
 after(() => {
-  for (const d of [nonProj, proj, ...extraDirs]) { try { rmSync(d, { recursive: true, force: true }); } catch {} }
+  for (const d of [nonProj, proj, gitCfgDir, ...extraDirs]) { try { rmSync(d, { recursive: true, force: true }); } catch {} }
 });
 
 function run(cwd) {
@@ -55,7 +56,7 @@ function run(cwd) {
 // 什麼」段、票內來源軸說明），對抗複審 S3 之後這些測試（grillCloseText／shipReport／帶內文的
 // tickets）改用貼近真實專案的寫法（粗體、表格、標題式、分段），不能再隨便塞合成格式。
 const extraDirs = [];
-function makeProjectFixture({ tickets = [], grillCloseUI = null, grillCloseText = null, decisionsCount = 0, mapContent = null, contextContent = null, frozen = null, shipReport = null } = {}) {
+function makeProjectFixture({ tickets = [], nextRound = [], grillCloseUI = null, grillCloseText = null, decisionsCount = 0, mapContent = null, contextContent = null, frozen = null, shipReport = null } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'ss-fx-'));
   extraDirs.push(dir);
   spawnSync('git', ['init', '-q'], { cwd: dir });
@@ -64,6 +65,10 @@ function makeProjectFixture({ tickets = [], grillCloseUI = null, grillCloseText 
   mkdirSync(join(dir, '.constellation', 'tickets'), { recursive: true });
   mkdirSync(join(dir, '.constellation', 'decisions'), { recursive: true });
   tickets.forEach((content, i) => writeFileSync(join(dir, '.constellation', 'tickets', `T-${i}.md`), content, 'utf8'));
+  if (nextRound.length) {
+    mkdirSync(join(dir, '.constellation', 'next-round'), { recursive: true });
+    nextRound.forEach((content, i) => writeFileSync(join(dir, '.constellation', 'next-round', `N-${i}.md`), content, 'utf8'));
+  }
   if (grillCloseText != null) {
     // 完整覆寫 grill-close.md 內容（用於測「大小流程」欄位與盲點審收斂行的各種寫法）。
     writeFileSync(join(dir, '.constellation', 'decisions', 'grill-close.md'), grillCloseText, 'utf8');
@@ -385,14 +390,6 @@ describe('session-start：決議 024 D4 附則——有票卻沒有訪談收尾�
     assert.match(ctx, /現況矛盾/, 'ship-report 沒涵蓋全部票，不算歸檔做到一半');
   });
 
-  test('例外二：tickets/ 只剩下輪承接票（目標段都註明來源軸）→ 不印', () => {
-    const dir = makeProjectFixture({
-      tickets: ['# T-1\nstatus: open\n\n## 目標\n來源軸：Standards，修正 XXX。\n'],
-    });
-    const ctx = JSON.parse(run(dir).stdout).hookSpecificOutput.additionalContext;
-    assert.doesNotMatch(ctx, /現況矛盾/);
-  });
-
   test('票裡只有部分標了來源軸、其餘沒有 → 不算「只剩承接票」，仍印現況矛盾', () => {
     const dir = makeProjectFixture({
       tickets: [
@@ -432,33 +429,61 @@ describe('session-start：決議 024 D4 附則——有票卻沒有訪談收尾�
     assert.doesNotMatch(ctx, /現況矛盾/);
   });
 
-  test('例外二：來源說明寫在另立的「## 來源」段（不是「## 目標」）→ 仍辨識為承接票，不印', () => {
-    const dir = makeProjectFixture({
-      tickets: ['# T-1\nstatus: open\n\n## 目標\n一般敘述，不含來源軸字樣。\n\n## 來源\n來源軸：Standards\n'],
-    });
-    const ctx = JSON.parse(run(dir).stdout).hookSpecificOutput.additionalContext;
-    assert.doesNotMatch(ctx, /現況矛盾/);
-  });
-
-  test('例外二：寫成「來源：出貨 Standards 軸」而非「來源軸」三字連寫 → 仍辨識為承接票，不印', () => {
-    const dir = makeProjectFixture({
-      tickets: ['# T-1\nstatus: open\n\n## 目標\n來源：出貨 Standards 軸，修正 XXX。\n'],
-    });
-    const ctx = JSON.parse(run(dir).stdout).hookSpecificOutput.additionalContext;
-    assert.doesNotMatch(ctx, /現況矛盾/);
-  });
-
-  // 對抗複審 M3 核心：舊實作要求「全部票都符合同一種例外」，出貨與承接混在一起時兩種都不符、
-  // 整批誤判成矛盾。改成逐票判斷後，兩張票各自被不同例外涵蓋也不該誤報。
-  test('出貨與承接混合：一張已出貨、一張是承接票，各自被不同例外涵蓋 → 不印', () => {
+  // 承接票不再有「來源軸」內容例外——下一輪要做的事一律開進 .constellation/next-round/，
+  // 這裡放的票就算寫著來源軸說明，只要放錯在 tickets/ 一樣算矛盾，訊息要指路正確的落點。
+  test('一張已出貨、一張承接票放錯在 tickets/ → 印現況矛盾，訊息含 next-round', () => {
     const dir = makeProjectFixture({
       tickets: [
         '# T-1\nstatus: done\n', // 檔名 T-0.md：靠出貨報告涵蓋
-        '# T-2\nstatus: open\n\n## 目標\n來源軸：Standards，修正 XXX。\n', // 檔名 T-1.md：承接票
+        '# T-2\nstatus: open\n\n## 目標\n來源軸：Standards，修正 XXX。\n', // 檔名 T-1.md：承接票放錯位置
       ],
       shipReport: '# 出貨報告\n\n## 做了什麼\nT-0 已完成 XXX。\n',
     });
     const ctx = JSON.parse(run(dir).stdout).hookSpecificOutput.additionalContext;
-    assert.doesNotMatch(ctx, /現況矛盾/, '兩張票各自被不同例外涵蓋，混合狀態不該被誤判成矛盾');
+    assert.match(ctx, /現況矛盾/, '承接票放錯在 tickets/ 不再是例外，出貨那張仍靠例外各自判斷，不會蓋過這張');
+    assert.match(ctx, /next-round/, '訊息要指路承接票該放的位置');
+  });
+});
+
+describe('session-start：使用者已拍板的「下輪待辦」抽屜——next-round/ 只報張數，不當成本輪現況', () => {
+  // E4 回歸網：下一輪的承接票放進 next-round/、tickets/ 本輪是空的時，票況要照空專案處理
+  // （0 張＋附抽屜張數），盲點審提醒照常看 grill-close.md 本身，design 哨兵與現況矛盾兩個
+  // 哨兵都只認 tickets/ 有沒有票，next-round/ 不該讓它們誤觸發或誤壓下。
+  test('next-round/ 有票、tickets/ 空、grill-close 大流程需要 UI 且沒有收斂行 → 票況 0 張並附待辦張數、印盲點審提醒、不印 design 哨兵、不印矛盾', () => {
+    const dir = makeProjectFixture({
+      nextRound: ['# T-9\nstatus: open\n\n## 目標\n來源軸：Standards，修正 XXX。\n'],
+      grillCloseText: '# grill-close\n大小流程：大、是否需要 UI：是（照既有架構做）\n',
+    });
+    const ctx = JSON.parse(run(dir).stdout).hookSpecificOutput.additionalContext;
+    assert.match(ctx, /共 0 張票/, 'next-round/ 不算本輪的票，tickets/ 是空的，票況該印 0 張');
+    assert.match(ctx, /下輪待辦 1 張在 \.constellation\/next-round\//, '待辦抽屜張數要附在票況那一行');
+    assert.match(ctx, /盲點審尚未收斂/, '大流程沒有收斂行，盲點審提醒仍要出現');
+    assert.doesNotMatch(ctx, /design 定稿哨兵/, 'tickets/ 是空的（還沒過 weave），design 哨兵不該印');
+    assert.doesNotMatch(ctx, /現況矛盾/, 'tickets/ 是空的，沒有票可矛盾');
+  });
+
+  test('next-round/ 沒有票（或不存在）→ 票況不附待辦張數', () => {
+    const dir = makeProjectFixture({});
+    const ctx = JSON.parse(run(dir).stdout).hookSpecificOutput.additionalContext;
+    assert.doesNotMatch(ctx, /下輪待辦/);
+  });
+
+  // 對抗審查 should-fix：grill-close.md 不存在時（訪談收尾還沒問過那一題），維持舊句「訪談收尾時
+  // 問使用者…」；grill-close.md 已存在時（那一題本輪已經問過、答案記在檔尾），改指向那一行，不要
+  // 讓代理人誤以為「還沒問」而重複詢問使用者。
+  test('next-round/ 有票、沒有 grill-close.md → 票況維持「訪談收尾時問使用者」舊句', () => {
+    const dir = makeProjectFixture({ nextRound: ['# T-9\nstatus: open\n\n## 目標\n來源軸：Standards。\n'] });
+    const ctx = JSON.parse(run(dir).stdout).hookSpecificOutput.additionalContext;
+    assert.match(ctx, /下輪待辦 1 張在 \.constellation\/next-round\/（訪談收尾時問使用者要順便做、留著還是丟掉，不是現在要做的事）/);
+  });
+
+  test('next-round/ 有票、grill-close.md 已存在（本輪已問過那一題）→ 票況改指向 grill-close.md 檔尾那一行', () => {
+    const dir = makeProjectFixture({
+      nextRound: ['# T-9\nstatus: open\n\n## 目標\n來源軸：Standards。\n'],
+      grillCloseText: '# grill-close\n大小流程：小、是否需要 UI：否\n下輪待辦：放棄 T-9\n',
+    });
+    const ctx = JSON.parse(run(dir).stdout).hookSpecificOutput.additionalContext;
+    assert.match(ctx, /下輪待辦 1 張在 \.constellation\/next-round\/（本輪併入哪幾張見 decisions\/grill-close\.md 檔尾「下輪待辦」那一行）/);
+    assert.doesNotMatch(ctx, /訪談收尾時問使用者要順便做/, '這一題本輪已經問過，不該再印成還沒問');
   });
 });

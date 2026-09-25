@@ -525,21 +525,20 @@ function buildBlindspotSentinel(base) {
 }
 
 // 決議 024 D4 附則：`tickets/` 有票卻沒有 `decisions/grill-close.md` 代表這批票沒經過訪談收尾，
-// 措辭對齊 SKILL.md「現況矛盾照實告知」那句；兩種情況除外——出貨歸檔做到一半，或 `tickets/`
-// 只剩出貨時開給下一輪的承接票（辨識方式見 phase-ship.md「發現的處理」）。這句攔不住刻意繞過
+// 措辭對齊 SKILL.md「現況矛盾照實告知」那句；唯一的例外是出貨歸檔做到一半（辨識方式見
+// phase-ship.md「發現的處理」）。使用者已拍板：下一輪要做的事一律開票放進 `.constellation/next-round/`
+// 這個「下輪待辦」抽屜、不進 `tickets/`，故不再有「tickets/ 只剩承接票」這個例外——承接票如果
+// 還放在 tickets/，就是放錯位置，這句會照樣把它算進矛盾並指路正確的落點。這句攔不住刻意繞過
 // 流程直接開票（例如正式站出事時的緊急作戰），只擋無心漏掉的訪談收尾。
 function ticketIdFromFilename(f) {
   const m = f.match(/^([A-Za-z]+-\d+)/); // 票號慣例 T-001，取不到就退回整個檔名 stem
   return m ? m[1] : f.replace(/\.md$/i, '');
 }
 
-// 對抗複審 M3／S1：兩個例外原本各自要求「全部票都符合」、且票號比對用 .includes() 子字串——
-// 子字串比對會讓 T-1 被 T-10 撞號誤判成已涵蓋（S1），「全部符合」則在出貨與承接混在一起時整批
-// 誤判。改成：①逐一抽出完整票號（含範圍展開），用 Set 成員比對，邊界安全不撞號；②逐張票各自
-// 判斷「有沒有交代」，任何一張兩者都不符才算矛盾——混合狀態不會被誤判成整批都沒交代，單張漏
-// 交代也不會被另一張的交代蓋過去。
+// 對抗複審 S1：票號比對原本用 .includes() 子字串，會讓 T-1 被 T-10 撞號誤判成已涵蓋。改成
+// 逐一抽出完整票號（含範圍展開），用 Set 成員比對，邊界安全不撞號。
 
-// 例外一：出貨歸檔做到一半——掃整段「做了什麼」（不只第一行；真實寫法有表格、範圍寫法
+// 例外：出貨歸檔做到一半——掃整段「做了什麼」（不只第一行；真實寫法有表格、範圍寫法
 // 「T-401~T-417」、單一條目列點，只看第一行會漏掉表格與條列式列出的票號）找出涵蓋了哪些票號。
 const TICKET_RANGE_RE = /([A-Za-z]+)-(\d+)\s*[~～–]\s*(?:[A-Za-z]+-)?(\d+)/g;
 const TICKET_TOKEN_RE = /\b[A-Za-z]+-\d+\b/g;
@@ -567,15 +566,6 @@ function collectShipCoveredTicketIds(base) {
   return ids;
 }
 
-// 例外二：tickets/ 只剩出貨時開給下一輪的承接票（phase-ship.md「發現的處理」）。真實寫法有寫在
-// 「## 目標」段，也有另立「## 來源」段，或直接寫「來源：出貨 XXX 軸」不含「來源軸」三字連寫——
-// 不再限定段落，全票搜尋來源說明字樣（比對前同樣先去 markdown 標記，防加粗寫法漏判）。
-const CARRY_OVER_RE = /來源軸|來源\s*[：:][^\n]*(?:出貨|軸)/;
-
-function isCarryOverTicket(raw) {
-  return CARRY_OVER_RE.test(stripMdMarks(raw));
-}
-
 function buildGrillCloseMismatchSentinel(base) {
   let ticketFiles = [];
   try { ticketFiles = readdirSync(join(base, 'tickets')).filter(f => f.toLowerCase().endsWith('.md')); } catch { ticketFiles = []; }
@@ -583,20 +573,16 @@ function buildGrillCloseMismatchSentinel(base) {
   if (existsSync(join(base, 'decisions', 'grill-close.md'))) return null; // 有訪談收尾，不矛盾
 
   const shipCovered = collectShipCoveredTicketIds(base);
-  const unaccounted = [];
-  for (const f of ticketFiles) {
-    if (shipCovered.has(ticketIdFromFilename(f).toUpperCase())) continue; // 例外一：本輪出貨報告已涵蓋
-    const raw = readTextSafe(join(base, 'tickets', f));
-    if (raw && isCarryOverTicket(raw)) continue; // 例外二：承接票
-    unaccounted.push(f);
-  }
+  const unaccounted = ticketFiles.filter(f => !shipCovered.has(ticketIdFromFilename(f).toUpperCase())); // 例外：本輪出貨報告已涵蓋
   if (!unaccounted.length) return null;
 
   return '⚠【現況矛盾】tickets/ 有票，但 decisions/grill-close.md 不存在——這批票沒經過訪談收尾，' +
-    '照實告知使用者這個落差，不自行腦補跳過。出貨歸檔做到一半、或票是下一輪的承接票時不算矛盾，' +
-    '但這裡的辨識是關鍵字啟發式、不是精確判定：請自行核對 ship-report.md 與各票內容是否真的屬於' +
-    '這兩種例外，不要看到沒印這句就當作已經查證過。這句攔不住刻意繞過流程直接開票（例如正式站' +
-    '出事時的緊急作戰，案例見 Constellation 母本決議 024），只擋無心漏掉的訪談收尾。';
+    '照實告知使用者這個落差，不自行腦補跳過。出貨歸檔做到一半時不算矛盾，但這裡的辨識是關鍵字' +
+    '啟發式、不是精確判定：請自行核對 ship-report.md 是否真的涵蓋這些票，不要看到沒印這句就當作' +
+    '已經查證過。下一輪要做的承接票應該放在 .constellation/next-round/，不放 tickets/——若這裡的' +
+    '票其實是承接票，代表放錯位置，請照實告知使用者並搬過去，不要當它不算矛盾。這句攔不住刻意' +
+    '繞過流程直接開票（例如正式站出事時的緊急作戰，案例見 Constellation 母本決議 024），只擋無心' +
+    '漏掉的訪談收尾。';
 }
 
 // repo root 解析：git rev-parse --show-toplevel，失敗 fallback cwd（與 commit-gate.mjs 鏡像）。
@@ -632,7 +618,20 @@ function buildSummary(root) {
 
   const counts = STATUSES.map(s => `${s} ${buckets[s].length}`).join('、');
   const lines = [];
-  lines.push(`【Constellation 專案現況】共 ${files.length} 張票 — ${counts}${unknown ? `（另有 ${unknown} 張狀態無法辨識）` : ''}`);
+  // 使用者已拍板的「下輪待辦」抽屜：開發或出貨時說「下一輪再做」的事開票放這裡，不進 tickets/、
+  // 不跟這一輪封箱。這裡只報張數，不是要現在做的事——訪談收尾時才問使用者順便做、留著還是丟掉。
+  let nextRoundCount = 0;
+  try { nextRoundCount = readdirSync(join(base, 'next-round')).filter(f => f.toLowerCase().endsWith('.md')).length; } catch { nextRoundCount = 0; }
+  // 對抗審查 should-fix：grill-close.md 已存在時，「訪談收尾時問使用者…」這句已經過期——那一題本輪
+  // 已經問過（答案記在 grill-close.md 檔尾「下輪待辦」那一行，見 phase-grill.md），繼續印同一句會
+  // 誤導成「還沒問」；改指向那一行，抽屜裡剩下的張數才是真的還沒被本輪決定要不要併入的。
+  const closeExists = existsSync(join(base, 'decisions', 'grill-close.md'));
+  const drawerNote = nextRoundCount
+    ? (closeExists
+      ? `；下輪待辦 ${nextRoundCount} 張在 .constellation/next-round/（本輪併入哪幾張見 decisions/grill-close.md 檔尾「下輪待辦」那一行）`
+      : `；下輪待辦 ${nextRoundCount} 張在 .constellation/next-round/（訪談收尾時問使用者要順便做、留著還是丟掉，不是現在要做的事）`)
+    : '';
+  lines.push(`【Constellation 專案現況】共 ${files.length} 張票 — ${counts}${unknown ? `（另有 ${unknown} 張狀態無法辨識）` : ''}${drawerNote}`);
 
   if (buckets['in-progress'].length) {
     lines.push('進行中：');
