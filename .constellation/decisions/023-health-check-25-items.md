@@ -50,3 +50,17 @@
   - P12：022④ 核准彈窗（母本 transcript 6c561432）推薦說明為「把現場已在做的寫成規則」，舉 AI_project_hub 輪次史五條「流程外，無票」為例；那五條全超過 3 檔，其中「接案流程入口修補」動了 migration 0177／0178、標註「無出貨審查（流程外小修）」。
   - 017⑤：transcript 18 次哨兵注入中 17 次發生在「共 0 張票」；AI_project_hub 的定稿記錄命名為 design-freeze／ui-design-frozen，舊觸發條件在該專案永不成立。
   - 020 更正：由 Workflow 派出的 subagent 讀自身環境變數，`CLAUDE_CODE_SESSION_ID` 與主 session 相同、另帶 `CLAUDE_CODE_CHILD_SESSION=1`；https://code.claude.com/docs/en/hooks 以 `agent_id` 區分 subagent；`serve.mjs` 的 `findRoot` 從 cwd 往上找第一個含 `.constellation/` 的目錄。Codex：https://learn.chatgpt.com/docs/hooks（developers.openai.com/codex/hooks 轉址至此）原文「SessionEnd and Interrupt use 1 second by default and support up to 3 seconds」「SessionEnd hooks always run synchronously, even when async is true」；本機 codex-cli 0.155.1 每次啟動印「clamping SessionEnd hook timeout to 3s」；`serve.mjs` 自記全機進程快照最快 5.7 秒、中位 8.0 秒。
+
+## 補充：獨佔工作的執行時機
+
+決定：
+
+- **獨佔工作的執行時機**：`exclusive` 標註的工作（套 migration／改 schema、整庫快照型資料保險、量級壓測）統一在「單獨時段」執行——本輪 fan-out 開工前，或本輪整合全部完成後，且當下沒有其他 worker 在跑寫 DB 檢查的時候；不在序列整合當下做。
+
+原因：
+
+- 依賴接力下，序列整合當下其他 worker 可能仍在平行寫庫，這時做 migration 跟平行寫庫同樣會撞庫；原本 DESIGN.md §4（票頭範例，寫「留到序列整合做」）與 §7（多工政策，寫「序列整合或單獨時段」）兩處說法互相矛盾，與 skill `phase-build.md` 已經在用的「單獨時段」也對不上。
+
+證據：
+
+- 拍板脈絡：母本 session `bcfe2ca2-373c-4737-8458-c4650e23d86c` 追加彈窗，題目原文「標「獨佔」的票（套 migration、改 schema）要什麼時候跑？憲法與 skill 三處說法不一，要統一（會改憲法兩句）」→ 所選選項「統一成「單獨時段」（推薦）」。

@@ -107,7 +107,7 @@
 status: open | in-progress | blocked | done
 blocked-by: T-001            # 依賴關係
 zone: src/auth/**, tests/auth/**   # 檔案界線（可選標註；平行預設走各票獨立 worktree，不再靠 zone 互斥）
-exclusive: 套 migration      # 獨佔（可選標註；隔離不了的 DB 操作，留到序列整合做，見 §7）
+exclusive: 套 migration      # 獨佔（可選標註；隔離不了的 DB 操作，執行時機統一為單獨時段，見 §7）
 
 ## 目標（行為契約，禁寫實作內部路徑/程式碼片段——durability over precision）
 ## 驗收條件（合成階段寫定，逐條可勾）
@@ -181,7 +181,7 @@ exclusive: 套 migration      # 獨佔（可選標註；隔離不了的 DB 操�
 
 ## 7. 多工政策（票平行＋序列整合）
 
-- 合成拆票時**預設每票各配一個 git worktree 平行 fan-out**（Workflow 腳本，worker 用便宜模型）——無依賴的票一律平行跑，不再靠 zone 是否重疊決定能不能平行；`zone`（檔案界線）降為**可選**標註，供人工複核參考，不再是平行判準。三道保護頂住 worktree 平行的風險：①**同檔真的被兩票同時改到**——走既有 merge-conflict 流程處理，不靠 zone 事先避開；②**寫 DB 的檢查照資料隔離鐵則平行跑**——票專屬前綴、只比對自己前綴範圍、禁止整表前後快照比對，平行時跑出的紅先單獨重跑一次再判定是不是產品回歸；本質上隔離不了的操作（套 migration／改 schema、整庫快照型資料保險、量級壓測）在票頭標 `exclusive:`（獨佔），留到序列整合或單獨時段做；起站埠由 weave 逐票指定，瀏覽器驗證用測試執行器自己開的瀏覽器、不搶共用分頁；③**每合併一張票就立刻移除該 worktree**，且每個 worktree 的 `node_modules` 一律用 junction 指回主專案（不整份複製），避免閒置 worktree 拖慢全庫搜尋、佔滿依賴磁碟空間。
+- 合成拆票時**預設每票各配一個 git worktree 平行 fan-out**（Workflow 腳本，worker 用便宜模型）——無依賴的票一律平行跑，不再靠 zone 是否重疊決定能不能平行；`zone`（檔案界線）降為**可選**標註，供人工複核參考，不再是平行判準。三道保護頂住 worktree 平行的風險：①**同檔真的被兩票同時改到**——走既有 merge-conflict 流程處理，不靠 zone 事先避開；②**寫 DB 的檢查照資料隔離鐵則平行跑**——票專屬前綴、只比對自己前綴範圍、禁止整表前後快照比對，平行時跑出的紅先單獨重跑一次再判定是不是產品回歸；本質上隔離不了的操作（套 migration／改 schema、整庫快照型資料保險、量級壓測）在票頭標 `exclusive:`（獨佔）——**執行時機統一為單獨時段，不是序列整合當下**：依賴接力下序列整合期間其他 worker 仍可能平行寫庫，這時做 migration 跟平行時同樣不安全。遇到 `exclusive` 票，暫停派出新 worker，等當下所有還在跑 DB 檢查的 worker 都結束，這張票自己一個獨立做完（worker＋整合都跑完、DB 操作真的落地）才恢復平行派工——可以落在本輪 fan-out 開工前，也可以落在本輪全部整合完之後，只要當下沒有其他 worker 在跑寫 DB 檢查即可；起站埠由 weave 逐票指定，瀏覽器驗證用測試執行器自己開的瀏覽器、不搶共用分頁；③**每合併一張票就立刻移除該 worktree**，且每個 worktree 的 `node_modules` 一律用 junction 指回主專案（不整份複製），避免閒置 worktree 拖慢全庫搜尋、佔滿依賴磁碟空間。
 - **worktree 基底須含本輪產物**：大流程票清單核准即同意一次本機 commit——fan-out 前先 commit 本輪 `.constellation/` 產物與定稿改動（不推送；執行期狀態檔不進）。官方預設從遠端預設分支開 worktree，worker 會看不到未推送的票與凍結名單、凍結守衛在 worker 端因此放行；所以 `install.ps1` 在使用者沒設過時把 Claude Code 使用者層設定 `worktree.baseRef` 寫成 `head`（所有專案的 worktree 都受影響）、卸載時只移除自己寫入的那筆。首次 fan-out 以 worker 分支 reflog 顯示 `Created from HEAD` 驗收，不是就停下回報。worker 開工先確認自己的票檔在工作區，沒有就回報、不開工（Codex 端不讀這項設定，靠這道確認兜底）。
 - **寬改動例外（expand–contract）**：單一機械改動、爆炸半徑跨大半 repo（rename 欄位、共用型別改形、全域 API 簽名變更）時，垂直切片會讓大量 worktree 同時碰同一批檔案、合併時全面互撞——不硬拆，改走三段式：expand（新舊並存、不破壞）→ migrate（按爆炸半徑分批遷移、每批一票 blocked-by expand）→ contract（零殘留後刪舊、blocked-by 全部遷移票）；批次無法獨綠時共用整合分支＋最終 integrate-and-verify 票。細節在 phase-weave.md。
 - **模型分派要逐一落實**：Workflow script 裡沒寫 `model` 的 `agent()` 會默默繼承主迴圈模型，「worker 用便宜模型」不會自動成立——每個 `agent()` 都要顯式指定，並在 script 開頭把各階段模型寫成常數，讓分派意圖看得見。

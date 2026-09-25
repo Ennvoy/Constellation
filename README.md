@@ -213,7 +213,7 @@ Constellation 是一套給 AI 編碼助理用的**開發工作流**。它不是�
 status: open | in-progress | blocked | done
 blocked-by: T-001                  # 依賴關係，可留空
 zone: src/auth/**, tests/auth/**   # 檔案界線（可選標註；平行預設走各票獨立 worktree，不再靠 zone 互斥）
-exclusive: 套 migration           # 獨佔（可選標註；DB 隔離不了的操作才標，需獨立時段做，不與其他票同時跑）
+exclusive: 套 migration           # 獨佔（可選標註；DB 隔離不了的操作才標，執行時機見 DESIGN.md §7）
 
 ## 目標（行為契約，禁寫實作內部路徑／程式碼片段）
 ## 驗收條件（合成階段寫定，逐條可勾）
