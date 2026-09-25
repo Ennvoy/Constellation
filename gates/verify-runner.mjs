@@ -7,7 +7,11 @@
 //   見 ticket-template.md）就跑該清單；沒有就跑 config 的 commands.test 全量——fallback 永遠是全量，
 //   縮圈只因「票裡明寫了」而發生。證據寫回該票檔。
 // --scope ship：不要求 --ticket，跑 commands.test＋commands.journey 全量（票內縮圈清單一律不看），
-//   證據寫入 {cwd}/.constellation/ship-evidence.md（沒有這個檔就自動建立）。
+//   證據寫入 {cwd}/.constellation/ship-evidence.md（沒有這個檔就自動建立）。開跑前先搶跨 session
+//   機器鎖（gates/lease.mjs，決議 026）：搶到才開始跑；被佔就每 5 秒重試、先印一次持有者、之後
+//   每 10 分鐘印一行，`--max-wait <秒，預設 14400＝4 小時>` 逾時用代碼 3 結束（不計入斷路器、不寫
+//   失敗紀錄）；子孫行程重入（環境變數 CONSTELLATION_LEASE_ACQUIRED）視為已持有，不再搶不再等。
+//   --scope ticket 不搶鎖，持有方存在時只印一行提醒，逐票驗證照跑不受影響。
 // --ticket 可以給純票號（如 T-003）：先試直接路徑，找不到就在 .constellation/tickets/ 下
 // glob `<票號>*.md`，唯一命中才用；零命中或多重命中一律報錯並列出候選，不猜。
 // 全部指令 exit 0 才落一筆「## 驗證證據」（時間戳＋各指令＋exit code＋stdout 尾 8 個非空白行＋簽章）；
@@ -70,6 +74,11 @@ import { spawn, spawnSync } from 'node:child_process';
 import { resolve, join, basename, dirname } from 'node:path';
 import { createHmac, createHash } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
+import {
+  readHolder, peekHolder, isPidAlive, myStartedAtMs, acquire as acquireLease, invalidate as invalidateLease,
+  invalidateCorrupt as invalidateCorruptLease, release as releaseLease,
+  updateShellPid as updateLeaseShellPid, estimateEndFromShipEvidence, formatHolder,
+} from './lease.mjs';
 
 const stripBom = s => (s && s.charCodeAt(0) === 0xfeff ? s.slice(1) : s);
 
@@ -132,11 +141,12 @@ function findProjectRoot(from) {
 }
 
 function parseArgs(argv) {
-  const out = { ticket: '', cwd: '', scope: 'ticket' };
+  const out = { ticket: '', cwd: '', scope: 'ticket', maxWait: '' };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--ticket') out.ticket = argv[++i] || '';
     else if (argv[i] === '--cwd') out.cwd = argv[++i] || '';
     else if (argv[i] === '--scope') out.scope = argv[++i] || '';
+    else if (argv[i] === '--max-wait') out.maxWait = argv[++i] || '';
   }
   return out;
 }
@@ -430,7 +440,9 @@ function makeSink() {
 
 // 跑一條指令，回 { stdout, stderr, exitCode, timedOut, error, shellPid }。
 // shellPid 是這條指令的外殼（cmd.exe）pid，S2 補刀的血緣判準要靠它認「這是我起的」。
-function runCommand(cmd, cwd, timeoutMs) {
+// onSpawn（可選）：外殼一 spawn 就拿到 pid 時立刻回呼——ship 範圍拿它更新機器鎖登記的
+// 「目前子指令外殼 pid」（見 main() 呼叫處），與這條指令本身的執行邏輯無關，失敗不影響驗證。
+function runCommand(cmd, cwd, timeoutMs, onSpawn) {
   return new Promise(res => {
     const out = makeSink();
     const err = makeSink();
@@ -445,6 +457,7 @@ function runCommand(cmd, cwd, timeoutMs) {
       env: { ...process.env, PYTHONIOENCODING: 'utf-8', LANG: 'C.UTF-8' },
     });
     currentChild = child;
+    if (onSpawn) { try { onSpawn(child.pid); } catch {} }
 
     const finish = () => {
       if (done) return;
@@ -699,14 +712,225 @@ function appendFailureRecord(content, entryText) {
   return `${content}${sep}\n${entryText}\n`;
 }
 
+// ---------------------------------------------------------------------------
+// 跨 session 機器鎖（決議 026，見 gates/lease.mjs 檔頭）：--scope ship 開跑前搶鎖，被佔就排隊等
+// 對方跑完，免得兩個共用同一支 runner 的專案互相把對方的出貨全量當孤兒殺掉。
+// ---------------------------------------------------------------------------
+const LEASE_MAX_WAIT_SEC_DEFAULT = 4 * 60 * 60; // 4 小時
+// 測試逃生窗（同 CONSTELLATION_VERIFY_TEST_ABS_MAX_MS 的用法）：只給本檔測試覆寫成毫秒級，
+// 不進 config.json、不是使用者可設定的選項。
+const LEASE_POLL_MS = Number(process.env.CONSTELLATION_LEASE_TEST_POLL_MS) || 5000;
+const LEASE_STATUS_MS = Number(process.env.CONSTELLATION_LEASE_TEST_STATUS_MS) || 10 * 60 * 1000;
+// 登記檔壞掉（讀不出來但檔案還在）卡超過這麼久才當失效處理——太短會跟「正在寫入的瞬間」誤判，
+// 太長會讓真的壞掉的登記卡住整輪 ship（見 lease.mjs 的 invalidateCorrupt）。同款測試逃生窗。
+const CORRUPT_STALE_MS = Number(process.env.CONSTELLATION_LEASE_TEST_CORRUPT_STALE_MS) || 30_000;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// 子孫重入判定：環境變數放的是「目前登記持有者的 pid:startedAt」而不是單純的 '1'——只放 '1' 的話，
+// 任何**單純繼承到這個變數**的行程（例如這支測試殼層剛好沿用了舊環境、或這支 runner 本身被當成
+// 別人 commands.test 的一部分跑）都會被誤判成「已持有」而完全跳過搶鎖，鎖形同虛設。改放身分字串後，
+// 只有「目前登記檔真的是這把旗標指的那一筆」才算重入；查不到那份登記（不管是沒人持有還是換了人）
+// 就必須照正常流程重新搶。
+const LEASE_ENV_FLAG = 'CONSTELLATION_LEASE_ACQUIRED';
+const leaseFlagFor = identity => `${identity.pid}:${identity.startedAt}`;
+function isReentrantLease() {
+  const flag = process.env[LEASE_ENV_FLAG];
+  if (!flag) return false;
+  const holder = readHolder();
+  return !!holder && flag === `${holder.pid}:${holder.startedAt}`;
+}
+
+// --scope ticket 不排隊，持有方存在時只印一行提醒（規格要求一行）——逐票驗證不受影響；
+// 順手帶上「紅了怎麼辦」的行動指引，不用另外去 lease list 查。
+function noteShipLeaseIfHeld() {
+  if (isReentrantLease()) return; // 自己就是持有者的子孫，不必提醒自己
+  const holder = readHolder();
+  if (holder && isPidAlive(holder.pid)) {
+    console.error(
+      `提醒：機器鎖目前被別的出貨全量持有中（${holder.root || '不明專案'}，PID ${holder.pid}）——` +
+      '逐票驗證不受影響、照跑；若這次紅了，先等對方結束再重跑一次判定。'
+    );
+  }
+}
+
+// 開跑前搶機器鎖；被佔就排隊等，逾時（預設 4 小時）用代碼 3 結束——不計入斷路器、不寫失敗紀錄，
+// 因為這不是驗證失敗，只是機器一直被佔用。回傳識別物件（供收尾釋放比對）；null 代表不必釋放
+// （子孫重入，或登記目錄寫不進去已 fail-open 照跑）。
+async function acquireShipLease(cwd, maxWaitSec) {
+  if (isReentrantLease()) return null; // 子孫重入：視為已持有，不再搶、不用釋放
+
+  const identity = { pid: process.pid, startedAt: myStartedAtMs() }; // 全程只算一次，見 lease.mjs 檔頭說明
+  const entry = {
+    root: cwd,
+    session: process.env.CODEX_SESSION_ID || process.env.CLAUDE_CODE_SESSION_ID || 'unknown',
+    runtime: process.env.CODEX_SESSION_ID ? 'codex' : process.env.CLAUDE_CODE_SESSION_ID ? 'claude' : 'unknown',
+    pid: identity.pid,
+    startedAt: identity.startedAt,
+    purpose: 'ship 全量驗證',
+    estimatedEndAt: null,
+    grantedAt: null,
+    shellPid: null,
+  };
+  // 每次真的嘗試搶鎖前才重算「預估結束時間」與「grantedAt」（真正搶到的那一刻）——排隊排了很久
+  // 的話，進場那一刻算的估計值輪到時早就過期，一定要在最終寫進登記檔的那次呼叫前重算才準
+  // （見 lease.mjs 檔頭）；grantedAt 同時也是守門訊息「起於 HH:MM」該顯示的時間，不是排隊起點。
+  function tryAcquire() {
+    entry.estimatedEndAt = estimateEndFromShipEvidence(cwd);
+    entry.grantedAt = Date.now();
+    return acquireLease(entry);
+  }
+
+  let result;
+  try {
+    result = tryAcquire();
+  } catch (err) {
+    console.error(`⚠ 機器鎖登記目錄寫不進去（${err && err.message ? err.message : err}），本輪不排隊，直接照跑（視為已開跑）。`);
+    return null; // fail-open：沒有東西要釋放
+  }
+  if (result.ok) {
+    console.error('機器鎖無人佔用，開跑。'); // 這一行本身就是「開跑」訊號，見 phase-ship.md 步驟 1
+    process.env[LEASE_ENV_FLAG] = leaseFlagFor(identity);
+    return identity;
+  }
+
+  const deadline = Date.now() + maxWaitSec * 1000;
+  let announced = false;
+  let lastStatusAt = 0;
+  // 初始化成 Date.now()、不是 0：這是「上次做過較貴檢查」的時間戳，從 0（等同 1970 年）起算的話，
+  // 第一輪迴圈只要持有者還活著就會立刻判定「已經超過 LEASE_STATUS_MS 沒做」而馬上觸發一次
+  // queryProcessTable()（實測會呼叫 PowerShell 枚舉全機行程，動輒數秒）——等於每次排隊一開始就
+  // 平白多等好幾秒，跟這個檢查本來要「每隔 LEASE_STATUS_MS 才多付一次」的設計意圖相反，
+  // 短 --max-wait 時足以把預算耗光而誤判逾時（wave5 對抗複審 S6 測試案例踩過這個坑）。
+  let lastHeavyCheckAt = Date.now();
+  let corruptSince = null; // 第一次看到「登記檔在但讀不出來」的時間
+
+  for (;;) {
+    if (result.corrupt) {
+      // 登記檔存在但解析不出來（多半是寫到一半被打斷，如 taskkill／TaskStop 打在寫檔中途）：
+      // 不能沿用下面的 invalidateLease()——它靠比對 pid／startedAt 判斷「是不是原本那一筆」，
+      // 壞檔案沒有這個身分可比，會誤判成「已經被清掉」而不動手，讓壞檔案卡住不放。
+      if (corruptSince == null) corruptSince = Number.isFinite(result.mtimeMs) ? result.mtimeMs : Date.now();
+      if (!announced) {
+        console.error(`機器鎖登記檔讀不出來（可能正寫到一半），先等最多 ${Math.round(CORRUPT_STALE_MS / 1000)} 秒再視同失效重搶。`);
+        announced = true;
+      }
+      if (Date.now() - corruptSince >= CORRUPT_STALE_MS) {
+        invalidateCorruptLease();
+        corruptSince = null;
+      }
+      if (Date.now() >= deadline) {
+        console.error(`等了 ${Math.round(maxWaitSec / 60)} 分鐘機器鎖登記檔仍讀不出來，先停下（代碼 3，不計入斷路器）。`);
+        process.exit(3);
+      }
+      await sleep(LEASE_POLL_MS);
+      result = tryAcquire();
+      if (result.ok) {
+        console.error('機器鎖搶到了，開跑。');
+        process.env[LEASE_ENV_FLAG] = leaseFlagFor(identity);
+        return identity;
+      }
+      continue;
+    }
+
+    const holder = result.holder;
+    if (!holder) {
+      // holder 讀不到，且不是上面的「壞掉」分支：檔案剛好在這個瞬間消失（被釋放或被別人判失效）。
+      result = tryAcquire();
+      if (result.ok) {
+        // 原持有者正常結束（release() 把登記檔刪了）而不是判失效——這是排隊等待最常見的收尾方式，
+        // 同樣要印「開跑」：這一行是主 session 用來判斷「還能不能中途砍」的訊號（見 phase-ship.md
+        // 步驟 1），不論先前有沒有真的排過隊都要印，沒有這行就沒有訊號可看。
+        console.error('機器鎖搶到了，開跑。');
+        process.env[LEASE_ENV_FLAG] = leaseFlagFor(identity);
+        return identity;
+      }
+      if (Date.now() >= deadline) process.exit(3);
+      await sleep(LEASE_POLL_MS);
+      continue;
+    }
+
+    if (!announced) {
+      console.error(`機器鎖被佔用，排隊等待——\n${formatHolder(holder)}`);
+      announced = true;
+      lastStatusAt = Date.now();
+    }
+
+    // 失效判定：先用零成本的 pid 存活檢查；每隔 LEASE_STATUS_MS（預設 10 分鐘）才多付一次較貴的
+    // 「行程建立時間」比對——防 PID 被系統回收後接出一個剛好同號的無關行程（決議 020 同一套顧慮）。
+    // 兩個時間來源不同（這裡記的是 JS 端用 uptime 反推的估計值，比對的是 CIM 查到的實際建立時間），
+    // 允許 2 秒的量測誤差，不要求毫秒級精確相等。
+    let stale = !isPidAlive(holder.pid);
+    if (!stale && Date.now() - lastHeavyCheckAt >= LEASE_STATUS_MS) {
+      lastHeavyCheckAt = Date.now();
+      const info = queryProcessTable().get(String(holder.pid));
+      if (info && Number.isFinite(info.created) && Number.isFinite(holder.startedAt)) {
+        stale = Math.abs(info.created - holder.startedAt) > 2000;
+      }
+    }
+
+    if (stale) {
+      invalidateLease(holder);
+      result = tryAcquire();
+      if (result.ok) {
+        console.error('原持有者已失效，機器鎖搶到了，開跑。');
+        process.env[LEASE_ENV_FLAG] = leaseFlagFor(identity);
+        return identity;
+      }
+      // 只有真的換了新持有者才重新印一次「排隊等待」——invalidate 沒生效時（例如短暫的
+      // EPERM/EBUSY）現在的登記還是同一個持有者，不必也不該再印一次一模一樣的內容。
+      const stillSame = result.holder &&
+        Number(result.holder.pid) === Number(holder.pid) &&
+        Number(result.holder.startedAt) === Number(holder.startedAt);
+      if (!stillSame) announced = false;
+      if (Date.now() >= deadline) {
+        console.error(`等了 ${Math.round(maxWaitSec / 60)} 分鐘機器鎖仍被佔用，先停下（代碼 3，不計入斷路器）：\n${formatHolder(result.holder || holder)}`);
+        process.exit(3);
+      }
+      // 失效改名可能一直失敗（EPERM/EBUSY 或更罕見的原因），務必先讓出時間、也一定要先過
+      // deadline 檢查才 continue——否則會變成一個不 sleep 也不看逾時的空轉緊迴圈（S3）。
+      await sleep(LEASE_POLL_MS);
+      continue;
+    }
+
+    if (Date.now() >= deadline) {
+      console.error(`等了 ${Math.round(maxWaitSec / 60)} 分鐘機器鎖仍被佔用，先停下（代碼 3，不計入斷路器）：\n${formatHolder(holder)}`);
+      process.exit(3);
+    }
+
+    await sleep(LEASE_POLL_MS);
+    if (Date.now() - lastStatusAt >= LEASE_STATUS_MS) {
+      lastStatusAt = Date.now();
+      console.error(`仍在排隊等機器鎖——\n${formatHolder(holder)}`);
+    }
+    // 這裡只是被動重新整理現況，不能換成 tryAcquire()：tryAcquire() 若剛好在這一刻成功搶到鎖，
+    // 回傳的是 `{ ok: true }`（沒有 holder 欄位），下一輪迴圈頂端的 `if (!holder)` 會誤判成
+    // 「現在沒人持有」而再搶一次——這次一定撞到自己剛寫下的登記而失敗，等於在等自己，直到
+    // 逾時退出、還留下一份沒人釋放的孤兒登記（wave5 對抗審查曾在此踩過一次）。
+    result = peekHolder();
+  }
+}
+
 async function main() {
-  const { ticket, cwd: cwdArg, scope: scopeArg } = parseArgs(process.argv.slice(2));
+  const { ticket, cwd: cwdArg, scope: scopeArg, maxWait: maxWaitArg } = parseArgs(process.argv.slice(2));
   const scope = scopeArg || 'ticket';
   if (scope !== 'ticket' && scope !== 'ship') {
     console.error(`--scope 只能是 ticket 或 ship（收到："${scopeArg}"）`);
     process.exit(1);
   }
   const cwd = cwdArg ? resolve(cwdArg) : findProjectRoot(process.cwd());
+
+  // 跨 session 機器鎖：ship 開跑前搶鎖、被佔就排隊；ticket 不排隊，只在持有方存在時提醒一行。
+  let shipLeaseIdentity = null;
+  if (scope === 'ship') {
+    const maxWaitSec = Number(maxWaitArg) > 0 ? Number(maxWaitArg) : LEASE_MAX_WAIT_SEC_DEFAULT;
+    shipLeaseIdentity = await acquireShipLease(cwd, maxWaitSec);
+    if (shipLeaseIdentity) {
+      // 一處同步釋放，涵蓋所有 process.exit 出口，不必逐一改；釋放前比對識別碼（見 lease.mjs release）。
+      process.on('exit', () => { releaseLease(shipLeaseIdentity); });
+    }
+  } else {
+    noteShipLeaseIfHeld();
+  }
 
   let ticketPath = '';
   let target = '';
@@ -763,7 +987,8 @@ async function main() {
   for (let cmdIndex = 0; cmdIndex < commands.length; cmdIndex++) {
     const cmd = commands[cmdIndex];
     const cmdStartMs = Date.now();
-    const r = await runCommand(cmd, cwd, timeoutMs);
+    const onSpawn = shipLeaseIdentity ? pid => updateLeaseShellPid(shipLeaseIdentity, pid) : undefined;
+    const r = await runCommand(cmd, cwd, timeoutMs, onSpawn);
     const durSec = Math.round((Date.now() - cmdStartMs) / 1000);
     // 每條指令跑完就 reap（含逾時、含失敗）——下面所有 process.exit 出口因此都已清乾淨。
     const afterSnap = snapshotListeners();
