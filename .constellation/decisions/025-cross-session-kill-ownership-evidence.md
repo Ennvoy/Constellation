@@ -25,10 +25,12 @@
 - transcript：`…\AI-project-hub\0866f059-dd15-47a7-91c2-a969fde99ba6\subagents\workflows\wf_a7e39764-773\agent-a605315224437aa48.jsonl`、同目錄 `agent-aa165ad640ba5e71a.jsonl`、`…\crm-system-worktrees-round-0915\f932032b-e7dd-4539-9e7f-ca10c69cff12\subagents\agent-a0b82f20642a9909a.jsonl`。
 - 本次調查全程沒有改動任何 repo 檔案；實驗僅在 scratchpad 起自己的行程，已複查零殘留、實驗腳本已刪除；調查當下機器上沒有需要處理的 headless 殘留。
 
-後續（repo 外，待使用者核准，非本次落地範圍——**複審標記為未解決的缺口，不是可有可無的加分項**：條文這次只改了本 repo 內三處＋本檔，真正下令去殺的來源沒改；crm 每個新 session 開場就會載入下面兩份，`verification-playbook.md` 只在 build 階段才進 context，主線收工當下根本不在場，兩邊衝突時 agent 會照信任順位更高的全域規則走——不改這三處，同一種誤殺會重演）：
-- crm-system 記憶檔 `feedback-kill-orphan-processes.md`「09-23 新形狀」段需改寫成「別碰，那多半是別的 session 正在用」；「09-22 反例」段「啟動時間早於本 session 才算別人的」也要一併改掉——那同樣是拿啟動時間判斷歸屬，跟本決議的三種證據互相矛盾。
-- crm 整合員 brief 範本（T-133）刪掉「收工必殺帶 `ms-playwright` 的 `chrome-headless-shell`」。
-- 全域 `~/.claude/CLAUDE.md`「可以直接殺」條的測試 runner 殘留一項，補上前提「父行程要實查已死；命令列、程式名相同、啟動時間早晚、CPU／記憶體高低都不算歸屬證據」。
-- 這三處文字要先經使用者彈窗核准逐字內容才能落地——本決議的「一起處理」授權僅止於本 repo 內的條文修正，不涵蓋這三處全域／跨專案檔案的具體措辭。
+後續（repo 外，原標記為未解決的缺口——已依使用者核准完成落地）：
 
-流程提醒：本決議改動 `DESIGN.md` §6，依母本 `CLAUDE.md`「`DESIGN.md` 是憲法」，這段文字合併回主線前須經使用者核准；本次僅在獨立 worktree 完成修訂與回歸測試，未合併、未取得核准。
+**使用者核准**：彈窗題目「把「收殘留行程」規則改成「只收能證明是自己開的，認不出來就先問」？（改憲法、使用者的全域規則、crm 記憶檔）」→ 使用者選「改（推薦）」（session `bcfe2ca2-373c-4737-8458-c4650e23d86c`）。這次核准同時涵蓋下面三處全域／跨專案檔案的具體措辭，以及本檔＋`DESIGN.md` §6 那段合併回主線所需的使用者核准（見檔尾「流程提醒」）。
+
+- crm-system 記憶檔 `feedback-kill-orphan-processes.md`「09-23 新形狀」段與「09-22 反例」段已改寫：不再用「命令列相同」「啟動時間早於本 session」判斷歸屬，統一改成「只收能證明是自己開的，認不出來先問使用者」，並補上瀏覽器會跟著控制它的腳本連坐死、不直接殺瀏覽器的說明。同批一併修正 `project-20260921-0915-walkthrough-and-beautify-round.md` HANDOFF 段裡同一句「整合員收工必查殺 chrome-headless-shell.exe」，以及 crm `MEMORY.md` 索引裡描述同一條錯誤判準的那一行。crm 記憶檔中找不到 `integration-brief.md` 或 T-133 專屬 brief 範本這類常駐檔案（該 brief 疑似只存在於當時的 scratchpad 暫存檔，未落成記憶檔），此項無對應檔案可改。
+- 全域 `~/.claude/CLAUDE.md`「自己起的程序自己收」段已新增「先認歸屬再動手」子項（只認自己記下的 PID／`TaskStop`／`serve.mjs` 登記／專屬腳本檔名／上層 claude 已不在的 MCP server 為證據，程式名稱、命令列相同、啟動時間、記憶體高低皆不算證據），「可以直接殺」「要先問我」兩行也各補上「已認出是自己的」「認不出歸屬的一律當成別人的」前提。
+- AI_project_hub 記憶檔 `feedback_kill_only_own_pids.md` 經核對內容已與新規則一致（本來就只認自己記下的 PID 與子孫，不用命令列／啟動時間判斷），未改動。
+
+流程提醒：本決議改動 `DESIGN.md` §6，依母本 `CLAUDE.md`「`DESIGN.md` 是憲法」，這段文字合併回主線前須經使用者核准——**核准已取得**，就是上面「後續」段記錄的同一個彈窗（session `bcfe2ca2-373c-4737-8458-c4650e23d86c`，選「改（推薦）」）；本次僅在獨立 worktree 完成修訂與回歸測試，合併回主線的動作本身不在這次落地範圍內，留待後續處理。
