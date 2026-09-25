@@ -19,11 +19,16 @@
 // 真繞過寫法（--no-verify、-n、-anm、core.hooksPath）維持擋下，見下方「必須仍擋下」區塊。
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { join, resolve, dirname } from 'node:path';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { createHmac } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import { commitGateCheck } from '../commit-gate.mjs';
+
+const GATE = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'commit-gate.mjs');
+const RUNNER = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'verify-runner.mjs');
 
 let repo;
 
@@ -535,5 +540,181 @@ describe('病態輸入（兩種形狀）不能逼近逾時', () => {
     const t0 = Date.now();
     commitGateCheck(bash('(git status); 用 git 做 commit; '.repeat(2500)));
     assert.ok(Date.now() - t0 < 3000, `耗時 ${Date.now() - t0}ms，疑似退回三次方成長`);
+  });
+});
+
+// ── P14 重構前基準：done 票驗簽往返（runner 真的簽出證據 → git 原生 pre-commit 兜底 --precommit）──
+// 與 pre-tool-use.test.mjs 的「經分派器 git commit」那組是同一套情境，換一條呼叫路徑（--precommit
+// 是 runPrecommit() 的 CLI 入口，直接 spawn 本檔＋--precommit，擋下時 exit 1，不是 2——見
+// commit-gate.mjs 的 runPrecommit）。重構後（gates/evidence.cjs）這些測試字面不改，用來證明兩條
+// 呼叫路徑（PreToolUse／git 原生 pre-commit）在重構前後判定結果一字不差。
+const PRECOMMIT_FIELD_SEP = '\u0001';
+function precommitTicketRelPath(p) {
+  const norm = String(p).replace(/\\/g, '/');
+  const m = norm.match(/\.constellation\/tickets\/[^/]+\.md$/i);
+  return m ? m[0] : norm;
+}
+function precommitRepoRootToken(cwd) {
+  return resolve(cwd).toLowerCase().replace(/\\/g, '/');
+}
+function precommitSign(secret, ts, relPath, commandsJoined, lastLine, repoRoot) {
+  const payload = [ts, relPath, commandsJoined, lastLine, repoRoot].join(PRECOMMIT_FIELD_SEP);
+  return createHmac('sha256', secret).update(payload, 'utf8').digest('hex');
+}
+
+describe('commit-gate：done 票驗簽往返（runner 簽出證據 → git 原生 pre-commit 兜底 --precommit；P14 重構前基準）', () => {
+  const PC_SECRET = 'test-secret-precommit-roundtrip';
+  let pcHome, pcNoSecretHome;
+  const pcRepos = [];
+
+  before(() => {
+    pcHome = mkdtempSync(join(tmpdir(), 'cg-evhome-'));
+    mkdirSync(join(pcHome, '.constellation'), { recursive: true });
+    writeFileSync(join(pcHome, '.constellation', 'secret'), PC_SECRET, 'utf8');
+
+    pcNoSecretHome = mkdtempSync(join(tmpdir(), 'cg-nosecret-'));
+    mkdirSync(join(pcNoSecretHome, '.constellation'), { recursive: true }); // 故意不放 secret 檔
+  });
+
+  after(() => {
+    for (const d of [pcHome, pcNoSecretHome, ...pcRepos]) { try { rmSync(d, { recursive: true, force: true }); } catch {} }
+  });
+
+  function makePcRepo() {
+    const dir = mkdtempSync(join(tmpdir(), 'cg-evrepo-'));
+    pcRepos.push(dir);
+    execFileSync('git', ['init', '-q'], { cwd: dir });
+    execFileSync('git', ['config', 'user.email', 'a@b.c'], { cwd: dir });
+    execFileSync('git', ['config', 'user.name', 'test'], { cwd: dir });
+    mkdirSync(join(dir, '.constellation', 'tickets'), { recursive: true });
+    writeFileSync(join(dir, '.constellation', 'config.json'), JSON.stringify({ commands: {} }), 'utf8');
+    return dir;
+  }
+
+  function pcTinyOkScript(dir) {
+    const p = join(dir, 'ok.mjs');
+    writeFileSync(p, "console.log('ok');\n", 'utf8');
+    return p;
+  }
+
+  function pcTicketShell(id, cmdPath) {
+    return [
+      '---', 'status: done', '---',
+      `# ${id} demo`, '',
+      '## 驗收條件', '- [x] 條件一', '',
+      '## 決議記錄', '',
+      '## 驗證指令',
+      `- \`node "${cmdPath.replace(/\\/g, '/')}"\``,
+      '',
+      '## 驗證證據（關票時由 runner 寫入）', '',
+    ].join('\n');
+  }
+
+  function pcSignViaRunner(repoDir, ticketAbsPath, homeDir) {
+    const r = spawnSync(process.execPath, [RUNNER, '--ticket', ticketAbsPath, '--scope', 'ticket', '--cwd', repoDir], {
+      env: { ...process.env, USERPROFILE: homeDir, HOME: homeDir },
+      encoding: 'utf8',
+      timeout: 60_000,
+    });
+    if (r.status !== 0) throw new Error(`fixture 簽章失敗（exit ${r.status}）：${r.stderr}`);
+  }
+
+  function pcStageTicket(repoDir, absPath) {
+    execFileSync('git', ['-C', repoDir, 'add', absPath]);
+  }
+
+  // --precommit 是 CLI 入口（見 commit-gate.mjs 檔頭的 process.argv 判斷），必須 spawn 本檔本身、
+  // 且 process.cwd() 要落在 repoDir（git 原生 pre-commit 實際執行時的 cwd 就是工作樹根）。
+  function precommitCheck(repoDir, homeDir) {
+    const r = spawnSync(process.execPath, [GATE, '--precommit'], {
+      cwd: repoDir,
+      env: { ...process.env, USERPROFILE: homeDir, HOME: homeDir },
+      encoding: 'utf8',
+    });
+    return { status: r.status, stderr: r.stderr || '' };
+  }
+
+  test('合法：runner 簽出的證據，--precommit 判定放行', () => {
+    const repoDir = makePcRepo();
+    const ok = pcTinyOkScript(repoDir);
+    const ticket = join(repoDir, '.constellation', 'tickets', 'T-911-legal.md');
+    writeFileSync(ticket, pcTicketShell('T-911', ok), 'utf8');
+    pcSignViaRunner(repoDir, ticket, pcHome);
+    pcStageTicket(repoDir, ticket);
+    const r = precommitCheck(repoDir, pcHome);
+    assert.equal(r.status, 0, `應放行，實際 exit ${r.status}｜${r.stderr.slice(0, 300)}`);
+  });
+
+  test('竄改：runner 簽出後手改證據內容，--precommit 判定擋下（exit 1，非 2）', () => {
+    const repoDir = makePcRepo();
+    const ok = pcTinyOkScript(repoDir);
+    const ticket = join(repoDir, '.constellation', 'tickets', 'T-912-tampered.md');
+    writeFileSync(ticket, pcTicketShell('T-912', ok), 'utf8');
+    pcSignViaRunner(repoDir, ticket, pcHome);
+    const original = readFileSync(ticket, 'utf8');
+    const tampered = original.replace(/sig: ([0-9a-f])([0-9a-f]+)/, (_, c1, rest) => `sig: ${c1 === '0' ? '1' : '0'}${rest}`);
+    assert.notEqual(tampered, original, '應該真的改到了 sig 值（fixture 前提檢查）');
+    writeFileSync(ticket, tampered, 'utf8');
+    pcStageTicket(repoDir, ticket);
+    const r = precommitCheck(repoDir, pcHome);
+    assert.equal(r.status, 1, `應擋下（--precommit 用 exit 1），實際 exit ${r.status}｜${r.stderr.slice(0, 300)}`);
+    assert.match(r.stderr, /驗簽失敗|commit 守門/);
+  });
+
+  test('反例：sig: unsigned（runner 讀不到 secret 時真實寫出的狀態），--precommit 判定擋下', () => {
+    const repoDir = makePcRepo();
+    const ok = pcTinyOkScript(repoDir);
+    const ticket = join(repoDir, '.constellation', 'tickets', 'T-913-unsigned.md');
+    writeFileSync(ticket, pcTicketShell('T-913', ok), 'utf8');
+    pcSignViaRunner(repoDir, ticket, pcNoSecretHome); // 簽章環境沒有 secret，runner 真的寫出 sig: unsigned
+    assert.match(readFileSync(ticket, 'utf8'), /sig: unsigned/, 'fixture 前提：這筆證據真的是 unsigned');
+    pcStageTicket(repoDir, ticket);
+    const r = precommitCheck(repoDir, pcHome); // 檢查時的環境「有」secret
+    assert.equal(r.status, 1, `應擋下，實際 exit ${r.status}｜${r.stderr.slice(0, 300)}`);
+  });
+
+  test('反例：最新一筆證據超過 7 天新鮮期，--precommit 判定擋下', () => {
+    const repoDir = makePcRepo();
+    const rootOut = execFileSync('git', ['-C', repoDir, 'rev-parse', '--show-toplevel']).toString('utf8').trim();
+    const repoRoot = precommitRepoRootToken(rootOut);
+    const ticket = join(repoDir, '.constellation', 'tickets', 'T-914-stale.md');
+    const CMD = 'node -e "console.log(1)"';
+    const OUT_LINE = '1';
+    const ts = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString(); // 8 天前，超過 7 天窗口
+    const sig = precommitSign(PC_SECRET, ts, precommitTicketRelPath(ticket), CMD, OUT_LINE, repoRoot);
+    writeFileSync(ticket, [
+      '---', 'status: done', '---', '# T-914 stale', '',
+      '## 驗收條件', '- [x] 條件一', '',
+      '## 驗證證據（關票時由 runner 寫入）',
+      `- **${ts}**`,
+      `  - \`${CMD}\`（exit 0）`,
+      '    ```', `    ${OUT_LINE}`, '    ```',
+      `  - sig: ${sig}`, '',
+    ].join('\n'), 'utf8');
+    pcStageTicket(repoDir, ticket);
+    const r = precommitCheck(repoDir, pcHome);
+    assert.equal(r.status, 1, `應擋下，實際 exit ${r.status}｜${r.stderr.slice(0, 300)}`);
+  });
+
+  test('反例：簽章裡的 repo 根跟實際 repo 不同（跨 repo 重放），--precommit 判定擋下', () => {
+    const repoDir = makePcRepo();
+    const otherRoot = precommitRepoRootToken(join(tmpdir(), 'cg-some-other-project'));
+    const ticket = join(repoDir, '.constellation', 'tickets', 'T-915-crossrepo.md');
+    const CMD = 'node -e "console.log(1)"';
+    const OUT_LINE = '1';
+    const ts = new Date().toISOString();
+    const sig = precommitSign(PC_SECRET, ts, precommitTicketRelPath(ticket), CMD, OUT_LINE, otherRoot);
+    writeFileSync(ticket, [
+      '---', 'status: done', '---', '# T-915 crossrepo', '',
+      '## 驗收條件', '- [x] 條件一', '',
+      '## 驗證證據（關票時由 runner 寫入）',
+      `- **${ts}**`,
+      `  - \`${CMD}\`（exit 0）`,
+      '    ```', `    ${OUT_LINE}`, '    ```',
+      `  - sig: ${sig}`, '',
+    ].join('\n'), 'utf8');
+    pcStageTicket(repoDir, ticket);
+    const r = precommitCheck(repoDir, pcHome);
+    assert.equal(r.status, 1, `應擋下，實際 exit ${r.status}｜${r.stderr.slice(0, 300)}`);
   });
 });
