@@ -23,6 +23,9 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const GATES_DIR = dirname(fileURLToPath(import.meta.url));
 const VERIFY_RUNNER_ABS_PATH = join(GATES_DIR, 'verify-runner.mjs');
 const SERVE_ABS_PATH = join(GATES_DIR, 'serve.mjs');
+// 對抗複審 S4：盲點審提醒裡指路的 phase-grill.md 同樣改走絕對路徑（同上，不受呼叫時 cwd 影響）；
+// gates/ 與 skills/ 是母本 repo 的同層目錄，故從 GATES_DIR 往上一層即可推到 skills/。
+const PHASE_GRILL_ABS_PATH = join(GATES_DIR, '..', 'skills', 'constellation', 'references', 'phase-grill.md');
 
 const stripBom = s => (s && s.charCodeAt(0) === 0xfeff ? s.slice(1) : s);
 
@@ -459,6 +462,143 @@ function buildDesignSentinel(base, root) {
     '  處置：Read skills/constellation/references/phase-design.md，補做步驟 5（直接改專案正式頁面 code）→ 5b（執行端在本地逐一點過每個互動、截圖發私人 Artifact 給使用者看圖拍板；瀏覽器工具或 Artifact 任一缺，退回使用者本地點）→ 7（定稿記錄附逐區塊元件清單、凍結名單與 source 欄）。'].join('\n');
 }
 
+// 決議 024 D1 附則：把「盲點審有沒有真的跑完」從紀律改成機器提醒。grill-close.md 記著大流程時，
+// weave 進場與 5b 看圖拍板前都要求檔尾有收斂行（DESIGN.md §2 保險 3、SKILL.md Step 0）；換 session
+// 常把這步無聲跳過（grill-close.md 在、盲點審沒跑完），這裡補一道機器提醒。fail-open：解析異常一律
+// 不叫，不拖垮開場。
+// 對抗複審 M1：真實專案的寫法遠比純文字「大小流程：大」多——欄位名加粗（**大小流程**）、單列
+// key-value 表格（`| 大小流程 | 大 |`）、標題式寫法（獨立一行「## 1. 大小流程」，值寫在下一個非空
+// 行）都要認得出來，收斂行同理可能寫成「**盲點審**：已收斂」。比對前先把 `*`／`` ` ``／`_`／`|`
+// 這幾種 markdown 標記換成空白（不改變中文內文語意，只清掉排版噪音），冒號也改成可省略：同一行
+// 「大小流程」後面若還有內容就直接當值取用（表格列沒有冒號），只有欄位名獨占一行時才去下一個
+// 非空行找值。
+// 解析「大小流程」欄位值只取到下一個頓號／括號為止，不能只比對字串含不含「大流程」——已知有
+// 專案把備註寫進括號（例如「小（該功能原評為大流程，後來降為小流程）」），若整段只比對含不含
+// 「大流程」三字會把這種小流程誤判成大流程。冒號全形（：）半形（:）皆接受。
+function stripMdMarks(s) {
+  return String(s).replace(/[*`_|]/g, ' ');
+}
+
+function parseSizeField(text) {
+  const lines = stripMdMarks(text).split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const idx = lines[i].indexOf('大小流程');
+    if (idx < 0) continue;
+    const restTrim = lines[i].slice(idx + 4).trim(); // 「大小流程」固定 4 個中文字，跳過後看同行殘餘
+    if (restTrim) {
+      const m = restTrim.match(/^[：:]?\s*([^、（(]*)/);
+      const val = m ? m[1].trim() : '';
+      if (val) return val;
+    }
+    // 同一行「大小流程」後面沒有值（標題式寫法）→ 值在下一個非空行
+    for (let j = i + 1; j < lines.length; j++) {
+      const t = lines[j].trim();
+      if (!t) continue;
+      const m2 = t.match(/^([^、（(]*)/);
+      return m2 ? m2[1].trim() : '';
+    }
+    return '';
+  }
+  return '';
+}
+
+const BLINDSPOT_CONVERGED_RE = /盲點審\s*[：:]\s*(已收斂|使用者喊停)/;
+
+function buildBlindspotSentinel(base) {
+  // 對抗複審 M2：SKILL.md Step 0 把這條保險寫在「tickets/ 不存在或沒有 *.md」那個分支底下——
+  // 已經過 weave 開了票，代表訪談與盲點審那一輪早就收斂過（不然開不了票），這裡不該對著舊規則
+  // 寫的 grill-close 每次開場都誤報；過 weave 之後「定稿有沒有落地」交給 buildDesignSentinel。
+  let ticketFiles = [];
+  try { ticketFiles = readdirSync(join(base, 'tickets')).filter(f => f.toLowerCase().endsWith('.md')); } catch { ticketFiles = []; }
+  if (ticketFiles.length) return null;
+
+  const close = readTextSafe(join(base, 'decisions', 'grill-close.md'));
+  if (!close) return null; // 沒有 grill-close.md，訪談根本還沒收尾，交給 buildGrillCloseMismatchSentinel 處理
+  if (!parseSizeField(close).startsWith('大')) return null; // 小流程可省略本保險（phase-grill.md「完整性四保險」第 3 點）
+  if (BLINDSPOT_CONVERGED_RE.test(stripMdMarks(close))) return null; // 已收斂或使用者喊停，效力相同（含加粗寫法）
+  return '⚠【盲點審尚未收斂】decisions/grill-close.md 記著大流程，但檔尾沒有「盲點審：已收斂（第 N 輪）」' +
+    '也沒有「盲點審：使用者喊停（第 N 輪）」——訪談收尾已拍板，但獨立盲點審還沒跑完（例如跑到一半換了 ' +
+    `session）。不得因為看到 grill-close.md 就當盲點審已經跑完：Read "${PHASE_GRILL_ABS_PATH}"，` +
+    '照「完整性四保險」第 3 點接回盲點審；需要 UI 時畫面製作可同時接續，但 5b 看圖拍板前要收斂。若這份' +
+    'grill-close.md 是舊規則寫的（當時收斂才轉交、本來就沒有收斂行）且盲點審其實已經跑完（該檔或決議裡' +
+    '已有記載），照實告知使用者，經同意後補上收斂行即可，不必重跑。';
+}
+
+// 決議 024 D4 附則：`tickets/` 有票卻沒有 `decisions/grill-close.md` 代表這批票沒經過訪談收尾，
+// 措辭對齊 SKILL.md「現況矛盾照實告知」那句；兩種情況除外——出貨歸檔做到一半，或 `tickets/`
+// 只剩出貨時開給下一輪的承接票（辨識方式見 phase-ship.md「發現的處理」）。這句攔不住刻意繞過
+// 流程直接開票（例如正式站出事時的緊急作戰），只擋無心漏掉的訪談收尾。
+function ticketIdFromFilename(f) {
+  const m = f.match(/^([A-Za-z]+-\d+)/); // 票號慣例 T-001，取不到就退回整個檔名 stem
+  return m ? m[1] : f.replace(/\.md$/i, '');
+}
+
+// 對抗複審 M3／S1：兩個例外原本各自要求「全部票都符合」、且票號比對用 .includes() 子字串——
+// 子字串比對會讓 T-1 被 T-10 撞號誤判成已涵蓋（S1），「全部符合」則在出貨與承接混在一起時整批
+// 誤判。改成：①逐一抽出完整票號（含範圍展開），用 Set 成員比對，邊界安全不撞號；②逐張票各自
+// 判斷「有沒有交代」，任何一張兩者都不符才算矛盾——混合狀態不會被誤判成整批都沒交代，單張漏
+// 交代也不會被另一張的交代蓋過去。
+
+// 例外一：出貨歸檔做到一半——掃整段「做了什麼」（不只第一行；真實寫法有表格、範圍寫法
+// 「T-401~T-417」、單一條目列點，只看第一行會漏掉表格與條列式列出的票號）找出涵蓋了哪些票號。
+const TICKET_RANGE_RE = /([A-Za-z]+)-(\d+)\s*[~～–]\s*(?:[A-Za-z]+-)?(\d+)/g;
+const TICKET_TOKEN_RE = /\b[A-Za-z]+-\d+\b/g;
+
+function collectShipCoveredTicketIds(base) {
+  const raw = readTextSafe(join(base, 'ship-report.md'));
+  if (!raw) return new Set();
+  const lines = raw.split(/\r?\n/);
+  const idx = lines.findIndex(l => /^##\s*做了什麼/.test(l.trim()));
+  if (idx < 0) return new Set();
+  let end = lines.length;
+  for (let i = idx + 1; i < lines.length; i++) {
+    if (/^##\s/.test(lines[i])) { end = i; break; } // 進入下一個 section，「做了什麼」段結束
+  }
+  const section = lines.slice(idx + 1, end).join('\n');
+  const ids = new Set();
+  for (const m of section.matchAll(TICKET_RANGE_RE)) {
+    const start = parseInt(m[2], 10);
+    const stop = parseInt(m[3], 10);
+    if (Number.isFinite(start) && Number.isFinite(stop) && stop >= start && stop - start < 1000) {
+      for (let n = start; n <= stop; n++) ids.add(`${m[1].toUpperCase()}-${n}`);
+    }
+  }
+  for (const m of section.matchAll(TICKET_TOKEN_RE)) ids.add(m[0].toUpperCase());
+  return ids;
+}
+
+// 例外二：tickets/ 只剩出貨時開給下一輪的承接票（phase-ship.md「發現的處理」）。真實寫法有寫在
+// 「## 目標」段，也有另立「## 來源」段，或直接寫「來源：出貨 XXX 軸」不含「來源軸」三字連寫——
+// 不再限定段落，全票搜尋來源說明字樣（比對前同樣先去 markdown 標記，防加粗寫法漏判）。
+const CARRY_OVER_RE = /來源軸|來源\s*[：:][^\n]*(?:出貨|軸)/;
+
+function isCarryOverTicket(raw) {
+  return CARRY_OVER_RE.test(stripMdMarks(raw));
+}
+
+function buildGrillCloseMismatchSentinel(base) {
+  let ticketFiles = [];
+  try { ticketFiles = readdirSync(join(base, 'tickets')).filter(f => f.toLowerCase().endsWith('.md')); } catch { ticketFiles = []; }
+  if (!ticketFiles.length) return null; // 沒有票就沒有這種矛盾
+  if (existsSync(join(base, 'decisions', 'grill-close.md'))) return null; // 有訪談收尾，不矛盾
+
+  const shipCovered = collectShipCoveredTicketIds(base);
+  const unaccounted = [];
+  for (const f of ticketFiles) {
+    if (shipCovered.has(ticketIdFromFilename(f).toUpperCase())) continue; // 例外一：本輪出貨報告已涵蓋
+    const raw = readTextSafe(join(base, 'tickets', f));
+    if (raw && isCarryOverTicket(raw)) continue; // 例外二：承接票
+    unaccounted.push(f);
+  }
+  if (!unaccounted.length) return null;
+
+  return '⚠【現況矛盾】tickets/ 有票，但 decisions/grill-close.md 不存在——這批票沒經過訪談收尾，' +
+    '照實告知使用者這個落差，不自行腦補跳過。出貨歸檔做到一半、或票是下一輪的承接票時不算矛盾，' +
+    '但這裡的辨識是關鍵字啟發式、不是精確判定：請自行核對 ship-report.md 與各票內容是否真的屬於' +
+    '這兩種例外，不要看到沒印這句就當作已經查證過。這句攔不住刻意繞過流程直接開票（例如正式站' +
+    '出事時的緊急作戰，案例見 Constellation 母本決議 024），只擋無心漏掉的訪談收尾。';
+}
+
 // repo root 解析：git rev-parse --show-toplevel，失敗 fallback cwd（與 commit-gate.mjs 鏡像）。
 function resolveRepoRoot(cwd) {
   try {
@@ -511,12 +651,14 @@ function buildSummary(root) {
     }
   }
   // 知識軌導航（DESIGN.md §4「接續」）：每段獨立 try——單段解析炸掉只少那一段，票況照常注入。
-  let map = null, ctx = null, dec = null, hist = null, designWarn = null;
+  let map = null, ctx = null, dec = null, hist = null, designWarn = null, blindspotWarn = null, grillMismatchWarn = null;
   try { map = buildMapSection(base, root); } catch { /* fail-open */ }
   try { ctx = buildContextSection(base); } catch { /* fail-open */ }
   try { dec = buildDecisionsSection(base); } catch { /* fail-open */ }
   try { hist = buildHistorySection(base); } catch { /* fail-open */ }
   try { designWarn = buildDesignSentinel(base, root); } catch { /* fail-open */ }
+  try { blindspotWarn = buildBlindspotSentinel(base); } catch { /* fail-open */ } // 決議 024 D1 附則
+  try { grillMismatchWarn = buildGrillCloseMismatchSentinel(base); } catch { /* fail-open */ } // 決議 024 D4 附則
 
   // 操作把手（驗證 runner／server 起停）：緊跟在【開工前必讀】後面、票況之前——
   // 這兩行是「動手前先怎麼跑」，比票況更前置，不該埋在整串注入的最後才被看到。
@@ -570,8 +712,10 @@ function buildSummary(root) {
   } else {
     lines.push(...toolLines); // 沒有地圖／脈絡／決議可導航（例如工作流母本自己）時仍要露出這兩行
   }
-  // design 哨兵緊跟票況：它講的是「這一輪的 UI 到底定稿了沒」，屬於現況而非知識軌，
-  // 且不成立時會擋住 weave，所以要排在地圖與脈絡之前先被看到。
+  // 現況矛盾（有票沒訪談收尾）與盲點審未收斂、design 哨兵都緊跟票況：講的都是「這一輪走到哪」，
+  // 屬於現況而非知識軌，且不成立時會擋住下一步，所以要排在地圖與脈絡之前先被看到。
+  if (grillMismatchWarn) lines.push(grillMismatchWarn); // 決議 024 D4 附則
+  if (blindspotWarn) lines.push(blindspotWarn); // 決議 024 D1 附則
   if (designWarn) lines.push(designWarn);
   if (map) lines.push(map.text); // 票況之後、知識軌之前：先知道東西在哪，再談脈絡
   if (hist) lines.push(hist.text);
