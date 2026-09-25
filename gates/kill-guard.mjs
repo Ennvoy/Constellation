@@ -29,14 +29,18 @@ const PASS = { block: false };
 const BLOCK = msg => ({ block: true, message: msg });
 
 // 敘述開頭詞是不是殺行程動詞：把字串開頭可能的變數指派、括號剝掉後看第一個詞。
-const KILL_LEADER_RE = /^(?:taskkill|stop-process|spps|kill)\b/i;
+// 動詞後面必須接空白、行尾或 shell 分隔符，不能接 `-`／`.`／字母數字——否則 `kill-guard.mjs`、
+// `kill-guard.test`、`taskkill.exe`（識別字／副檔名巧合撞到動詞開頭）也會被當成真的在呼叫該動詞。
+const KILL_LEADER_RE = /^(?:taskkill|stop-process|spps|kill)(?![-.\w])/i;
 
-// 拆成一條條「敘述」：先按管線（單一 `|`，不含 `||`）切，各段再按 `;`／`&&`／`||`／換行切；
-// 每段若含 `{ ... }` 區塊（ForEach-Object／foreach 的迴圈本體），區塊本文另外當一條敘述加進來
-// 一併判斷——只拆一層，不做完整的殼語法剖析，足夠涵蓋審查列出的寫法即可（極簡原則）。
+// 拆成一條條「敘述」：先按管線（單一 `|`，不含 `||`、不含跳脫過的 `\|`）切，各段再按
+// `;`／`&&`／`||`／換行切；每段若含 `{ ... }` 區塊（ForEach-Object／foreach 的迴圈本體），
+// 區塊本文另外當一條敘述加進來一併判斷——只拆一層，不做完整的殼語法剖析，足夠涵蓋審查列出的
+// 寫法即可（極簡原則）。`\|` 是 grep 基本正則（BRE）的 or，常見於
+// `grep -n 'taskkill\|Stop-Process' file`，不是 shell 管線邊界，切開來會把後半段誤判成殺行程敘述。
 function splitStatements(cmd) {
   const stmts = [];
-  const pipeSegs = cmd.split(/(?<!\|)\|(?!\|)/);
+  const pipeSegs = cmd.split(/(?<![\\|])\|(?!\|)/);
   for (const seg of pipeSegs) {
     for (const part of seg.split(/;|&&|\|\||\r?\n/)) {
       stmts.push(part);

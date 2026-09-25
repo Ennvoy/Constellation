@@ -246,3 +246,38 @@ describe('kill-guard：S1 對抗審查——唯讀查詢管線不該被誤擋（
       '-Name 跟殺行程動詞不在同一條敘述'
     ));
 });
+
+// 語料重放實測（wave5/merged-corpus.json 9,209 條真實指令）找出的兩個誤擋成因：
+// 1) splitStatements() 把 grep 基本正則（BRE）跳脫過的 `\|`（or）當成 shell 管線邊界切開，
+//    切出以 taskkill／Stop-Process／kill 開頭的片段而誤判——常見於 `grep -n '甲\|乙\|taskkill' file`
+//    這種查字串的唯讀指令。
+// 2) KILL_LEADER_RE 原本用 `\b` 當邊界，`-`／`.` 都算邊界字元，導致 `kill-guard.mjs`、`kill-guard.test`、
+//    `kill.ps1`、`taskkill-report.ps1` 這類以動詞開頭的識別字／檔名也命中。
+describe('kill-guard：wave5 對抗審查修正——跳脫管線與 kill- 開頭識別字不該被誤擋（別人持有鎖時）', () => {
+  before(() => writeHolder());
+  after(() => clearHolder());
+
+  test('grep 用 BRE 跳脫 \\| 列關鍵字，taskkill 只是被查的字串之一（成因 1）', () =>
+    assertPassed(bash("grep -n \"萬字\\|斷路器\\|taskkill\\|千字\" README.md"), 'BRE \\| 列表裡的 taskkill'));
+
+  test('grep -o 用 \\| 串接兩段規則運算式，Stop-Process 只是規則的一部分（成因 1）', () =>
+    assertPassed(
+      bash("grep -n -o 'taskkill[^\"\\\\]\\{0,80\\}\\|Stop-Process[^\"\\\\]\\{0,80\\}' file.jsonl"),
+      'BRE \\| 串接規則運算式片段'
+    ));
+
+  test('grep 用 \\| 列關鍵字，其中一個剛好是 kill-guard.mjs 這種識別字（成因 1＋2 疊加）', () =>
+    assertPassed(
+      bash("grep -n \"機器鎖\\|殺行程守門\\|kill-guard.mjs\\|決議 026\" DESIGN.md"),
+      'kill-guard.mjs 識別字'
+    ));
+
+  test('kill-guard.mjs 當成單一敘述（不經過管線切分）也不該被當成裸 kill 呼叫（成因 2）', () =>
+    assertPassed(bash('kill-guard.mjs --self-check'), 'kill-guard.mjs 開頭識別字'));
+
+  test('kill.ps1 這種檔名（kill 後面接句點）不該被當成裸 kill 呼叫（成因 2）', () =>
+    assertPassed(bash('kill.ps1 -Confirm:$false'), 'kill.ps1 開頭識別字'));
+
+  test('taskkill-report.ps1 這種識別字，taskkill 等其他動詞邊界比照同一原則（成因 2）', () =>
+    assertPassed(bash('taskkill-report.ps1 -Verbose'), 'taskkill- 開頭識別字'));
+});
