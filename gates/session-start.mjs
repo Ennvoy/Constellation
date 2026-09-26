@@ -520,8 +520,8 @@ function buildBlindspotSentinel(base) {
   return '⚠【盲點審尚未收斂】decisions/grill-close.md 記著大流程，但檔尾沒有「盲點審：已收斂（第 N 輪）」' +
     '也沒有「盲點審：使用者喊停（第 N 輪）」——訪談收尾已拍板，但獨立盲點審還沒跑完（例如跑到一半換了 ' +
     `session）。不得因為看到 grill-close.md 就當盲點審已經跑完：Read "${PHASE_GRILL_ABS_PATH}"，` +
-    '照「完整性四保險」第 3 點——收斂前不進 design／weave，先接回盲點審（換了 session 一律改派新審查員' +
-    '看全集）。若這份' +
+    '照「完整性四保險」第 3 點——收斂前不進 design／weave，先接回盲點審（每一輪都派一位沒參與過的新' +
+    '審查員看全部內容，換了 session 接回也一樣）。若這份' +
     'grill-close.md 是舊規則寫的（當時收斂才轉交、本來就沒有收斂行）且盲點審其實已經跑完（該檔或決議裡' +
     '已有記載），照實告知使用者，經同意後補上收斂行即可，不必重跑。';
 }

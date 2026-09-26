@@ -253,6 +253,15 @@ describe('session-start：決議 023 P20——決議與詞彙資訊只在置頂�
     assert.equal(hits.length, 1, '「共 3 筆」只該出現一次，不該在必讀句與獨立段落各講一次');
   });
 
+  // 決議 029：工程預設清單固定寫進 decisions/engineering-defaults.md、就地改寫，不是逐輪疊加的
+  // 編號決議，不該被算進決議筆數（判準：檔名沒有數字開頭，見 buildDecisionsSection 的過濾規則）。
+  test('decisions/engineering-defaults.md 不是編號決議，不算進決議筆數', () => {
+    const dir = makeProjectFixture({ decisionsCount: 2 });
+    writeFileSync(join(dir, '.constellation', 'decisions', 'engineering-defaults.md'), '# 工程預設清單\n', 'utf8');
+    const ctx = JSON.parse(run(dir).stdout).hookSpecificOutput.additionalContext;
+    assert.match(ctx, /共\s*2\s*筆/, 'engineering-defaults.md 沒有數字開頭，不該被算進決議筆數');
+  });
+
   test('CONTEXT 詞條數併進必讀句、標籤只寫「專案詞彙」，不再印獨立【專案詞彙】段落', () => {
     const dir = makeProjectFixture({ contextContent: '- **詞一**：說明。\n- **詞二**：說明。\n' });
     const ctx = JSON.parse(run(dir).stdout).hookSpecificOutput.additionalContext;
@@ -269,10 +278,11 @@ describe('session-start：決議 024 D1 附則——盲點審未收斂的機器�
     assert.match(ctx, /盲點審尚未收斂/);
     assert.match(ctx, /決議 024|完整性四保險/); // 對齊 phase-grill.md 的處置指引
     assert.match(ctx, /舊規則/, '舊規則已記載跑完時應補行而非要求重跑，措辭要能看到這個例外');
-    // 決議 028：時機規則改成「收斂前不進 design／weave」，換 session 一律改派新審查員看全集
-    // （取代舊規則「需要 UI 時畫面製作可同時接續，5b 看圖拍板前才收斂」那套時機）。
+    // 決議 029：盲點審改成「每一輪都換一位沒參與過的新審查員看全部內容」；時機仍是決議 028 A
+    // 保留的「收斂前不進 design／weave」（取代舊規則「需要 UI 時畫面製作可同時接續，5b 看圖拍板前
+    // 才收斂」那套時機）。
     assert.match(ctx, /收斂前不進\s*design／weave/);
-    assert.match(ctx, /換了 session 一律改派新審查員看全集/);
+    assert.match(ctx, /每一輪都派一位沒參與過的新審查員看全部內容/);
     assert.doesNotMatch(ctx, /畫面製作可同時接續/, '舊規則的時機措辭應已被取代');
   });
 

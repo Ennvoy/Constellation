@@ -63,5 +63,4 @@ description: 當使用者要啟動新功能開發、想走完整開發工作流�
   - **AskUserQuestion 彈窗**（Claude Code 端所有提問——開放問題與封閉確認——都走彈窗，一次一題）→ Codex 端沒有這個工具，一律降級為純文字點列格式：一則訊息一題、置於結尾醒目處、推薦排第一並標記；使用者可回數字、回「ok」、或打自由文字。
   - **Workflow 工具（票平行 fan-out）** → Codex 端沒有這個工具，這批票改序列逐張做，不平行。
   - **DesignSync／Claude Design canvas、瀏覽器工具與 Artifact**（②畫面定稿整套判準與降級）→ 不重複列在這裡，寫在 `references/phase-design.md`；判準是「工具此刻在不在」，不是按 runtime 分。
-  - **SendMessage 喚回／Agent 工具起審查員**（大流程獨立盲點審複查輪，決議 028）→ 不重複列在這裡，寫在 `references/phase-grill.md`「完整性四保險」第 3 點；Codex 端沒有這兩個工具，每輪（含複查）一律改派新審查員看決議全集，也沒有最終確認這一步。
   - **SessionEnd 自動收臨時 server** → Codex 端上限 3 秒，`reap` 常收不完（不殺也不刪登記），得靠 `serve.mjs stop --port <p>` 手動收；細節見本檔同目錄 `references/verification-playbook.md`「臨時 server 的起與收」，這裡不重複。
