@@ -7,6 +7,7 @@
 //   閘門二「done 票稽核」：staged 的票檔若把 status 設為 done，驗其最新證據筆簽章（新鮮度放寬 7 天，
 //     其餘與關票刷卡機同一套驗簽邏輯）——堵「用 shell 指令繞過關票刷卡機直接改檔＋git add」這條旁門，
 //     關票刷卡機只在 Edit/Write/MultiEdit/apply_patch 當下擋，commit 這關再兜底一次。
+//   附帶：下輪待辦抽屜守衛（決議 027）、凍結名單縮水守衛（決議 030，見 frozenShrinkReason）。
 // 另補「模型端繞過 pre-commit」防線：命令帶 --no-verify/-n 或改向 -c core.hooksPath → 擋下（human 在終端機
 // 自己打的不過本 hook，--no-verify 對人仍是 documented 逃生門、reflog 可稽核）。這條防線判不準時寧可擋：
 // 短旗標 -n 只在明列的窄類別放行（見 shortNOnlyInSafeSegments，防手滑的啟發式、非對抗性保證）。
@@ -82,7 +83,7 @@ function runPrecommit() {
 
     const staged = stagedFiles(root); // 取不到＝null＝三道全 fail-open
     const reason = secretsReason(root, staged) || artifactsReason(staged) || doneTicketAuditReason(root, staged) ||
-      nextRoundReason(root, staged);
+      nextRoundReason(root, staged) || frozenShrinkReason(root, staged);
     if (reason) {
       process.stderr.write(reason + '\n  （這是 Constellation 的 git pre-commit 兜底；真要跳過：git commit --no-verify）\n');
       process.exit(1);
@@ -265,6 +266,56 @@ function nextRoundReason(root, staged) {
   ].join('\n');
 }
 
+// 凍結名單縮水守衛（決議 030；附帶職責，同下輪待辦抽屜守衛）：staged 的 design-frozen.json 比 HEAD
+// 版少了某些 frozen 路徑，每一條都必須在「這次 commit 新增的」log 紀錄裡有對應的 unfreeze，否則擋下
+// 並列出被刪的路徑。擋的是 AI_project_hub 決議 406 成因 B：兩支平行分支合併 design-frozen.json 衝突
+// 時人工解錯、frozen 少了一行，閘門 5 照「名單沒有就放行」讓後續編輯無聲通過。
+// 「新增的」＝staged log 裡、HEAD log 沒有的那幾筆（逐筆 JSON 字串比對、以多重集合扣除），合併時另一
+// 支分支帶進來的 unfreeze 也算新增（它對這個 commit 的 HEAD 而言確實是新的）。
+// fail-open：HEAD 沒有這個檔（首次凍結）、staged 版整份刪除（出貨歸檔把它搬進 archive/）、任一版
+// 讀不到或不是合法 JSON——都放行，不在這道判斷格式問題（格式由 weave 機器三驗與閘門 3 哨兵把關）。
+// 限制：只攔會跑 pre-commit 的 commit；沒有衝突、git 自動完成的 merge commit 不跑 pre-commit，
+// 但那種合併也不會由人手解 frozen 陣列，不是這道要防的情境。
+const DESIGN_FROZEN_GIT_PATH = '.constellation/design-frozen.json';
+const normFrozenPath = p => String(p).replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+
+function frozenShrinkReason(root, staged) {
+  if (!staged || !staged.some((p) => normFrozenPath(p) === DESIGN_FROZEN_GIT_PATH)) return null;
+  const read = (spec) => {
+    try {
+      const data = JSON.parse(stripBom(execFileSync('git', ['-C', root, 'show', spec], {
+        maxBuffer: 1 << 24, stdio: ['ignore', 'pipe', 'ignore'],
+      }).toString('utf8')));
+      return data && Array.isArray(data.frozen) ? data : null;
+    } catch { return null; }
+  };
+  const head = read('HEAD:' + DESIGN_FROZEN_GIT_PATH);
+  const next = read(':' + DESIGN_FROZEN_GIT_PATH);
+  if (!head || !next) return null;
+
+  const nextFrozen = new Set(next.frozen.filter((f) => typeof f === 'string').map(normFrozenPath));
+  const removed = head.frozen.filter((f) => typeof f === 'string' && !nextFrozen.has(normFrozenPath(f)));
+  if (!removed.length) return null;
+
+  const headLog = (Array.isArray(head.log) ? head.log : []).map((e) => JSON.stringify(e));
+  const addedUnfreeze = new Set();
+  for (const e of Array.isArray(next.log) ? next.log : []) {
+    const i = headLog.indexOf(JSON.stringify(e));
+    if (i >= 0) { headLog.splice(i, 1); continue; } // HEAD 就有的舊紀錄，不算這次新增
+    if (e && typeof e.path === 'string' && String(e.action ?? '').toLowerCase() === 'unfreeze') {
+      addedUnfreeze.add(normFrozenPath(e.path));
+    }
+  }
+  const missing = removed.filter((f) => !addedUnfreeze.has(normFrozenPath(f)));
+  if (!missing.length) return null;
+  return [
+    'Constellation commit 守門：擋下 commit —— design-frozen.json 的 frozen 名單少了以下路徑，但這次 commit 沒有新增對應的 unfreeze 紀錄：',
+    ...missing.map((p) => '    ' + p),
+    '  → 多半是合併衝突時解錯、誤刪了 frozen 陣列的行：把這些路徑補回 frozen 再 commit。',
+    '  → 真的要解凍：先經使用者彈窗同意，在 log 補一筆 {"path": …, "action": "unfreeze", "ticket": …, "reason": …}，與移出 frozen 同一個 commit。',
+  ].join('\n');
+}
+
 // staged 裡標 done 的票，逐張驗證據簽章——讀 staged 版本內容（git show :path），失敗才 fallback 磁碟
 // （例如檔案已從 index 移除但還在工作區這種邊緣狀況，寧可再試一次也不要 fail-open 漏掉稽核）。
 function doneTicketAuditReason(root, staged) {
@@ -401,6 +452,8 @@ export function commitGateCheck(input) {
   if (doneAudit) return BLOCK(doneAudit);
   const nextRound = nextRoundReason(root, staged);
   if (nextRound) return BLOCK(nextRound);
+  const frozenShrink = frozenShrinkReason(root, staged);
+  if (frozenShrink) return BLOCK(frozenShrink);
 
   return PASS;
 }

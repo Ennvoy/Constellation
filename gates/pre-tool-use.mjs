@@ -14,8 +14,16 @@
 // tool_input／toolInput），是安全超集：三道閘門要判定任何東西，命令字串本來就一定含對應字樣。
 // 注意：這只是「要不要載入 kill-guard.mjs」的粗篩，不要求後面一定接數字——`| kill`、`kill -n` 這種
 // 沒有緊跟數字的寫法也要能觸發載入，真正的安全判斷交給 kill-guard.mjs 自己逐敘述分析。
+//
+// 決議 030 加掛第四道：定稿 UI 凍結守衛的 shell 版（gates/frozen-guard.mjs 的 frozenShellCheck，
+// 與 close-gate.mjs 對 Edit|Write 用的是同一份判定）。它有自己的粗篩字樣（重導向 >、tee、sed、
+// Set-Content、cp、mv、git…，見 SHELL_WRITE_HINT_RE），與上面三道的粗篩各管各的；排在最前面——
+// 寫凍結檔是硬擋，訊息要講明是凍結檔，不被 git 守門的一般性訊息蓋掉。
 const stripBom = s => (s && s.charCodeAt(0) === 0xfeff ? s.slice(1) : s);
 const NEEDS_GATE_RE = /git|taskkill|stop-process|spps|\bkill\b|wmic|\.kill\(|\bterminate\b/i;
+// 與 frozen-guard.mjs 的 SHELL_WRITE_HINT_RE 同字面（粗篩要在載入該檔之前做，故內聯一份）。
+const FROZEN_HINT_RE =
+  />|\b(?:tee|sed|perl|cp|mv|rm|del|erase|rd|rmdir|unlink|truncate|shred|dd|sc|ac|ni|ri|mi|cpi|ren|rni|clc|copy|move|git)\b|-(?:content|item)\b|out-file/i;
 
 let raw = '';
 process.stdin.setEncoding('utf8');
@@ -25,15 +33,17 @@ process.stdin.on('end', async () => {
   let input;
   try { input = JSON.parse(stripBom(raw).trim() || '{}'); } catch { return process.exit(0); }
   const ti = input.tool_input ?? input.toolInput ?? {};
-  if (!NEEDS_GATE_RE.test(String(ti.command ?? ''))) return process.exit(0);
+  const cmd = String(ti.command ?? '');
 
   // 依序判、任一道 block 即擋下並回該道原本的訊息（訊息不改寫，使用者看到的與合併前一字不差）。
-  // 逐道各自動態 import＋try-catch fail-open：一道爆掉或載入失敗都不影響另一道。
+  // 逐道各自動態 import＋try-catch fail-open：一道爆掉或載入失敗都不影響另一道；粗篩沒中的那道不載入。
   const loaders = [
-    async () => (await import('./git-guardrail.mjs')).gitGuardrailCheck,
-    async () => (await import('./commit-gate.mjs')).commitGateCheck,
-    async () => (await import('./kill-guard.mjs')).killGuardCheck,
-  ];
+    [FROZEN_HINT_RE, async () => (await import('./frozen-guard.mjs')).frozenShellCheck],
+    [NEEDS_GATE_RE, async () => (await import('./git-guardrail.mjs')).gitGuardrailCheck],
+    [NEEDS_GATE_RE, async () => (await import('./commit-gate.mjs')).commitGateCheck],
+    [NEEDS_GATE_RE, async () => (await import('./kill-guard.mjs')).killGuardCheck],
+  ].filter(([re]) => re.test(cmd)).map(([, load]) => load);
+  if (!loaders.length) return process.exit(0);
   for (const load of loaders) {
     let r;
     try { r = (await load())(input); } catch { r = null; }

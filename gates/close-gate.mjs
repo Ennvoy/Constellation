@@ -33,11 +33,14 @@
 // 票檔）——要改必須先經使用者彈窗同意、把該檔從 frozen 移除並在 log 記一筆 unfreeze（含原因）。名單
 // 檔不存在或解析失敗一律 fail-open，不影響非 UI 專案；目標本身就是 design-frozen.json 時不受此檢查
 // 限制（否則永遠無法解凍）。此檢查與上面的 done 票檢查各自獨立觸發，互不影響、互不依賴。
-import { readFileSync, existsSync } from 'node:fs';
-import { homedir } from 'node:os';
+// 判定實作在 gates/frozen-guard.mjs（決議 030 抽出）；Bash／PowerShell 寫檔由 pre-tool-use.mjs 呼叫同一份。
+import { readFileSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
+import {
+  findProjectRoot, normalizeRepoRelPath, checkFrozenPath, DESIGN_FROZEN_REL, DESIGN_FROZEN_PATH_RE,
+} from './frozen-guard.mjs';
 
 const stripBom = s => (s && s.charCodeAt(0) === 0xfeff ? s.slice(1) : s);
 
@@ -78,30 +81,6 @@ function ticketRootFromPath(absTicketPath) {
 // 必須用同一套推導方式（resolve→小寫→正斜線）才能讓兩邊算出的 repoRootToken 一致。
 function resolveCwd(input) {
   return input.cwd ?? input.workspace_root ?? input.workingDirectory ?? process.cwd();
-}
-
-// 讀 .constellation 底下設定檔（design-frozen.json／design-baseline.json）時找 repo 根：從某個
-// 起點目錄往上找，認 `.constellation` 目錄本身存在。
-// 對抗審查 must-fix（P3 殘留）：舊寫法認 `.constellation/config.json`，但 config.json 要到 weave
-// 階段才生成（DESIGN.md §4）、畫面定稿凍結卻發生在 design 階段（早於 weave）——新專案第一輪凍結
-// design-frozen.json 時，往上找一路走到家目錄都找不到 config.json，退回錯誤的起點，導致合法的定稿
-// 凍結被誤判成「baseline 不存在」而擋下，凍結守衛也會因為根算錯而讀錯位置、靜默 fail-open。改認
-// `.constellation` 目錄本身（不要求 config.json），design/weave 兩階段都認得出來。
-// 家目錄判斷順序很關鍵：**先**判斷是否已經走到家目錄、**再**檢查 `.constellation` 存不存在——
-// 家目錄底下的 ~/.constellation/ 只放簽章 secret（不含 config.json，但目錄本身確實存在），順序反過來
-// 會把家目錄誤判成專案根。找不到就回原起點（fail-open，維持「這層就是根」的舊行為，不誤擋）。
-// 與 gates/verify-runner.mjs 的同名函式同一套邏輯，各自內聯一份，不共用 import——這是決議 023
-// 否決「熱路徑小函式抽共用檔」那條的範圍，不屬於 P14 合一的 evidence.cjs（那支模組只管簽章驗證）。
-function findProjectRoot(from) {
-  const home = resolve(homedir()).toLowerCase();
-  let dir = resolve(from);
-  for (;;) {
-    if (dir.toLowerCase() === home) return resolve(from);
-    if (existsSync(join(dir, '.constellation'))) return dir;
-    const up = dirname(dir);
-    if (up === dir) return resolve(from);
-    dir = up;
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -288,79 +267,9 @@ function checkApplyPatch(patchText, input) {
 }
 
 // ---------------------------------------------------------------------------
-// 定稿 UI 凍結守衛（見檔頭說明）：讀 `.constellation/design-frozen.json`，命中 frozen 名單的檔案擋下。
+// 定稿 UI 凍結守衛（見檔頭說明）：判定本身在 gates/frozen-guard.mjs（決議 030 抽出，Bash／PowerShell
+// 那條路的 pre-tool-use.mjs 也呼叫同一份）；本檔只負責依工具形狀取出目標路徑。
 // ---------------------------------------------------------------------------
-const DESIGN_FROZEN_REL = '.constellation/design-frozen.json';
-const DESIGN_FROZEN_PATH_RE = /(^|[\\/])\.constellation[\\/]design-frozen\.json$/i;
-
-// 路徑正規化：反斜線轉正斜線、解析成絕對路徑後去掉 root（repo 根）前綴變成 repo 相對路徑、統一小寫
-// 做大小寫不敏感比對。frozen 名單裡的項目本來就是 repo 相對路徑，resolve(root, relPath) 會把它接到
-// root 下再還原回同一個相對路徑，兩邊（目標檔案／名單項目）都走這條正規化才能公平比較。
-function normalizeRepoRelPath(filePath, root) {
-  const rootAbs = resolve(root).replace(/\\/g, '/');
-  const abs = resolve(root, String(filePath)).replace(/\\/g, '/');
-  const rootLower = rootAbs.toLowerCase();
-  const absLower = abs.toLowerCase();
-  const rel = absLower.startsWith(rootLower + '/') ? abs.slice(rootAbs.length + 1) : abs;
-  return rel.toLowerCase();
-}
-
-// 讀凍結名單：不存在／JSON 解析失敗／格式不對（frozen 不是陣列）一律回 null——呼叫端當作
-// fail-open（跳過此檢查），不誤擋沒有用到定稿凍結機制的專案。root 是已經找過的專案根（見
-// findProjectRoot），不是 hook 給的原始 cwd。
-function readFrozenList(root) {
-  try {
-    const p = join(root, '.constellation', 'design-frozen.json');
-    const data = JSON.parse(stripBom(readFileSync(p, 'utf8')));
-    if (!data || !Array.isArray(data.frozen)) return null;
-    return data.frozen.filter(f => typeof f === 'string' && f.length);
-  } catch {
-    return null;
-  }
-}
-
-function frozenMessage(filePath) {
-  return [
-    `Constellation 定稿 UI 凍結守衛：擋下——${filePath}。`,
-    '  → 此檔案是使用者定稿凍結的 UI 元件（design-frozen.json）——要修改必須先經使用者彈窗同意、將該檔' +
-      '從 frozen 移除並在 log 記一筆 unfreeze（含原因），才能編輯。不得未經同意自行解凍。',
-  ].join('\n');
-}
-
-// 給定單一目標檔案路徑（必須是絕對路徑），判斷是否命中凍結名單。回 BLOCK(...) 或 null（不擋）——
-// 刻意不用 PASS 物件，因為 PASS 本身是 truthy，呼叫端要能用 `if (result)` 分辨「有擋下」與「沒事」。
-// root 從目標檔所在目錄往上找（見 findProjectRoot），不用 hook 給的 cwd——cwd 可能是子目錄或另一個
-// worktree，會讀錯 .constellation/design-frozen.json 的位置（見 P3）。
-// 對抗審查 should-fix：巢狀 .constellation（例如 monorepo 子套件另外初始化過、但沒有
-// design-frozen.json）時，findProjectRoot 認到的最近一層未必是凍結名單真正所在的根——逐層往上找
-// 「真的有 design-frozen.json」的那一層，找不到才退回最近一層（維持原本 fail-open 行為，不誤擋
-// 沒用到定稿凍結機制的專案）。
-function findFrozenRoot(from) {
-  const home = resolve(homedir()).toLowerCase();
-  const fallback = findProjectRoot(from);
-  let dir = resolve(from);
-  for (;;) {
-    if (dir.toLowerCase() === home) return fallback;
-    if (existsSync(join(dir, '.constellation', 'design-frozen.json'))) return dir;
-    const up = dirname(dir);
-    if (up === dir) return fallback;
-    dir = up;
-  }
-}
-
-function checkFrozenPath(filePath) {
-  // 例外：目標本身就是 design-frozen.json → 不受凍結檢查限制，否則永遠無法解凍。
-  if (DESIGN_FROZEN_PATH_RE.test(String(filePath))) return null;
-  const root = findFrozenRoot(dirname(String(filePath)));
-  if (normalizeRepoRelPath(filePath, root) === DESIGN_FROZEN_REL) return null;
-
-  const frozen = readFrozenList(root);
-  if (!frozen || !frozen.length) return null; // 名單不存在／解析失敗／空清單 → fail-open
-
-  const rel = normalizeRepoRelPath(filePath, root);
-  const hit = frozen.some(f => normalizeRepoRelPath(f, root) === rel);
-  return hit ? BLOCK(frozenMessage(filePath)) : null;
-}
 
 // ---------------------------------------------------------------------------
 // 解凍回凍檢查（本輪新增）：關票（status: done）驗簽通過後，再核對 design-frozen.json 的 `log`——

@@ -92,7 +92,7 @@ import {
 // 變數）才能靜態推出匯出名稱——evidence.cjs 的 module.exports 若插入「值不是同名變數」的項目（例如
 // `X: 5*60*1000`），它後面的名稱會推不出來，runner 啟動時直接 SyntaxError（大聲失敗，不會靜默放行，
 // 但仍值得避免）。改動 evidence.cjs 的 module.exports 時維持簡寫，或都放最後面。
-import { SECRET_PATH, readSecret, ticketRelPath, repoRootToken, computeSignature, COMMAND_LINE_RE } from './evidence.cjs';
+import { SECRET_PATH, readSecret, ticketRelPath, repoRootToken, computeSignature, COMMAND_LINE_RE, signingRoot } from './evidence.cjs';
 
 const stripBom = s => (s && s.charCodeAt(0) === 0xfeff ? s.slice(1) : s);
 
@@ -1080,7 +1080,7 @@ async function main() {
     // 簽章用的「輸出尾行」取真正解碼後內容的最後非空白行（不含保底解碼註記那一行），
     // 這樣才是對「實際輸出內容」的指紋，不是對註記文字的指紋。
     const lastLine = lastCmdResult ? lastCmdResult.realLastLine : '';
-    const repoRoot = repoRootToken(cwd);
+    const repoRoot = repoRootToken(signingRoot(cwd)); // 決議 030：綁主工作樹根，跨 worktree 驗簽一致
     const sig = computeSignature(secret, ts, target, commandsJoined, lastLine, repoRoot);
     entryLines.push(`  - sig: ${sig}`);
   } else {

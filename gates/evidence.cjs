@@ -19,6 +19,8 @@
 // ⚠ 簽章內容不得更動：computeSignature 涵蓋的欄位（ISO 時間戳／票檔相對路徑或 "ship"／全部指令
 // 串接／輸出尾行／repo 根絕對路徑）與串接順序、FIELD_SEP，一旦改了，舊票裡已經簽好的證據會全部
 // 驗簽失敗。真要改欄位定義，得先想清楚舊證據的遷移路徑，不是這支模組自己能決定的事。
+// 決議 030 改過一次「repo 根」這欄的取值（改用 signingRoot＝主工作樹根，與 worktree 脫鉤），遷移
+// 路徑是驗簽端同時接受新舊兩種根（acceptedRootTokens），欄位與串接順序本身沒動。
 //
 // 本模組只管「怎麼驗簽章」，不管「repo 根怎麼找」——close-gate 用票檔絕對路徑切根
 // （ticketRootFromPath）、commit-gate 用 `git rev-parse --show-toplevel`，兩套推導方式差異夠大、
@@ -33,10 +35,10 @@
 //      （secrets／驗證垃圾／殺行程守門等）不受影響。
 'use strict';
 
-const { readFileSync } = require('node:fs');
+const { readFileSync, statSync, realpathSync } = require('node:fs');
 const { createHmac, timingSafeEqual } = require('node:crypto');
 const { homedir } = require('node:os');
-const { join, resolve } = require('node:path');
+const { join, resolve, dirname, basename } = require('node:path');
 
 const SECRET_PATH = join(homedir(), '.constellation', 'secret');
 
@@ -62,6 +64,36 @@ function ticketRelPath(p) {
 // 風格寫法的同一個路徑，token 仍相同；不同專案的 cwd 一定不同，簽章因此天然綁定 repo（防跨專案重放）。
 function repoRootToken(cwd) {
   return resolve(cwd).toLowerCase().replace(/\\/g, '/');
+}
+
+// 簽章用的 repo 根（決議 030）：同一個 repo 的所有 worktree 都解到「主工作樹根」，簽章從此與「在哪個
+// worktree 簽／驗」脫鉤——舊算法直接拿呼叫端給的根（worktree 自己的 toplevel），worker 把 main
+// merge 進 worktree 後，內容逐位元組相同的 done 票就被判簽章不符（AI_project_hub 決議 403）。
+// 純讀檔、不叫 git：dir/.git 是目錄＝自己就是主工作樹；是檔案（`gitdir: <主 repo>/.git/worktrees/<名>`）
+// 就讀該處的 commondir 解出共用 .git 目錄，其上一層即主工作樹根。任何一步讀不到（非 git 目錄、
+// submodule／--separate-git-dir 這類沒有 commondir 的形狀）一律退回 dir 本身＝與舊算法相同。
+// 最後過一次 realpath，讓短檔名／大小寫等寫法差異收斂成同一個字串。
+function signingRoot(dir) {
+  let root = resolve(dir);
+  try {
+    const dotGit = join(root, '.git');
+    if (!statSync(dotGit).isDirectory()) {
+      const m = readFileSync(dotGit, 'utf8').match(/^gitdir:\s*(.+?)\s*$/m);
+      if (m) {
+        const gitdir = resolve(root, m[1]);
+        const common = resolve(gitdir, readFileSync(join(gitdir, 'commondir'), 'utf8').trim());
+        if (basename(common).toLowerCase() === '.git') root = dirname(common);
+      }
+    }
+  } catch { /* 讀不到就維持 dir 本身 */ }
+  try { root = realpathSync.native(root); } catch {}
+  return root;
+}
+
+// 驗簽時接受的 repo 根 token：新算法（主工作樹根）＋舊算法（呼叫端給的根，決議 030 之前簽的證據）。
+// 兩者都綁同一個 repo，跨專案重放照樣對不上。
+function acceptedRootTokens(rootDir) {
+  return [...new Set([repoRootToken(signingRoot(rootDir)), repoRootToken(rootDir)])];
 }
 
 // 欄位分隔字元：一般文字與指令輸出裡幾乎不可能出現的控制字元（U+0001, SOH），
@@ -220,11 +252,9 @@ function checkLatestEvidence(content, ticketPath, rootDir, maxAgeMs) {
   if (entry.sig === 'unsigned') return 'unsigned';
 
   const relPath = ticketRelPath(ticketPath);
-  const repoRoot = repoRootToken(rootDir);
-  const expected = computeSignature(secret, entry.ts, relPath, entry.commandsJoined, entry.lastLine, repoRoot);
-  if (!safeHexEqual(expected, entry.sig)) return 'mismatch';
-
-  return 'ok';
+  const ok = acceptedRootTokens(rootDir).some(repoRoot =>
+    safeHexEqual(computeSignature(secret, entry.ts, relPath, entry.commandsJoined, entry.lastLine, repoRoot), entry.sig));
+  return ok ? 'ok' : 'mismatch';
 }
 
 // ⚠ verify-runner.mjs 對本模組是具名匯入（import { SECRET_PATH, ... } from './evidence.cjs'），靠
@@ -239,4 +269,5 @@ module.exports = {
   computeSignature,
   COMMAND_LINE_RE,
   checkLatestEvidence,
+  signingRoot,
 };
