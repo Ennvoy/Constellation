@@ -1,3 +1,5 @@
+## 2026-10-01 發現當場結案：下輪待辦只收使用者親口選「下輪做」、發現先分誰該決定、既有問題問「現在修／記進 MAP」、審查前移到 build 每批整合後、出貨離場加「所有發現已結案」（決議 031，流程外，無票）獨立審查：無（流程外免出貨審查）；全量測試：`node --test "gates/test/*.test.mjs"` 576 tests / 91 suites，576 pass、0 fail（純文件與閘門註解改動，無新增測試）
+
 ## 2026-10-01 簽章與 worktree 脫鉤、凍結守衛補 Bash／PowerShell、commit 擋凍結名單縮水（決議 030，流程外，無票）獨立審查：無（流程外免出貨審查）；全量測試：`node --test "gates/test/*.test.mjs"` 576 tests / 91 suites，576 pass、0 fail（新增 `gates/test/worktree-frozen.test.mjs` 46 條）
 
 ## 2026-09-25 修正孤兒行程歸屬證據（決議 025）的複審意見——收斂到 agent 級證據、修正連坐範圍、記歸屬證據詞條（流程外，無票）獨立審查：無（流程外免出貨審查；本輪內容即回應一次外部複審意見的修正）；全量測試：`node --test "gates/test/*.test.mjs"` 373 tests / 61 suites，373 pass、0 fail（純文件改動，無新增測試）

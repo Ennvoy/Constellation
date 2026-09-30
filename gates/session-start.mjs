@@ -528,7 +528,7 @@ function buildBlindspotSentinel(base) {
 
 // 決議 024 D4 附則：`tickets/` 有票卻沒有 `decisions/grill-close.md` 代表這批票沒經過訪談收尾，
 // 措辭對齊 SKILL.md「現況矛盾照實告知」那句；唯一的例外是出貨歸檔做到一半（辨識方式見
-// phase-ship.md「發現的處理」）。使用者已拍板：下一輪要做的事一律開票放進 `.constellation/next-round/`
+// phase-ship.md「發現的處理」）。使用者已拍板：使用者選「下輪做」的事開票放進 `.constellation/next-round/`
 // 這個「下輪待辦」抽屜、不進 `tickets/`，故不再有「tickets/ 只剩承接票」這個例外——承接票如果
 // 還放在 tickets/，就是放錯位置，這句會照樣把它算進矛盾並指路正確的落點。這句攔不住刻意繞過
 // 流程直接開票（例如正式站出事時的緊急作戰），只擋無心漏掉的訪談收尾。
@@ -620,7 +620,7 @@ function buildSummary(root) {
 
   const counts = STATUSES.map(s => `${s} ${buckets[s].length}`).join('、');
   const lines = [];
-  // 使用者已拍板的「下輪待辦」抽屜：開發或出貨時說「下一輪再做」的事開票放這裡，不進 tickets/、
+  // 使用者已拍板的「下輪待辦」抽屜：使用者在彈窗選「下輪做」的事開票放這裡（決議 031），不進 tickets/、
   // 不跟這一輪封箱。這裡只報張數，不是要現在做的事——訪談收尾時才問使用者順便做、留著還是丟掉。
   let nextRoundCount = 0;
   try { nextRoundCount = readdirSync(join(base, 'next-round')).filter(f => f.toLowerCase().endsWith('.md')).length; } catch { nextRoundCount = 0; }

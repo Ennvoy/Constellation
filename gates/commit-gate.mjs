@@ -237,7 +237,7 @@ function artifactsReason(staged) {
 
 const TICKET_PATH_RE = /(^|[\\/])\.constellation[\\/]tickets[\\/][^\\/]+\.md$/i;
 const STATUS_DONE_RE = /^\s*status\s*:\s*done\s*(?:#.*)?$/im;
-// 「下輪待辦」抽屜（附帶，鏡像 close-gate.mjs 同名規則）：出貨時開給下一輪的候選票暫存區，不算
+// 「下輪待辦」抽屜（附帶，鏡像 close-gate.mjs 同名規則）：使用者在彈窗選「下輪做」的票暫存區，不算
 // 這一輪的 tickets/，不驗、不關——要做就先經 weave 原樣搬進 tickets/。這裡只擋「staged 內容把抽屜
 // 裡的票標成 done」這個動作，不驗簽章（本來就不該驗——這些票還沒經過 weave 收編）。
 const NEXT_ROUND_PATH_RE = /(^|[\\/])\.constellation[\\/]next-round[\\/][^\\/]+\.md$/i;

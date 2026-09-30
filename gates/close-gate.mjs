@@ -53,7 +53,7 @@ const TICKET_PATH_RE = /(^|[\\/])\.constellation[\\/]tickets[\\/][^\\/]+\.md$/i;
 const STATUS_DONE_RE = /^\s*status\s*:\s*done\s*(?:#.*)?$/im;
 // apply_patch 的新增行以 `+` 開頭（unified diff 慣例），只有「新增」status: done 才算這次操作把票關掉。
 const STATUS_DONE_ADDED_RE = /^\+\s*status\s*:\s*done\s*(?:#.*)?\s*$/m;
-// 「下輪待辦」抽屜（附帶）：出貨時開給下一輪的候選票暫存區，不算這一輪的 tickets/，不驗、不關——
+// 「下輪待辦」抽屜（附帶）：使用者在彈窗選「下輪做」的票暫存區，不算這一輪的 tickets/，不驗、不關——
 // 要做就先經 weave 原樣搬進 tickets/ 再走正常流程。這裡只擋「把抽屜裡的票直接標成 done」這個動作。
 const NEXT_ROUND_PATH_RE = /(^|[\\/])\.constellation[\\/]next-round[\\/][^\\/]+\.md$/i;
 // 「## 驗收條件」section 內、行首未勾選的列項（- [ ]，允許前導縮排——巢狀清單也算數）。
