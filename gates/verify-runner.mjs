@@ -725,7 +725,7 @@ function noteShipLeaseIfHeld() {
     if (!holder || !isPidAlive(holder.pid) || holder.pid === process.pid || flag === `${holder.pid}:${holder.startedAt}`) continue;
     console.error(
       `提醒：出貨鎖目前被別的出貨全量持有中（${holder.root || '不明專案'}，PID ${holder.pid}）——` +
-      '本次驗證不受影響、照跑；若這次紅了，先等對方結束再重跑一次判定。'
+      '本次驗證不受影響、照跑；若這次紅了，先等對方結束再單跑紅的那幾支判定。'
     );
   }
 }

@@ -15,6 +15,10 @@
 //     secret 時 runner 照跑、把證據寫成 sig: unsigned；現在模組整支壞掉時，runner 所有模式（含
 //     --scope ship 全量與機器鎖排隊）都會直接跑不出來。換來的是「模組真的壞掉」這件事會立刻大聲
 //     擋下，而不是悄悄退化——代價可接受，但要照實記，不能說成本來就是這樣。
+//   - gates/lease.mjs 的 projectKey（決議 033，每專案一把出貨鎖的鍵）：用 createRequire 延遲同步載入，
+//     只在算專案鍵那一刻才載入。殺行程守門（gates/kill-guard.mjs）也讀 lease.mjs，所以這裡不能靜態
+//     import——否則本模組壞掉時守門整支載入失敗、被 dispatcher 當成 fail-open 放行。延遲載入後，
+//     載入失敗只讓守門的「同專案」判斷丟例外，kill-guard 把它當成不同專案而擋下（多擋，不放行）。
 //
 // ⚠ 簽章內容不得更動：computeSignature 涵蓋的欄位（ISO 時間戳／票檔相對路徑或 "ship"／全部指令
 // 串接／輸出尾行／repo 根絕對路徑）與串接順序、FIELD_SEP，一旦改了，舊票裡已經簽好的證據會全部

@@ -29,7 +29,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { repoRootToken, signingRoot } from './evidence.cjs';
+import { createRequire } from 'node:module';
 
 const stripBom = s => (s && s.charCodeAt(0) === 0xfeff ? s.slice(1) : s);
 
@@ -45,7 +45,12 @@ const staleMarkerPath = key => join(leaseDir(key), 'holder.json.stale'); // 失�
 
 // 專案鍵：呼叫端給「專案根」（有 .constellation 的那一層；worktree 的根也行），解成主工作樹根後取雜湊——
 // 同一個 repo 的所有 worktree 得到同一把鍵，目錄連結（junction／symlink）經 realpath 收斂成同一個字串。
+// evidence.cjs 在這裡延遲同步載入（不是檔頭靜態 import）：殺行程守門（kill-guard.mjs）也讀本檔，
+// 靜態 import 會讓 evidence.cjs 壞掉時守門整支載入失敗、被 dispatcher 當成 fail-open 靜默放行，
+// 違反 DESIGN.md §11.5「模組壞掉不影響殺行程守門」。延遲載入後，載入失敗只會讓這次呼叫丟例外：
+// kill-guard 的同專案判斷包在 try/catch 裡、失敗就當成不同專案而擋下（保守的方向）。
 function projectKey(root) {
+  const { repoRootToken, signingRoot } = createRequire(import.meta.url)('./evidence.cjs');
   return createHash('sha256').update(repoRootToken(signingRoot(root))).digest('hex').slice(0, 12);
 }
 
@@ -251,17 +256,17 @@ export {
 function cmdList() {
   const all = listHolders();
   if (!all.length) {
-    console.log('目前沒有人持有機器鎖。');
+    console.log('目前沒有人持有出貨鎖。');
     return 0;
   }
   for (const { key, holder } of all) {
     // 檔案在但讀不出來（壞掉／寫到一半），跟「真的沒人」講清楚是兩回事——照實說出來，
     // 不要讓人誤以為機器是空的（S2：曾經因此讓全量默默卡滿 4 小時 max-wait 都不吭聲）。
     if (!holder) {
-      console.log(`機器鎖登記檔存在但讀不出來（可能壞掉或正寫到一半）：${holderPath(key)}`);
+      console.log(`出貨鎖登記檔存在但讀不出來（可能壞掉或正寫到一半）：${holderPath(key)}`);
       continue;
     }
-    console.log(`機器鎖持有中（${holderPath(key)}）：`);
+    console.log(`出貨鎖持有中（${holderPath(key)}）：`);
     console.log(formatHolder(holder));
   }
   return 0;

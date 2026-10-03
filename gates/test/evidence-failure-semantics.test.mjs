@@ -1,15 +1,18 @@
 // gates/test/evidence-failure-semantics.test.mjs — P14 第三步：evidence.cjs 失效語義。
-// 把整個 gates/ 複製到暫存目錄，分別造三種壞法（檔案不見／執行時丟例外／少了一個匯出），驗證：
+// 把整個 gates/ 複製到暫存目錄，分別造幾種壞法（檔案不見／執行時丟例外／少了一個匯出／忘了 return），驗證：
 //   - 跟 evidence.cjs 完全無關的防線（凍結守衛、secrets、git push --force、一般編輯）不受影響——
 //     close-gate.mjs／commit-gate.mjs 只在真的碰到 done 票時才 createRequire 載入該模組，模組壞掉
 //     不該連坐擋下或連坐放行其他判定。
+//   - 殺行程守門（kill-guard.mjs）也不受影響：它透過 lease.mjs 的專案鍵間接用到 evidence.cjs，但那裡是延遲載入
+//     （決議 033）——模組壞掉時守門照樣載得起來、照樣擋別 session 持有的出貨全量；唯一的退化是「同 session 放行」
+//     算不出專案鍵，保守當成別人處理而擋下（多擋，不放行）。
 //   - 唯一受影響的是 done 票稽核（關票／commit 兩條路徑），且必須 fail-closed（擋下，不是放行），
 //     訊息含「簽章模組」——讓人一看就知道是模組故障，不是這張票的證據有問題（P14 對抗審查 must-fix）。
 // 「合法 done 票」的證據用真正的（未壞掉的）gates/verify-runner.mjs 簽出來，證明「這張票在模組正常時
 // 會過關，只是因為模組壞了才被擋下」，不是隨便找一張本來就會被擋的票來測。
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import {
   mkdtempSync, mkdirSync, rmSync, writeFileSync, readdirSync, copyFileSync, statSync,
 } from 'node:fs';
@@ -123,7 +126,7 @@ function runDispatch(gatesDir, input, homeDir) {
   return { status: r.status, stderr: r.stderr || '' };
 }
 
-describe('evidence.cjs 失效語義（P14 第三步：三種壞法 × 六個斷言）', () => {
+describe('evidence.cjs 失效語義（P14 第三步：四種壞法 × 八個斷言）', () => {
   let secretHome;
   const cleanupDirs = [];
 
@@ -210,6 +213,46 @@ describe('evidence.cjs 失效語義（P14 第三步：三種壞法 × 六個斷�
           tool_name: 'Edit', cwd: repoDir, tool_input: { file_path: normalFile, old_string: 'hello', new_string: 'world' },
         }, secretHome);
         assert.equal(r.status, 0, `應放行，實際 exit ${r.status}｜${r.stderr.slice(0, 300)}`);
+      });
+
+      // 殺行程守門：用本測試自己 spawn 的 sleeper 當出貨鎖持有者，登記寫在假家目錄；指令只是字串，
+      // 經 dispatcher 判定，從頭到尾不會真的執行任何 taskkill。
+      function withHolder(holderSession, fn) {
+        const home = track(mkdtempSync(join(tmpdir(), 'evfail-kghome-')));
+        const repoDir = track(gitRepo());
+        const sleeper = spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 120000)']);
+        try {
+          const leaseDir = join(home, '.constellation', 'leases', 'proj-key-1');
+          mkdirSync(leaseDir, { recursive: true });
+          writeFileSync(join(leaseDir, 'holder.json'), JSON.stringify({
+            key: 'proj-key-1', root: repoDir, session: holderSession, runtime: 'claude', pid: sleeper.pid,
+            startedAt: Date.now(), purpose: 'ship 全量驗證', estimatedEndAt: null, shellPid: null,
+          }), 'utf8');
+          return fn({ home, repoDir, pid: sleeper.pid });
+        } finally {
+          try { sleeper.kill(); } catch {}
+        }
+      }
+
+      test('別 session 持有出貨鎖時，殺它的行程仍擋下（exit 2）——殺行程守門不依賴 evidence.cjs（決議 033）', () => {
+        withHolder('holder-session', ({ home, repoDir, pid }) => {
+          const r = runDispatch(gatesDir, {
+            tool_name: 'Bash', cwd: repoDir, session_id: 'my-session',
+            tool_input: { command: `taskkill /PID ${pid} /F` },
+          }, home);
+          assert.equal(r.status, 2, `守門應擋下，實際 exit ${r.status}（載入失敗會被當成 fail-open 放行）｜${r.stderr.slice(0, 300)}`);
+          assert.match(r.stderr, /出貨全量/);
+        });
+      });
+
+      test('同 session 的登記、但專案鍵算不出來（evidence.cjs 壞）：保守當成別人處理而擋下，不放行', () => {
+        withHolder('my-session', ({ home, repoDir, pid }) => {
+          const r = runDispatch(gatesDir, {
+            tool_name: 'Bash', cwd: repoDir, session_id: 'my-session',
+            tool_input: { command: `taskkill /PID ${pid} /F` },
+          }, home);
+          assert.equal(r.status, 2, `同 session 放行要比對專案鍵，鍵算不出來應當成別人而擋下，實際 exit ${r.status}｜${r.stderr.slice(0, 300)}`);
+        });
       });
     });
   }

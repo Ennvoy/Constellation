@@ -326,10 +326,10 @@ describe('lease CLI：只開放 list', () => {
     });
   }
 
-  test('沒有人持有時：list 印「目前沒有人持有機器鎖」，exit 0', () => {
+  test('沒有人持有時：list 印「目前沒有人持有出貨鎖」，exit 0', () => {
     const r = runCli(['list']);
     assert.equal(r.status, 0);
-    assert.match(r.stdout, /目前沒有人持有機器鎖/);
+    assert.match(r.stdout, /目前沒有人持有出貨鎖/);
   });
 
   const writeHolderFile = (key, content) => {
@@ -343,7 +343,7 @@ describe('lease CLI：只開放 list', () => {
     writeHolderFile('proj-a', JSON.stringify(sampleEntry({ root: 'C:/somewhere', purpose: '出貨全量驗證' }), null, 2));
     const r = runCli(['list']);
     assert.equal(r.status, 0);
-    assert.match(r.stdout, /機器鎖持有中/);
+    assert.match(r.stdout, /出貨鎖持有中/);
     assert.match(r.stdout, /出貨全量驗證/);
     assert.match(r.stdout, /C:\/somewhere/);
   });
@@ -355,7 +355,7 @@ describe('lease CLI：只開放 list', () => {
     const r = runCli(['list']);
     assert.equal(r.status, 0);
     for (const t of [/甲專案出貨/, /乙專案出貨/, /舊版整台一把/, /C:\/proj-a-root/, /C:\/legacy-root/]) assert.match(r.stdout, t);
-    assert.equal((r.stdout.match(/機器鎖持有中/g) || []).length, 3);
+    assert.equal((r.stdout.match(/出貨鎖持有中/g) || []).length, 3);
   });
 
   test('不支援的子指令：印用法、exit 1', () => {
@@ -369,7 +369,7 @@ describe('lease CLI：只開放 list', () => {
     const r = runCli(['list']);
     assert.equal(r.status, 0);
     assert.match(r.stdout, /讀不出來/, '應照實講壞掉，不是空手放行成「沒有人持有」');
-    assert.doesNotMatch(r.stdout, /目前沒有人持有機器鎖/);
+    assert.doesNotMatch(r.stdout, /目前沒有人持有出貨鎖/);
   });
 
   test('一份壞掉、一份正常：兩份都要講到，壞的不遮住好的', () => {

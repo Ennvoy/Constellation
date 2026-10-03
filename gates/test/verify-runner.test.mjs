@@ -688,7 +688,7 @@ describe('verify-runner ×lease：--scope ship 開跑前搶本專案的出貨鎖
       // S7：規格要求「一行」且要帶「紅了怎麼辦」的行動指引，不是印一整份 formatHolder 摘要。
       const reminderLine = r.stderr.split('\n').find(l => l.includes('提醒：出貨鎖目前被別的出貨全量持有中'));
       assert.ok(reminderLine, '應印出提醒');
-      assert.match(reminderLine, /先等對方結束再重跑一次判定/, '提醒應包含紅了之後的行動指引');
+      assert.match(reminderLine, /先等對方結束再單跑紅的那幾支判定/, '提醒應包含紅了之後的行動指引');
       assert.equal(existsSync(holderFilePath()), true, '逐票驗證不該動到別人的出貨鎖登記');
       const holderNow = readHolderRaw();
       assert.equal(holderNow && Number(holderNow.pid), holder.pid, '出貨鎖仍應是原本那個假持有者，未被逐票驗證誤搶或誤清');
@@ -867,7 +867,7 @@ describe('verify-runner ×lease：--scope ship 開跑前搶本專案的出貨鎖
       assert.doesNotMatch(r.stderr, /機器鎖被佔用，排隊等待/);
       const reminders = r.stderr.split('\n').filter(l => l.includes('提醒：出貨鎖目前被別的出貨全量持有中'));
       assert.equal(reminders.length, 2, `開跑一次、紅燈收尾一次，實際 ${reminders.length} 次`);
-      assert.match(reminders[1], /先等對方結束再重跑一次判定/);
+      for (const line of reminders) assert.match(line, /先等對方結束再單跑紅的那幾支判定/, "開跑與紅燈收尾兩次提醒都要帶單跑指引");
       assert.ok(r.stderr.lastIndexOf('提醒：出貨鎖') > r.stderr.indexOf('驗證失敗'), '收尾那次提醒要印在失敗訊息之後');
       cleanupFailureLog(r.stderr);
     } finally {
