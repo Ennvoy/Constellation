@@ -57,7 +57,7 @@
 - **zone（可選）**：這張票預期觸及的檔案 glob（例如 `src/auth/**, tests/auth/**`），填了只供整合時檢查越界，不用來判斷誰能平行（見下面「zone 與平行」）。
 - **blocked-by**：這張票要等哪張票的產出先落地（共用型別、資料庫 schema、共用元件）才能開工，就填哪張。
 - **exclusive（可選，DB 隔離不了才標）**：資料隔離規則、平行紅燈重跑、`exclusive` 的「單獨時段」怎麼運作，見本檔同目錄 `phase-build.md`「保護二」與 `verification-playbook.md`「測試資料衛生」，這裡不重複；只有本質上隔離不了的操作（套 migration／改 schema、整庫快照型資料保險、量級壓測）才標 `exclusive:`（格式見 `ticket-template.md`）。
-- **起站埠**：這張票的驗證需要起本地 server 時，weave 逐票指定一個埠號、寫進票的「驗證指令」小標供 worker 照用（格式見 `ticket-template.md`）；埠號怎麼傳進測試框架見 `verification-playbook.md`「測試資料衛生」，這裡不重複；瀏覽器驗證改用測試執行器自己開的瀏覽器，不搶共用分頁。
+- **起站埠**：這張票的驗證需要起本地 server 時，weave 逐票指定一個埠號、寫進票「驗證指令」清單之前的說明文字供 worker 照用（格式見 `ticket-template.md`）；埠號怎麼傳進測試框架見 `verification-playbook.md`「測試資料衛生」，這裡不重複；瀏覽器驗證改用測試執行器自己開的瀏覽器，不搶共用分頁。
 - **必備模組對賬（web 系統）**：拆完票後對照本檔同目錄 `user-defaults.md` 的必備四模組
   （使用者管理／角色管理／權限管理／使用紀錄）——每個模組都要有對應的票或明確併入某張票的
   驗收條件；使用者當次明示不要的，grill-close.md 應有記錄才可省略，不得默默漏掉。
@@ -81,7 +81,7 @@
 
 ## 每票「驗證指令」縮圈（建議寫，抓不準就省略）
 
-拆票時順手為每張票寫「## 驗證指令」section（格式與逐欄規則見本檔同目錄的 `ticket-template.md`）：
+拆票時順手為每張票寫「## 驗證指令」section（格式與逐欄規則見本檔同目錄的 `ticket-template.md`；標題必須剛好是「## 驗證指令」，標題後不要加括號說明或任何後綴，否則 runner 不認、整張票退回跑全量）：
 
 - **動機**：`commands.test` 是全量快速套件，測試量隨輪持續增長，票級全量重跑會讓驗證時間隨專案越來越久——縮圈把票級成本鎖在「這張票的影響面」，不再付全專案累積測試量的錢。
 - **怎麼抓**：全域靜態檢查（typecheck／lint）照抄保留＋依票的 zone 與行為影響面挑測試子集（用測試框架的目錄／pattern 過濾，例如 `pnpm test:unit tests/auth`），寧寬勿窄。**不限單元測試**——整合／db 測試同樣照領域子集納入（例如 `pnpm exec playwright test --project=db tests/callcenter`），讓 db 重的票在票級就驗到自己領域的整合面，不必整套全量留到 ship 才第一次跑（全量整合套件動輒數十分鐘，領域子集通常兩三分鐘）。
