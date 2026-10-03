@@ -1,5 +1,5 @@
 # T-001 出貨鎖改成每個專案一把
-status: in-progress
+status: done
 blocked-by:
 zone: gates/lease.mjs, gates/verify-runner.mjs, gates/kill-guard.mjs, gates/test/**, DESIGN.md, README.md, skills/constellation/**, .constellation/**
 
@@ -26,6 +26,7 @@ zone: gates/lease.mjs, gates/verify-runner.mjs, gates/kill-guard.mjs, gates/test
   - 開跑與紅燈收尾的提醒句，詞句由「機器鎖目前被別的出貨全量持有中……逐票驗證不受影響」改成「出貨鎖目前被別的出貨全量持有中……本次驗證不受影響」，因為同一句現在也用在出貨全量上；排隊、開跑、失效接手等其他執行訊息一字不動（含「機器鎖被佔用，排隊等待」），避免牽動條文引用的「開跑」訊號。
   - 殺行程守門找專案根的做法，在 kill-guard 內聯一份（比照決議 023 各閘門各自內聯、不共用）；專案鍵由 lease.mjs 的 projectKey 算。
   - 本票狀態維持 in-progress、不標 done：本工作區不得啟動驗證 runner（只能由主線背景啟動），所以沒有 runner 簽章的證據；手動跑出的測試結果（先 602 tests 全綠；審查修正後重跑 610 tests／94 suites 全綠）記在決議 033 證據，關票與簽章留給主線在確認沒有測試在跑之後做。
+- 關票（取代上一條「維持 in-progress」）：2026-10-03 由主線背景起驗證 runner（用本工作區版本），票級 21:00:51–21:04:59 執行 `node --test "gates/test/*.test.mjs"` exit 0（610 tests／94 suites 全綠，248 秒），簽章證據寫在下方「驗證證據」；出貨全量 21:04:59–21:09:35 同一條指令 exit 0（275 秒），證據在 `.constellation/ship-evidence.md`。起跑時 runner 警告本票「驗證指令」標題帶後綴、不算縮圈清單而改跑 config 全量（同一條指令，結果不受影響）；關票時已把標題改成剛好「## 驗證指令」、說明移到清單之前，純文件格式、不影響證據。
 - 審查後修正（兩軸審查結論與逐條處理；皆已在本工作區修正並重跑全部 gates 測試）：
   - 規格軸，結論「修完兩條阻擋即可併回」：
     - 阻擋 1「殺行程守門現在經 `lease.mjs` 靜態依賴 `evidence.cjs`，與 DESIGN §11.5『不受影響』的保證矛盾」→ 已修：`lease.mjs` 的 `projectKey` 改為 `createRequire` 延遲載入，載入失敗時 kill-guard 把同專案判斷當成不同專案而擋下；`evidence.cjs` 檔頭與 DESIGN 目錄樹註解、§11.5 同步；`evidence-failure-semantics.test.mjs` 新增 4 種壞法 × 2 案例（別 session 仍擋、同 session 專案鍵算不出來仍擋）共 8 條。
@@ -38,8 +39,22 @@ zone: gates/lease.mjs, gates/verify-runner.mjs, gates/kill-guard.mjs, gates/test
     - 建議 2「`list` 列所有專案、『機器鎖無人佔用，開跑』與『出貨鎖……別的出貨全量持有中』並排看似矛盾」→ 已修一半：`phase-ship.md` 補一句說明兩行並存不矛盾、runner 印「開跑」就不必查 `list`；丟掉另一半（改 runner 的「機器鎖無人佔用，開跑」字樣）：決議 033 已決定執行中訊息一字不動、避免牽動條文引用的「開跑」訊號，文件說明已足夠。
     - 建議 3「專案鍵代表同一個 git repo，不是共用同一份資源」→ 已修：決議 033 代價段與 DESIGN §11.5 各補一條範圍界線，不加機制。
 
-## 驗證指令（可選；票級縮圈清單，weave 寫定——省略則 runner 跑 config 全量）
-母本所有閘門的回歸測試，一條涵蓋全部：
+## 驗證指令
+票級縮圈清單，weave 寫定；省略則 runner 跑 config 全量。母本所有閘門的回歸測試，一條涵蓋全部：
 - `node --test "gates/test/*.test.mjs"`
 
 ## 驗證證據（關票時由 runner 寫入：指令＋結果摘要＋時間）
+- **2026-10-03T13:04:59.918Z**
+  - `node --test "gates/test/*.test.mjs"`（exit 0）
+    ```
+    ℹ tests 610
+    ℹ suites 94
+    ℹ pass 610
+    ℹ fail 0
+    ℹ cancelled 0
+    ℹ skipped 0
+    ℹ todo 0
+    ℹ duration_ms 247277.0468
+    ```
+  - 耗時：合計 248s｜node --test "gates/test/*.test.mjs" 248s
+  - sig: f5673ea96f9cbadafdba4669383f6156153fec154542847aff2e722a97f3ad94
