@@ -10,6 +10,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { projectKey } from '../lease.mjs';
 
 const RUNNER = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'verify-runner.mjs');
 const LEASE_MJS = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'lease.mjs');
@@ -437,12 +438,13 @@ describe('verify-runner：S5——無輸出計時器與總上限計時器互斥�
   });
 });
 
-// 決議 026：--scope ship 開跑前搶跨 session 機器鎖（gates/lease.mjs），被佔就排隊。
+// 決議 026、033：--scope ship 開跑前搶跨 session 的出貨鎖（gates/lease.mjs），同專案被佔就排隊，
+// 別的專案持有不排隊（只提醒）。專案鍵是主工作樹根的雜湊，登記在 leases/<鍵>/holder.json。
 // 「持有方」一律用這裡自己 spawn 的真行程模擬（讀 lease.mjs 的 acquire 直接登記自己），
 // 不是憑空捏造 PID——這樣「pid 已死」「pid 還活著」兩種情境都是真實可觀察的行程狀態。
-// 全部案例共用同一個 fakeHome（機器鎖是機器層級、不分專案，本來就該共用同一份登記檔），
+// 全部案例共用同一個 fakeHome（leaseHome），登記檔只寫在它底下，絕不碰真正的 ~/.constellation/leases；
 // 每個成功接手/搶到鎖的案例收尾都清掉自己留下的 ship-evidence／.verify-state，避免互相汙染。
-describe('verify-runner ×lease：--scope ship 開跑前搶機器鎖，被佔就排隊（決議 026）', () => {
+describe('verify-runner ×lease：--scope ship 開跑前搶本專案的出貨鎖，同專案被佔就排隊（決議 026、033）', () => {
   let leaseHome, leaseProj, fakeHolderScript;
 
   before(() => {
@@ -457,15 +459,20 @@ describe('verify-runner ×lease：--scope ship 開跑前搶機器鎖，被佔就
     }), 'utf8');
 
     // 假持有者：直接呼叫 lease.mjs 的 acquire 登記自己，撐 argv[2] 毫秒後自然結束（不主動釋放，
-    // 模擬「行程死了但登記檔還留著」，靠等待方自己的失效判定去回收）。
+    // 模擬「行程死了但登記檔還留著」，靠等待方自己的失效判定去回收）。argv[3] 是它代表的專案目錄
+    // （登記在該專案的鍵底下）；argv[4] 給了就當登記目錄名（用來模擬舊版 leases/machine 登記，沒有 key 欄位）。
     fakeHolderScript = join(leaseProj, 'fake-holder.mjs');
     writeFileSync(fakeHolderScript, [
       // import 規格必須是合法的 file:// URL——Windows 上帶碟符的裸絕對路徑不是合法的 ESM 規格
       // （會丟 ERR_UNSUPPORTED_ESM_URL_SCHEME），故一律用 pathToFileURL 轉換。
-      `import { acquire } from ${JSON.stringify(pathToFileURL(LEASE_MJS).href)};`,
+      `import { acquire, projectKey } from ${JSON.stringify(pathToFileURL(LEASE_MJS).href)};`,
       "const holdMs = Number(process.argv[2] || '3000');",
+      "const proj = process.argv[3] || 'fake-project';",
+      "const legacyDir = process.argv[4];",
       'const startedAt = Date.now() - Math.round(process.uptime() * 1000);',
-      "const r = acquire({ root: 'fake-project', session: 'fake-session', runtime: 'test', pid: process.pid, startedAt, purpose: '假持有者（測試用）', estimatedEndAt: null, shellPid: null });",
+      "const entry = { root: proj, session: 'fake-session', runtime: 'test', pid: process.pid, startedAt, purpose: '假持有者（測試用）', estimatedEndAt: null, shellPid: null };",
+      'if (!legacyDir) entry.key = projectKey(proj);',
+      'const r = acquire(legacyDir || projectKey(proj), entry);',
       "if (!r.ok) { console.error('acquire-failed'); process.exit(1); }",
       "console.log('ACQUIRED');",
       'setTimeout(() => process.exit(0), holdMs);',
@@ -476,7 +483,29 @@ describe('verify-runner ×lease：--scope ship 開跑前搶機器鎖，被佔就
     for (const d of [leaseHome, leaseProj]) { try { rmSync(d, { recursive: true, force: true }); } catch {} }
   });
 
-  const holderFilePath = () => join(leaseHome, '.constellation', 'leases', 'machine', 'holder.json');
+  // 某個專案的登記檔路徑（預設是 leaseProj 這個專案）；legacyDir 給了就是舊版目錄（例如 'machine'）。
+  const holderFilePath = (proj = leaseProj, legacyDir) =>
+    join(leaseHome, '.constellation', 'leases', legacyDir || projectKey(proj), 'holder.json');
+  // 造一個專案目錄：主工作樹（.git 是目錄）。
+  const makeMainProject = (prefix, commands = { test: ['node -e "process.exit(0)"'], journey: [] }) => {
+    const dir = mkdtempSync(join(tmpdir(), prefix));
+    mkdirSync(join(dir, '.constellation', 'tickets'), { recursive: true });
+    mkdirSync(join(dir, '.git'), { recursive: true });
+    writeFileSync(join(dir, '.constellation', 'config.json'), JSON.stringify({ commands }), 'utf8');
+    return dir;
+  };
+  // 造同一個 repo 的另一個 worktree：手工搭 `git worktree add` 留下的形狀（不叫 git）——.git 是檔案、
+  // 指向主 repo 的 .git/worktrees/<名>，裡頭 commondir 指回共用的 .git；worktree 自己有一份 .constellation。
+  const makeWorktreeOf = (mainDir, prefix, commands = { test: ['node -e "process.exit(0)"'], journey: [] }) => {
+    const wt = mkdtempSync(join(tmpdir(), prefix));
+    const gitdir = join(mainDir, '.git', 'worktrees', 'wt-test');
+    mkdirSync(gitdir, { recursive: true });
+    writeFileSync(join(gitdir, 'commondir'), '../..\n', 'utf8');
+    writeFileSync(join(wt, '.git'), `gitdir: ${gitdir}\n`, 'utf8');
+    mkdirSync(join(wt, '.constellation', 'tickets'), { recursive: true });
+    writeFileSync(join(wt, '.constellation', 'config.json'), JSON.stringify({ commands }), 'utf8');
+    return wt;
+  };
 
   // 對抗複審 S6：本檔測試自己的 process.env 可能剛好也是被一支真的 `--scope ship` 的
   // commands.test 呼叫出來的（那支 runner 早就在自己身上設了 CONSTELLATION_LEASE_ACQUIRED），
@@ -489,24 +518,27 @@ describe('verify-runner ×lease：--scope ship 開跑前搶機器鎖，被佔就
     return { ...env, ...extra }; // ……測試自己要覆寫的值再疊上去，不會被這裡誤刪
   }
 
-  function spawnFakeHolder(holdMs) {
-    return spawn(process.execPath, [fakeHolderScript, String(holdMs)], {
+  // proj：假持有者代表哪個專案（預設 leaseProj）；legacyDir：登記到舊版目錄名（例如 'machine'）。
+  function spawnFakeHolder(holdMs, proj = leaseProj, legacyDir) {
+    const child = spawn(process.execPath, [fakeHolderScript, String(holdMs), proj, ...(legacyDir ? [legacyDir] : [])], {
       env: scrubEnv({ USERPROFILE: leaseHome, HOME: leaseHome }),
       stdio: ['ignore', 'ignore', 'ignore'],
     });
+    child.holderFile = holderFilePath(proj, legacyDir); // 收工清理用：記下它登記在哪
+    return child;
   }
 
-  function readHolderRaw() {
-    try { return JSON.parse(readFileSync(holderFilePath(), 'utf8')); } catch { return null; }
+  function readHolderRaw(proj = leaseProj, legacyDir) {
+    try { return JSON.parse(readFileSync(holderFilePath(proj, legacyDir), 'utf8')); } catch { return null; }
   }
 
   // 等到「這個假持有者自己的 pid」真的出現在登記檔裡才算數——不能只看檔案存不存在：上一個案例
   // 被 killFakeHolder 殺掉的假持有者若清理失敗會留下一份舊登記，光憑「有檔案」會誤判成這一輪剛
   // 搶到的那份，讓後面的斷言在錯的前提上跑。
-  async function waitForHolderPid(pid, timeoutMs = 5000) {
+  async function waitForHolderPid(pid, timeoutMs = 5000, proj = leaseProj, legacyDir) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      const h = readHolderRaw();
+      const h = readHolderRaw(proj, legacyDir);
       if (h && Number(h.pid) === Number(pid)) return true;
       await new Promise(r => setTimeout(r, 20));
     }
@@ -517,8 +549,9 @@ describe('verify-runner ×lease：--scope ship 開跑前搶機器鎖，被佔就
   // 剛搶到的登記；假持有者被 kill 後不會自己釋放，不清乾淨就會汙染下一個案例的起始狀態。
   function killFakeHolder(child) {
     try {
-      const h = readHolderRaw();
-      if (h && Number(h.pid) === Number(child.pid)) rmSync(holderFilePath(), { force: true });
+      const file = child.holderFile || holderFilePath();
+      const h = JSON.parse(readFileSync(file, 'utf8'));
+      if (h && Number(h.pid) === Number(child.pid)) rmSync(file, { force: true });
     } catch {}
     try { child.kill(); } catch {}
   }
@@ -546,7 +579,7 @@ describe('verify-runner ×lease：--scope ship 開跑前搶機器鎖，被佔就
 
   test('機器鎖登記目錄寫不進去：fail-open 直接照跑，訊息也要講明「視為已開跑」（M2）', () => {
     // 讓 leaseDir() 的 mkdirSync 必然失敗：預先在 leases 這個路徑放一個檔案（不是目錄），
-    // 底下的 machine 子目錄就無論如何建不出來。用獨立的假家目錄，不影響其他案例共用的 leaseHome。
+    // 底下的專案鍵子目錄就無論如何建不出來。用獨立的假家目錄，不影響其他案例共用的 leaseHome。
     const failHome = mkdtempSync(join(tmpdir(), 'vr-lease-failopen-'));
     try {
       mkdirSync(join(failHome, '.constellation'), { recursive: true });
@@ -590,25 +623,20 @@ describe('verify-runner ×lease：--scope ship 開跑前搶機器鎖，被佔就
   // `!holder` 分支）也要印，否則排隊等到真的輪到自己開跑時反而靜默無聲。這裡用兩個真的
   // verify-runner.mjs --scope ship 行程（不是假持有者腳本）：A 真的跑完、真的在 process.exit 呼叫
   // release() 釋放鎖，B 排隊等它——比假持有者腳本（設 timeout 直接死掉、不釋放）更貼近真實交棒。
-  test('持有者正常跑完釋放（非判失效）：B 排隊接手時也要印出「開跑」交接訊息，不能靜默', async () => {
-    const projA = mkdtempSync(join(tmpdir(), 'vr-lease-projA-'));
-    const projB = mkdtempSync(join(tmpdir(), 'vr-lease-projB-'));
+  // 決議 033：A 與 B 要排隊，必須是同一個專案——這裡 B 在同一個 repo 的另一個 worktree 裡跑
+  // （同 repo 的各 worktree 算同一專案，鍵是主工作樹根；這同時驗了「同 repo 不同 worktree 視為同專案」）。
+  test('持有者正常跑完釋放（非判失效）：同專案另一個 worktree 的 B 排隊接手時也要印出「開跑」交接訊息，不能靜默', async () => {
+    // A 的全量刻意跑一段有感時間，讓 B 有機會先觀察到「排隊等待」，再等 A 正常收尾釋放而非判死。
+    const projA = makeMainProject('vr-lease-projA-', { test: ['node -e "setTimeout(()=>process.exit(0),600)"'], journey: [] });
+    const projB = makeWorktreeOf(projA, 'vr-lease-projB-');
     let a;
     try {
-      for (const p of [projA, projB]) mkdirSync(join(p, '.constellation', 'tickets'), { recursive: true });
-      // A 的全量刻意跑一段有感時間，讓 B 有機會先觀察到「排隊等待」，再等 A 正常收尾釋放而非判死。
-      writeFileSync(join(projA, '.constellation', 'config.json'), JSON.stringify({
-        commands: { test: ['node -e "setTimeout(()=>process.exit(0),600)"'], journey: [] },
-      }), 'utf8');
-      writeFileSync(join(projB, '.constellation', 'config.json'), JSON.stringify({
-        commands: { test: ['node -e "process.exit(0)"'], journey: [] },
-      }), 'utf8');
-
       a = spawn(process.execPath, [RUNNER, '--cwd', projA, '--scope', 'ship'], {
         env: { ...process.env, USERPROFILE: leaseHome, HOME: leaseHome },
         stdio: ['ignore', 'ignore', 'ignore'],
       });
-      assert.ok(await waitForHolderPid(a.pid), 'A 應該先搶到機器鎖並登記自己的 pid');
+      assert.ok(await waitForHolderPid(a.pid, 5000, projA), 'A 應該先搶到本專案的出貨鎖並登記自己的 pid');
+      assert.equal(projectKey(projB), projectKey(projA), '前提：B 的 worktree 與 A 是同一專案');
 
       const b = runShip(['--max-wait', '20'], { CONSTELLATION_LEASE_TEST_POLL_MS: '100' }, projB);
       assert.equal(b.status, 0, `B 應排隊等 A 釋放後接手成功，實際 ${b.status}｜${b.stderr.slice(-300)}`);
@@ -658,12 +686,12 @@ describe('verify-runner ×lease：--scope ship 開跑前搶機器鎖，被佔就
       });
       assert.equal(r.status, 0, `逐票驗證不該被機器鎖擋住，實際 ${r.status}｜${r.stderr.slice(-300)}`);
       // S7：規格要求「一行」且要帶「紅了怎麼辦」的行動指引，不是印一整份 formatHolder 摘要。
-      const reminderLine = r.stderr.split('\n').find(l => l.includes('提醒：機器鎖目前被別的出貨全量持有中'));
+      const reminderLine = r.stderr.split('\n').find(l => l.includes('提醒：出貨鎖目前被別的出貨全量持有中'));
       assert.ok(reminderLine, '應印出提醒');
       assert.match(reminderLine, /先等對方結束再重跑一次判定/, '提醒應包含紅了之後的行動指引');
-      assert.equal(existsSync(holderFilePath()), true, '逐票驗證不該動到別人的機器鎖登記');
+      assert.equal(existsSync(holderFilePath()), true, '逐票驗證不該動到別人的出貨鎖登記');
       const holderNow = readHolderRaw();
-      assert.equal(holderNow && Number(holderNow.pid), holder.pid, '機器鎖仍應是原本那個假持有者，未被逐票驗證誤搶或誤清');
+      assert.equal(holderNow && Number(holderNow.pid), holder.pid, '出貨鎖仍應是原本那個假持有者，未被逐票驗證誤搶或誤清');
     } finally {
       killFakeHolder(holder);
       try { rmSync(join(leaseProj, '.constellation', 'tickets', 'T-801-ticket.md'), { force: true }); } catch {}
@@ -767,6 +795,8 @@ describe('verify-runner ×lease：--scope ship 開跑前搶機器鎖，被佔就
       assert.match(r.stderr, /等了 \d+ 分鐘機器鎖仍被佔用/, '應印出逾時訊息');
     } finally {
       try { rmSync(staleDir, { recursive: true, force: true }); } catch {}
+      // 這個案例刻意讓失效改名失敗，假持有者的（已死）登記因此一直留在本專案的鍵底下——收掉，免得汙染後面的案例。
+      try { rmSync(holderFilePath(), { force: true }); } catch {}
     }
   });
 
@@ -788,14 +818,105 @@ describe('verify-runner ×lease：--scope ship 開跑前搶機器鎖，被佔就
       // 對抗審查 should-fix：exit Promise 要在 spawn 後立刻建立——這裡子行程活 800ms，一般情況下
       // waitForHolderPid 早就完成，但機器負載高時 poll 可能拖久，晚掛監聽器一樣會踩到同一個競態。
       const exited = new Promise(r => child.once('exit', r));
-      assert.ok(await waitForHolderPid(child.pid), '應該搶到鎖並登記');
-      const holder = readHolderRaw();
+      assert.ok(await waitForHolderPid(child.pid, 5000, proj), '應該搶到鎖並登記');
+      const holder = readHolderRaw(proj);
       assert.equal(holder.session, 'inner-codex', 'Codex 從 Claude Code 內被啟動時，兩個 session id 都在，應以 CODEX_SESSION_ID 為準');
       assert.equal(holder.runtime, 'codex');
+      assert.equal(holder.key, projectKey(proj), '登記要帶專案鍵（殺行程守門比對 cwd 用）');
       await exited;
     } finally {
       try { child && child.kill(); } catch {}
       try { rmSync(proj, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  // ── 決議 033：只有同專案才排隊；別的專案持有只提醒、不等 ──
+  test('跨專案不等：別的專案的出貨鎖有人持有（活著），本專案照樣直接開跑，不印排隊訊息、不碰對方的登記，並印提醒', async () => {
+    const otherProj = makeMainProject('vr-lease-other-');
+    const holder = spawnFakeHolder(60_000, otherProj);
+    try {
+      assert.ok(await waitForHolderPid(holder.pid, 5000, otherProj), '別專案的假持有者應登記到自己的鍵底下');
+
+      const start = Date.now();
+      const r = runShip(['--max-wait', '5']);
+      const elapsedMs = Date.now() - start;
+      assert.equal(r.status, 0, `跨專案不該被擋，應直接跑完，實際 ${r.status}｜${r.stderr.slice(-300)}`);
+      assert.ok(elapsedMs < 20_000, `不該排隊等待，實際耗時 ${elapsedMs}ms`);
+      assert.doesNotMatch(r.stderr, /機器鎖被佔用，排隊等待/, '別專案持有不該讓本專案排隊');
+      assert.match(r.stderr, /開跑/, '照常印「開跑」');
+      const reminderLine = r.stderr.split('\n').find(l => l.includes('提醒：出貨鎖目前被別的出貨全量持有中'));
+      assert.ok(reminderLine, '開跑時要提醒別專案的出貨鎖有人持有');
+      assert.ok(reminderLine.includes(otherProj), '提醒要點名對方的專案');
+      assert.equal(Number(readHolderRaw(otherProj).pid), holder.pid, '對方的登記不該被動到');
+      assert.equal(existsSync(holderFilePath()), false, '本專案收工後釋放自己那一份');
+      cleanupShipArtifacts();
+    } finally {
+      killFakeHolder(holder);
+      try { rmSync(otherProj, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  test('跨專案、紅燈收尾：別專案的出貨鎖還有人持有，開跑與紅燈收尾各提醒一次（先等對方結束再單跑判定）', async () => {
+    const otherProj = makeMainProject('vr-lease-other-');
+    const redProj = makeMainProject('vr-lease-red-', { test: ['node -e "process.exit(1)"'], journey: [] });
+    const holder = spawnFakeHolder(60_000, otherProj);
+    try {
+      assert.ok(await waitForHolderPid(holder.pid, 5000, otherProj));
+      const r = runShip([], {}, redProj);
+      assert.equal(r.status, 1, `應紅燈 exit 1，實際 ${r.status}｜${r.stderr.slice(-300)}`);
+      assert.doesNotMatch(r.stderr, /機器鎖被佔用，排隊等待/);
+      const reminders = r.stderr.split('\n').filter(l => l.includes('提醒：出貨鎖目前被別的出貨全量持有中'));
+      assert.equal(reminders.length, 2, `開跑一次、紅燈收尾一次，實際 ${reminders.length} 次`);
+      assert.match(reminders[1], /先等對方結束再重跑一次判定/);
+      assert.ok(r.stderr.lastIndexOf('提醒：出貨鎖') > r.stderr.indexOf('驗證失敗'), '收尾那次提醒要印在失敗訊息之後');
+      cleanupFailureLog(r.stderr);
+    } finally {
+      killFakeHolder(holder);
+      for (const d of [otherProj, redProj]) { try { rmSync(d, { recursive: true, force: true }); } catch {} }
+    }
+  });
+
+  test('沒有別人持有時紅燈收尾不印提醒（也不誤把自己的登記當成別人）', () => {
+    const redProj = makeMainProject('vr-lease-red-', { test: ['node -e "process.exit(1)"'], journey: [] });
+    try {
+      const r = runShip([], {}, redProj);
+      assert.equal(r.status, 1);
+      assert.doesNotMatch(r.stderr, /提醒：出貨鎖/);
+      cleanupFailureLog(r.stderr);
+    } finally {
+      try { rmSync(redProj, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  test('相容舊版：leases/machine 的舊登記不讓新版排隊（不是同專案的鍵），但提醒讀得到它', async () => {
+    const holder = spawnFakeHolder(60_000, 'C:/legacy-project-root', 'machine');
+    try {
+      assert.ok(await waitForHolderPid(holder.pid, 5000, undefined, 'machine'), '舊版 machine 登記應寫在 leases/machine/holder.json');
+      assert.equal(readHolderRaw(undefined, 'machine').key, undefined, '前提：舊登記沒有 key 欄位');
+
+      const r = runShip(['--max-wait', '5']);
+      assert.equal(r.status, 0, `舊登記不該讓新版排隊，實際 ${r.status}｜${r.stderr.slice(-300)}`);
+      assert.doesNotMatch(r.stderr, /機器鎖被佔用，排隊等待/);
+      assert.match(r.stderr, /提醒：出貨鎖目前被別的出貨全量持有中（C:\/legacy-project-root/, '提醒要讀得到舊版登記');
+      assert.equal(Number(readHolderRaw(undefined, 'machine').pid), holder.pid, '舊登記不該被動到');
+      cleanupShipArtifacts();
+    } finally {
+      killFakeHolder(holder);
+    }
+  });
+
+  test('同專案的兩個 worktree：持有者在主工作樹，另一個 worktree 的 runner 照樣要排隊（逾時代碼 3）', async () => {
+    const mainProj = makeMainProject('vr-lease-main-');
+    const wt = makeWorktreeOf(mainProj, 'vr-lease-wt-');
+    const holder = spawnFakeHolder(60_000, mainProj);
+    try {
+      assert.ok(await waitForHolderPid(holder.pid, 5000, mainProj));
+      const r = runShip(['--max-wait', '1'], { CONSTELLATION_LEASE_TEST_POLL_MS: '200' }, wt);
+      assert.equal(r.status, 3, `同專案應排隊到逾時，實際 ${r.status}｜${r.stderr.slice(-300)}`);
+      assert.match(r.stderr, /機器鎖被佔用，排隊等待/);
+    } finally {
+      killFakeHolder(holder);
+      for (const d of [mainProj, wt]) { try { rmSync(d, { recursive: true, force: true }); } catch {} }
     }
   });
 });

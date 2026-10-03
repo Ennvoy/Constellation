@@ -4,21 +4,34 @@
 // （dispatcher 整合驗證留給 pre-tool-use.test.mjs）。
 //
 // 安全規則：全程把 USERPROFILE／HOME 指到本檔自建的拋棄式假家目錄，holder.json 只寫在假目錄
-// 底下，絕不碰真正的 ~/.constellation/leases；「持有方」一律用本檔自己 spawn 的 sleeper 行程
+// 底下，絕不碰真正的 ~/.constellation/leases（出貨鎖從決議 033 起每個專案一把：leases/<專案鍵>/holder.json，
+// 守門讀全部專案的登記取聯集，舊版 leases/machine 當成其中一份）；「持有方」一律用本檔自己 spawn 的 sleeper 行程
 // 的真實 PID 模擬，killGuardCheck 本身是純判定函式、不會 shell out，本檔從頭到尾不會真的執行
 // 任何一句 taskkill／Stop-Process／kill。
-import { test, describe, before, after } from 'node:test';
+import { test, describe, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, unlinkSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { spawn } from 'node:child_process';
 import { killGuardCheck } from '../kill-guard.mjs';
+import { projectKey } from '../lease.mjs';
 
 const bash = (command, extra = {}) => ({ tool_name: 'Bash', tool_input: { command }, ...extra });
+const DEFAULT_KEY = 'k-crm'; // 預設登記（crm-system 專案那一份）的目錄名
 
-let fakeHome, holderFile, origUserProfile, origHome;
+let fakeHome, holderFile, leasesDir, projBase, projCrm, origUserProfile, origHome;
 let holderProc, childProc; // 測試自己 spawn 的假行程，模擬持有方——絕不用機器上真實的其他行程
+let holder2Proc, child2Proc; // 第二個專案的持有方（多專案案例用）
+const holderFileOf = key => join(leasesDir, key, 'holder.json');
+// 真的建出專案目錄（有 .constellation 與 .git），專案鍵才算得穩——不能用不存在的路徑，往上找專案根
+// 會一路走到真實家目錄底下的 .constellation 去。
+function makeProject(name) {
+  const dir = join(projBase, name);
+  mkdirSync(join(dir, '.constellation'), { recursive: true });
+  mkdirSync(join(dir, '.git'), { recursive: true });
+  return dir;
+}
 
 before(() => {
   origUserProfile = process.env.USERPROFILE;
@@ -26,28 +39,36 @@ before(() => {
   fakeHome = mkdtempSync(join(tmpdir(), 'kg-home-'));
   process.env.USERPROFILE = fakeHome;
   process.env.HOME = fakeHome;
-  const holderDir = join(fakeHome, '.constellation', 'leases', 'machine');
-  mkdirSync(holderDir, { recursive: true });
-  holderFile = join(holderDir, 'holder.json');
+  leasesDir = join(fakeHome, '.constellation', 'leases');
+  holderFile = holderFileOf(DEFAULT_KEY);
+  mkdirSync(dirname(holderFile), { recursive: true });
+  projBase = mkdtempSync(join(tmpdir(), 'kg-proj-'));
+  projCrm = makeProject('crm-system');
 
-  // 兩個無害的 sleeper 行程只用來提供真實 PID；.pid 在 spawn() 呼叫後就同步可用，不必等它們
-  // 真的跑起來——本檔不判存活，純粹拿數字。
-  holderProc = spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 300000)']);
-  childProc = spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 300000)']);
+  // 幾個無害的 sleeper 行程只用來提供真實 PID；.pid 在 spawn() 呼叫後就同步可用，不必等它們
+  // 真的跑起來——killGuardCheck 只用 isPidAlive 判存活，行程活著就夠了。
+  const sleeper = () => spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 300000)']);
+  holderProc = sleeper();
+  childProc = sleeper();
+  holder2Proc = sleeper();
+  child2Proc = sleeper();
 });
 
 after(() => {
-  for (const p of [holderProc, childProc]) { try { p.kill(); } catch {} }
+  for (const p of [holderProc, childProc, holder2Proc, child2Proc]) { try { p.kill(); } catch {} }
   if (origUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = origUserProfile;
   if (origHome === undefined) delete process.env.HOME; else process.env.HOME = origHome;
   try { rmSync(fakeHome, { recursive: true, force: true }); } catch {}
+  try { rmSync(projBase, { recursive: true, force: true }); } catch {}
 });
 
 // 欄位名稱與 gates/lease.mjs／verify-runner.mjs 的 acquireShipLease 實際寫入的 holder.json 一致：
 // root、session、runtime、pid、startedAt、purpose、estimatedEndAt、shellPid。
-function writeHolder(overrides = {}) {
+// key 參數是登記所在的目錄名（隨便取）；登記裡的 key 欄位照 runner 的寫法放 root 算出的專案鍵，
+// 覆寫成 undefined 就是舊版（決議 026）沒有 key 欄位的格式。
+function writeHolder(overrides = {}, key = DEFAULT_KEY) {
   const holder = {
-    root: 'C:\\Users\\ennvoy.lin\\Desktop\\crm-system',
+    root: projCrm,
     session: 'other-session',
     runtime: 'claude',
     pid: holderProc.pid,
@@ -57,11 +78,16 @@ function writeHolder(overrides = {}) {
     shellPid: childProc.pid,
     ...overrides,
   };
-  writeFileSync(holderFile, JSON.stringify(holder));
+  if (!('key' in overrides)) holder.key = projectKey(holder.root);
+  mkdirSync(dirname(holderFileOf(key)), { recursive: true });
+  writeFileSync(holderFileOf(key), JSON.stringify(holder));
   return holder;
 }
 function clearHolder() {
   try { unlinkSync(holderFile); } catch {}
+}
+function clearAllHolders() {
+  try { rmSync(leasesDir, { recursive: true, force: true }); } catch {}
 }
 
 function assertBlocked(input, label) {
@@ -74,10 +100,11 @@ function assertPassed(input, label) {
   assert.equal(r.block, false, `${label}：應放行，實際 ${JSON.stringify(r)}`);
 }
 
-describe('kill-guard：沒人持有 machine 鎖', () => {
+describe('kill-guard：沒人持有出貨鎖', () => {
   before(() => clearHolder());
   test('taskkill 任意 PID 都放行', () => assertPassed(bash('taskkill /PID 99999 /F'), '無持有者'));
   test('holder.json 壞掉（非法 JSON）也放行（fail-open）', () => {
+    mkdirSync(dirname(holderFile), { recursive: true });
     writeFileSync(holderFile, '{not json');
     assertPassed(bash('taskkill /PID 1234 /F'), 'holder.json 壞掉');
     clearHolder();
@@ -138,18 +165,18 @@ describe('kill-guard：擋其他 session 持有者的 PID', () => {
   });
 });
 
-describe('kill-guard：同一 session 放行（即使命中 PID）', () => {
+describe('kill-guard：同一 session 在同一個專案裡放行（即使命中 PID）', () => {
   before(() => writeHolder({ session: 'my-session' }));
   after(() => clearHolder());
 
   test('hook stdin 帶 session_id 與持有方相同', () =>
-    assertPassed(bash(`taskkill /PID ${holderProc.pid} /F`, { session_id: 'my-session' }), '同一 session（stdin）'));
+    assertPassed(bash(`taskkill /PID ${holderProc.pid} /F`, { session_id: 'my-session', cwd: projCrm }), '同一 session（stdin）'));
 
   test('環境變數 CLAUDE_CODE_SESSION_ID 與持有方相同', () => {
     const orig = process.env.CLAUDE_CODE_SESSION_ID;
     process.env.CLAUDE_CODE_SESSION_ID = 'my-session';
     try {
-      assertPassed(bash(`taskkill /PID ${holderProc.pid} /F`), '同一 session（env）');
+      assertPassed(bash(`taskkill /PID ${holderProc.pid} /F`, { cwd: projCrm }), '同一 session（env）');
     } finally {
       if (orig === undefined) delete process.env.CLAUDE_CODE_SESSION_ID;
       else process.env.CLAUDE_CODE_SESSION_ID = orig;
@@ -162,7 +189,7 @@ describe('kill-guard：同一 session 放行（即使命中 PID）', () => {
     process.env.CLAUDE_CODE_SESSION_ID = 'outer-claude'; // 繼承自外層 Claude Code，不該被拿來比對
     process.env.CODEX_SESSION_ID = 'my-session';
     try {
-      assertPassed(bash(`taskkill /PID ${holderProc.pid} /F`), '同一 session（CODEX_SESSION_ID 優先）');
+      assertPassed(bash(`taskkill /PID ${holderProc.pid} /F`, { cwd: projCrm }), '同一 session（CODEX_SESSION_ID 優先）');
     } finally {
       if (orig1 === undefined) delete process.env.CLAUDE_CODE_SESSION_ID; else process.env.CLAUDE_CODE_SESSION_ID = orig1;
       if (orig2 === undefined) delete process.env.CODEX_SESSION_ID; else process.env.CODEX_SESSION_ID = orig2;
@@ -280,4 +307,105 @@ describe('kill-guard：wave5 對抗審查修正——跳脫管線與 kill- 開�
 
   test('taskkill-report.ps1 這種識別字，taskkill 等其他動詞邊界比照同一原則（成因 2）', () =>
     assertPassed(bash('taskkill-report.ps1 -Verbose'), 'taskkill- 開頭識別字'));
+});
+
+// 決議 033：出貨鎖每個專案一把，守門讀全部專案的登記取聯集。迴圈裡「持有者已死」「同 session」兩個分支
+// 都只能跳過那一份、繼續檢查下一份，不能直接放行整條指令。
+describe('kill-guard：決議 033 多專案登記取聯集', () => {
+  let projB, deadPid;
+  before(async () => {
+    projB = makeProject('proj-b');
+    const dying = spawn(process.execPath, ['-e', '']);
+    deadPid = dying.pid;
+    await new Promise(r => dying.on('exit', r));
+    for (let i = 0; i < 40; i++) {
+      try { process.kill(deadPid, 0); } catch { break; }
+      await new Promise(r => setTimeout(r, 50));
+    }
+  });
+  afterEach(() => clearAllHolders());
+
+  const otherProject = (overrides = {}) => ({
+    root: projB, session: 'other-session-b', pid: holder2Proc.pid, shellPid: child2Proc.pid, ...overrides,
+  });
+
+  test('兩個專案各有別人持有的登記：殺第二個專案的 PID 也擋（取聯集，不是只看第一份）', () => {
+    writeHolder({}, 'k-aaa');
+    writeHolder(otherProject(), 'k-zzz');
+    const r = assertBlocked(bash(`taskkill /PID ${holder2Proc.pid} /F`), '第二個專案的 runner pid');
+    assert.match(r.message, /proj-b/, '訊息要點名真正被殺的那個專案');
+    assertBlocked(bash(`taskkill /PID ${child2Proc.pid} /F`), '第二個專案的子指令外殼 pid');
+    const r1 = assertBlocked(bash(`taskkill /PID ${holderProc.pid} /F`), '第一個專案的 runner pid');
+    assert.match(r1.message, /crm-system/);
+  });
+
+  test('只有別專案持有，也擋：跨專案的出貨全量同樣是別人的行程', () => {
+    writeHolder(otherProject(), 'k-zzz');
+    assertBlocked(bash(`taskkill /PID ${holder2Proc.pid} /F`), '只有別專案的登記');
+    assertBlocked(bash('taskkill /IM node.exe /F'), '只有別專案的登記＋按名稱整批殺');
+  });
+
+  for (const [label, deadKey] of [['已死登記排在前面', 'k-000-dead'], ['已死登記排在後面', 'k-zzz-dead']]) {
+    test(`一份已死登記＋一份別 session 活登記：仍擋（${label}），已死那份順手作廢`, () => {
+      writeHolder({ pid: deadPid, shellPid: deadPid, session: 'whoever' }, deadKey);
+      writeHolder({}, 'k-mid');
+      assertBlocked(bash(`taskkill /PID ${holderProc.pid} /F`), '已死＋活的：命中活的 pid');
+      assertBlocked(bash('taskkill /IM node.exe /F'), '已死＋活的：按名稱整批殺');
+      assert.equal(existsSync(holderFileOf(deadKey)), false, '已死登記應被改名作廢');
+      assert.equal(existsSync(`${holderFileOf(deadKey)}.stale`), true);
+      assert.equal(existsSync(holderFileOf('k-mid')), true, '活的登記不該被動到');
+    });
+  }
+
+  test('一份同 session 登記＋一份別 session 活登記：殺別人的仍擋，殺自己的放行', () => {
+    writeHolder({ session: 'my-session' }, 'k-mine'); // 我自己的出貨（crm-system）
+    writeHolder(otherProject(), 'k-other');
+    const input = extra => ({ session_id: 'my-session', cwd: projCrm, ...extra });
+    assertBlocked(bash(`taskkill /PID ${holder2Proc.pid} /F`, input()), '殺別人的 runner');
+    assertBlocked(bash(`taskkill /PID ${child2Proc.pid} /F`, input()), '殺別人的子指令外殼');
+    assertBlocked(bash('taskkill /IM node.exe /F', input()), '別人還持有時，按名稱整批殺也擋');
+    assertPassed(bash(`taskkill /PID ${holderProc.pid} /F`, input()), '殺自己的 runner');
+  });
+
+  test('同 session 但 cwd 在另一個專案：當成別人處理，要擋', () => {
+    writeHolder({ session: 'my-session' }, 'k-mine');
+    assertBlocked(bash(`taskkill /PID ${holderProc.pid} /F`, { session_id: 'my-session', cwd: projB }), 'cwd 是別的專案');
+    assertBlocked(bash(`taskkill /PID ${holderProc.pid} /F`, { session_id: 'my-session' }),
+      '沒帶 cwd 時退回本行程的 cwd（不是那個專案），一樣擋');
+  });
+
+  test('同 session 且 cwd 在該專案的子目錄、或同 repo 的另一個 worktree：換算成主工作樹根後同專案，放行', () => {
+    writeHolder({ session: 'my-session' }, 'k-mine');
+    const sub = join(projCrm, 'src', 'deep');
+    mkdirSync(sub, { recursive: true });
+    assertPassed(bash(`taskkill /PID ${holderProc.pid} /F`, { session_id: 'my-session', cwd: sub }), '專案子目錄');
+
+    // 手工搭 git worktree 的形狀（不叫 git）：worktree 根的 .git 是檔案、commondir 指回主 repo 的 .git
+    const wt = join(projBase, 'crm-system-wt');
+    mkdirSync(join(projCrm, '.git', 'worktrees', 'wt'), { recursive: true });
+    writeFileSync(join(projCrm, '.git', 'worktrees', 'wt', 'commondir'), '../..\n', 'utf8');
+    mkdirSync(join(wt, '.constellation'), { recursive: true });
+    writeFileSync(join(wt, '.git'), 'gitdir: ' + join(projCrm, '.git', 'worktrees', 'wt') + '\n', 'utf8');
+    assertPassed(bash(`taskkill /PID ${holderProc.pid} /F`, { session_id: 'my-session', cwd: wt }), '同 repo 的另一個 worktree');
+  });
+
+  test('相容舊版：leases/machine 的登記（沒有 key 欄位）新版也讀得到、也擋', () => {
+    writeHolder({ key: undefined }, 'machine'); // 決議 026 舊格式：沒有 key，只有 root
+    assertBlocked(bash(`taskkill /PID ${holderProc.pid} /F`), '舊版 machine 登記');
+    assertBlocked(bash('taskkill /IM node.exe /F'), '舊版 machine 登記＋按名稱整批殺');
+  });
+
+  test('相容舊版：舊登記同 session 且 cwd 在它的 root 放行（專案鍵由 root 算）；cwd 在別處照擋', () => {
+    writeHolder({ key: undefined, session: 'my-session' }, 'machine');
+    assertPassed(bash(`taskkill /PID ${holderProc.pid} /F`, { session_id: 'my-session', cwd: projCrm }), '舊登記同專案同 session');
+    assertBlocked(bash(`taskkill /PID ${holderProc.pid} /F`, { session_id: 'my-session', cwd: projB }), '舊登記同 session 不同專案');
+  });
+
+  test('壞掉的登記不擋事（fail-open），也不影響旁邊正常登記的判定', () => {
+    mkdirSync(join(leasesDir, 'k-bad'), { recursive: true });
+    writeFileSync(holderFileOf('k-bad'), '{not json');
+    assertPassed(bash(`taskkill /PID ${holderProc.pid} /F`), '只有壞登記');
+    writeHolder({}, 'k-ok');
+    assertBlocked(bash(`taskkill /PID ${holderProc.pid} /F`), '壞登記旁邊的正常登記照擋');
+  });
 });

@@ -20,11 +20,12 @@ import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHmac } from 'node:crypto';
+import { projectKey } from '../lease.mjs';
 
 const GATE = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'pre-tool-use.mjs');
 const RUNNER = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'verify-runner.mjs');
 
-let repo, fakeHome, holderProc, childProc;
+let repo, fakeHome, crmProj, holderProc, childProc;
 
 before(() => {
   repo = mkdtempSync(join(tmpdir(), 'ptu-test-'));
@@ -34,7 +35,10 @@ before(() => {
   mkdirSync(join(repo, '.constellation'), { recursive: true });
 
   fakeHome = mkdtempSync(join(tmpdir(), 'ptu-home-'));
-  mkdirSync(join(fakeHome, '.constellation', 'leases', 'machine'), { recursive: true });
+  mkdirSync(join(fakeHome, '.constellation', 'leases', 'k-crm'), { recursive: true });
+  // 持有方的專案根：真的建出來（有 .constellation），專案鍵才算得穩；目錄名 crm-system 供訊息斷言。
+  crmProj = join(mkdtempSync(join(tmpdir(), 'ptu-proj-')), 'crm-system');
+  mkdirSync(join(crmProj, '.constellation'), { recursive: true });
   holderProc = spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 300000)']);
   childProc = spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 300000)']);
 });
@@ -43,6 +47,7 @@ after(() => {
   rmSync(repo, { recursive: true, force: true });
   for (const p of [holderProc, childProc]) { try { p.kill(); } catch {} }
   rmSync(fakeHome, { recursive: true, force: true });
+  rmSync(dirname(crmProj), { recursive: true, force: true });
 });
 
 function run(input, extraEnv = {}) {
@@ -55,11 +60,12 @@ function run(input, extraEnv = {}) {
 }
 
 // 欄位名稱與 gates/lease.mjs／verify-runner.mjs 的 acquireShipLease 實際寫入的 holder.json 一致：
-// root、session、runtime、pid、startedAt、purpose、estimatedEndAt、shellPid。
-const holderFile = () => join(fakeHome, '.constellation', 'leases', 'machine', 'holder.json');
+// key、root、session、runtime、pid、startedAt、purpose、estimatedEndAt、shellPid（決議 033 起每專案一份：leases/<鍵>/holder.json）。
+const holderFile = () => join(fakeHome, '.constellation', 'leases', 'k-crm', 'holder.json');
 function writeHolder(overrides = {}) {
   writeFileSync(holderFile(), JSON.stringify({
-    root: 'C:\\Users\\ennvoy.lin\\Desktop\\crm-system',
+    key: projectKey(crmProj),
+    root: crmProj,
     session: 'other-session',
     runtime: 'claude',
     pid: holderProc.pid,
@@ -127,7 +133,7 @@ describe('pre-tool-use：殺行程守門——快速放行條件有沒有正確�
     assert.match(r.stderr, /SendMessage/);
   });
 
-  test('沒人持有 machine 鎖時，taskkill 任意 PID 放行', () => {
+  test('沒人持有出貨鎖時，taskkill 任意 PID 放行', () => {
     const r = runWithHome({ tool_name: 'Bash', tool_input: { command: 'taskkill /PID 99999 /F' } });
     assert.equal(r.status, 0);
   });
@@ -153,10 +159,10 @@ describe('pre-tool-use：殺行程守門——快速放行條件有沒有正確�
     assert.match(r.stderr, /SendMessage/);
   });
 
-  test('同一 session（環境變數 CLAUDE_CODE_SESSION_ID 相符）放行，即使命中 PID', () => {
+  test('同一 session（環境變數 CLAUDE_CODE_SESSION_ID 相符）在同一個專案裡放行，即使命中 PID', () => {
     writeHolder({ session: 'my-session' });
     const r = runWithHome(
-      { tool_name: 'Bash', tool_input: { command: `taskkill /PID ${holderProc.pid} /F` } },
+      { tool_name: 'Bash', cwd: crmProj, tool_input: { command: `taskkill /PID ${holderProc.pid} /F` } },
       { CLAUDE_CODE_SESSION_ID: 'my-session' }
     );
     assert.equal(r.status, 0);

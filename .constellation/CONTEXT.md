@@ -5,7 +5,7 @@
 - **母本／應用專案**：母本＝本 repo（skill、閘門、install 的唯一源碼）；應用專案＝套用 Constellation 工作流的其他專案（各自有 `.constellation/`）。母本以 junction 掛到 `~/.claude/skills/`、`~/.codex/skills/`、`~/.agents/skills/`，改母本即時生效。
 - **閘門五件組**：①git 守門 ②commit 守門 ③session 開場注入 ④驗證 runner ⑤關票刷卡機——全在 `gates/*.mjs`，hook 觸發、平時零開銷。同目錄的 `clean-artifacts.mjs` 與 `serve.mjs` **是工具不是閘門**（不算第六件）；`serve.mjs` 另掛 SessionEnd hook，session 結束自動收掉本 session 登記的 server。
 - **記帳起停**：臨時 server 一律經 `gates/serve.mjs` 起停，`start`／`stop`／SessionEnd 只認登記過的、殺前比對啟動時間，絕不掃全機的埠（避免誤殺使用者自己開的或平行 session 的）；worktree 內的登記獨立、worker 收工前得自己 `stop`，Codex 端 SessionEnd 收不齊也得靠手動收（細節見母本 DESIGN.md §5、`verification-playbook.md`「臨時 server 的起與收」，案例見決議 020／023）。
-- **機器鎖／使用中燈**：`gates/lease.mjs` 登記的跨 session `machine` 資源鎖——出貨全量開跑前自動取鎖，機器被別的 session 佔用時自動排隊、輪到自動開跑；`gates/kill-guard.mjs` 另擋下把別人持有的全量當孤兒殺掉（細節見母本 DESIGN.md §5／§7，案例見決議 026）。
+- **出貨鎖／使用中燈**：`gates/lease.mjs` 登記的跨 session 出貨鎖，每個專案一把（鍵＝主工作樹根，同 repo 的各 worktree 同一把）——出貨全量開跑前自動取鎖，同專案被別的 session 佔用時自動排隊、輪到自動開跑；別的專案持有不排隊、只提醒；`gates/kill-guard.mjs` 讀所有專案的登記，擋下把別人持有的全量當孤兒殺掉（細節見母本 DESIGN.md §5／§7，案例見決議 026、033；原稱「機器鎖」）。
 - **歸屬證據**：收工要殺行程前，只認三種歸屬證據——`serve.mjs` 登記過的 server、自己開的背景任務、自己這個 agent 起的那支腳本（認專屬檔名或 PID，不是整個 session 共用的暫存路徑，平行 worker 分不出彼此）；程式名、共用路徑片段（如 `ms-playwright`）、命令列字串巧合相同、啟動時間早晚都不算證據。瀏覽器不直接殺，殺直接控制它的那支腳本即可，但連坐只管直接父子關係，隔一層 cmd／bash 就斷鏈；認不出是自己的一律彈窗問，不做自動掃殺（細節見 `verification-playbook.md`「臨時 server 的起與收」，案例見決議 025）。
 - **工作軌／知識軌**：`.constellation/` 的兩軌——工作軌＝tickets/（隨輪歸檔）；知識軌＝CONTEXT.md＋decisions/＋HISTORY.md（跨輪累積、不歸檔）。`next-round/` 放留給下一輪的待辦票，同樣不隨本輪歸檔——訪談收尾時使用者選了併入才會被 weave 搬進 `tickets/`，選了放棄則移進 `archive/next-round-closed/`（案例見決議 027）。
 - **端上桌**：知識軌內容由閘門 3 在 session 開場自動注入，不是寫給人翻的死檔案；「寫了沒端上桌」是接續力升級前的病灶（案例見決議 001）。

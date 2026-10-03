@@ -1,5 +1,7 @@
 # 026 跨 session 共用一台機器：機器鎖排隊＋殺行程守門，取代口頭協調
 
+> 第 1–2 點的「整台機器一把」已 **superseded by 033**：出貨鎖改成每個專案一把，只有同專案（含同 repo 的其他工作區）的出貨全量才排隊，跨專案不排隊；第 3 點的殺行程守門保留，改為讀所有專案的登記並修正兩個提前放行的縫。其餘各項仍有效。
+
 背景：09-25 凌晨，crm-system（round-0915）與 ai-project-hub 兩個獨立 session 同時把出貨全量壓上同一台機器，全靠 SendMessage 即時聊天協調，暴露出「靠人／靠訊息記得」撐不住的兩個洞。
 
 02:18 crm 啟動 round-0915 出貨全量（`verify-runner.mjs --scope ship`，PID 47592）；02:25 hub 的出貨子代理啟動一支指令列完全相同的全量（兩個專案共用同一支母本 `verify-runner.mjs`），02:28 把 02:18 那支（其實是 crm 的）當成自己的孤兒行程 `taskkill` 掉。crm 發現 runner 無聲消失、log 0 位元組，SendMessage 問 hub 是不是誤殺，hub 承認、通知自己子代理「不得再碰 crm 的路徑與埠」——但這通知只是叫醒一個新分身接手，原本正在執行 kill 的那個分身照樣殺完。crm 02:45 重啟第六趟（PID 27848），02:54 同一個子代理**第二次**殺掉它；這次不是認錯行程——它自己的 journal 寫著「PID 27848 (unrelated session…) is still competing for resources… I'll clear that one out」，是明知道那是別的 session、仍決定清掉。訊息攔不住已經在執行的行程，只有機械擋得住。
