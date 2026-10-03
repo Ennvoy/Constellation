@@ -1,0 +1,7 @@
+{
+  "approved": true,
+  "commands": {
+    "test": ["node --test \"gates/test/*.test.mjs\""],
+    "journey": []
+  }
+}
